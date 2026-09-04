@@ -1,0 +1,43 @@
+# Dagger workspace configuration
+# Install modules with: dagger install <module>
+# Example:
+#   dagger install github.com/dagger/dagger/modules/wolfi
+
+[modules.dagger-dang-sdk]
+source = "github.com/dagger/dang-sdk"
+
+[modules.dagger-dang-sdk.as-sdk]
+name = "dang"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "editor"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "claude"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "codex"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "contributor"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "delegate"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "engine-lab"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "history"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "librarian"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "review"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "sandbox"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "staff"
