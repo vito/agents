@@ -23,9 +23,12 @@
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
 #     workspace to the returned state. `date` is required (for reproducible
 #     commits); currentTimestamp supplies it.
+#   * GitRef.push publishes HEAD to the checkout's remote, engine-side (no
+#     host checkout involved), with an optional lease in the style of
+#     `--force-with-lease`. An effect on the remote, so never cached.
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, and commit.
+history, commit, and push.
 """
 type Committer {
   """
@@ -161,6 +164,67 @@ type Committer {
     print(`Committed ${short(sha)}: ${subject(message)} ` +
       `(${toString(picked.length)} file(s))` + leftNote)
     committed
+  }
+
+  """
+  Push the workspace's committed history to its remote.
+
+  Publishes HEAD — everything `commit` has recorded — to the repository the
+  checkout was cloned from. Pending changes are NOT pushed: commit first,
+  then push. The remote branch is created when it does not exist yet.
+
+  A push the remote rejects (its branch moved past ours) is an error, never a
+  takeover. To overwrite anyway, pass `expectedRemoteSHA`: the push then
+  succeeds only while the remote branch still points at that sha — a lease,
+  like `--force-with-lease` — so use it only after reading what the remote
+  moved to, and only when discarding that is the intent.
+  """
+  push(
+    source: Workspace!,
+    """
+    Destination branch on the remote. Empty pushes the current branch under
+    its own name; required when HEAD is not on a branch.
+    """
+    branch: String! = "",
+    """
+    Lease on the remote branch: omit for a plain push (fast-forwards and
+    branch creation only), or pass the sha the remote branch is expected to
+    point at to force-update it from exactly that state.
+    """
+    expectedRemoteSHA: String = null,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): pushing is an effect on the remote; a later identical
+    # call must push again, not replay the first result.
+    #
+    # The HEAD probe is the same first-read guard as the history tools': a
+    # workspace with no readable history gets the plain answer, not a push
+    # error.
+    head(source).commitSHA rescue { e: Error =>
+      return noHistory(e.message)
+    }
+    let result = head(source).push(
+      branch: branch,
+      expectedRemoteSHA: expectedRemoteSHA,
+    ).{{ref, previousSHA, sha, disposition}} rescue { e: Error =>
+      raise `push failed: ${plainError(e.message)}`
+    }
+    let summary = case (result.disposition) {
+      GitPushDisposition.UP_TO_DATE =>
+        `${result.ref} is already up to date at ${short(result.sha)}; nothing to push.`
+      GitPushDisposition.CREATED =>
+        `Pushed ${result.ref} (new branch) at ${short(result.sha)}.`
+      GitPushDisposition.FORCED =>
+        `Pushed ${result.ref}: forced ${short(result.previousSHA)} -> ${short(result.sha)}.`
+      else =>
+        `Pushed ${result.ref}: ${short(result.previousSHA)} -> ${short(result.sha)}.`
+    }
+    let left = source.git.uncommitted.diffStats.{{path}}.length
+    let leftNote = if (left > 0) {
+      "\n" + `${toString(left)} file(s) remain uncommitted and were not pushed; status shows them.`
+    } else {
+      ""
+    }
+    summary + leftNote
   }
 
   # --------------------------------------------------------------- history
@@ -650,6 +714,10 @@ type Committer {
     - `commit` — record pending changes as a commit and advance HEAD. Without
       `paths` it commits EVERYTHING `status` lists; with `paths`, only those
       changes, leaving the rest pending.
+    - `push` — publish committed history to the checkout's remote. Pending
+      changes are not pushed: commit first. A rejected push (the remote
+      moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
+      hatch, for when overwriting the remote is genuinely intended.
     - `log` — commits newest first. Pass `paths` to see who last touched a
       file and why, `grep` to search commit messages, and `full: true` to
       print full message bodies.
@@ -668,7 +736,8 @@ type Committer {
     writing a message to match the repository's conventions; keep commits
     focused, scoping with `paths` when only part of your pending work belongs
     together. Only commit when asked to, or when the task clearly calls for
-    it. The reading tools re-read the current state on every call, so re-run
-    them after making edits.
+    it — and only push when asked: a push leaves the workspace and publishes
+    to the remote. The reading tools re-read the current state on every call,
+    so re-run them after making edits.
   """
 }
