@@ -7,7 +7,8 @@
   "dependencies": [
     {
       "name": "editor",
-      "source": "../editor"
+      "source": "github.com/vito/editor",
+      "pin": "f27ffcef3dd65bfe3f764af6c29e98f821dc8a81"
     }
   ]
 }
