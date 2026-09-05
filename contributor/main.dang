@@ -31,8 +31,7 @@
 # against; it's a property of the project rather than of any one task (a
 # permanent fork would simply configure a different value).
 
-# Tail-truncate command output to keep tool results context-friendly (same
-# helper shape as modules/tui-qa and modules/engine-lab).
+# Tail-truncate command output to keep tool results context-friendly.
 let tailLines = 200
 # Patches read top-down, so they get head-truncated instead.
 let patchLines = 400

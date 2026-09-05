@@ -4,9 +4,9 @@
 #
 # Coding agents normally get curated tools (checks, generators, editor tools);
 # this module is for the rest: ad-hoc commands that need a real container.
-# It follows the session-state pattern of modules/engine-lab (state in `let`
-# fields, @cache(Never) + nonce cache-busting, per-call workspace copying)
-# and the Map-state pattern of modules/staff.
+# Session state lives in `let` fields (@cache(Never) + nonce cache-busting,
+# per-call workspace copying), following the Map-state pattern of the staff
+# module.
 #
 # Mechanics per session (a named entry in the private maps):
 #   - `exec` copies the caller's workspace to /workspace in the sandbox
@@ -166,7 +166,7 @@ type Sandbox {
   ): Sandbox! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): running a command is a side effect; a cached replay
     # would silently skip it. The nonce env var busts the exec cache
-    # underneath for the same reason (same trick as engine-lab).
+    # underneath for the same reason.
     let name = sessionName(session)
     if (fresh) {
       self.afters = self.afters.without(name)

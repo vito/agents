@@ -9,17 +9,16 @@
 # up under this tool call in the TUI, see the conversation nesting in
 # dagql/dagui/conversation.go) and hands back a single concise report.
 #
-# Modeled on ./modules/tui-qa (the @agent-tools shape). The sub-agent is a fresh
-# root `llm` conversation (Query.llm — inherits the session's default model and
-# auth) bound to the same Workspace as the parent (auto-filled; see
-# core/llm_object_tools.go), so it has the same tools. It runs to completion via
-# `loop` and we surface its `lastReply`.
+# The sub-agent is a fresh root `llm` conversation (Query.llm — inherits the
+# session's default model and auth) bound to the same Workspace as the parent
+# (auto-filled; see core/llm_object_tools.go), so it has the same tools. It
+# runs to completion via `loop` and we surface its `lastReply`.
 #
 # The sub-agent shares the parent's WORKSPACE, not its session: composing the
 # workspace's agents builds fresh module instances, so none of the
-# parent's live session state comes along — no running engine-lab engine, no
-# live tui-qa TUI session, no bound-object state (e.g. engine = null). Tools
-# that hold live state start fresh and would have to rebuild.
+# parent's live session state comes along — no running sandbox session, no
+# bound-object state. Tools that hold live state start fresh and would have
+# to rebuild.
 #
 # Two flavors:
 #   - `delegate` reports back in text only: investigative / QA / analysis
@@ -57,7 +56,7 @@ type Delegate {
   well-scoped legwork — e.g. "build and run the agent, drive the TUI, and report
   just the final screen and whether it panicked" — and keep your own context
   focused. The sub-agent shares your WORKSPACE, not your session: tools that
-  hold live state (engine-lab's engine, tui-qa's TUI session) start fresh and
+  hold live state (e.g. a sandbox session's container) start fresh and
   would have to rebuild — so either delegate tasks that are cheap to set up,
   or pass any needed endpoints/details explicitly in the task text.
   Note: this tool does NOT merge the sub-agent's workspace edits back,
@@ -97,7 +96,7 @@ type Delegate {
   report is surfaced above the patch summary.
 
   The sub-agent shares your WORKSPACE, not your session: tools that hold live
-  state (engine-lab's engine, tui-qa's TUI session) start fresh in its sandbox
+  state (e.g. a sandbox session's container) start fresh in its sandbox
   and would have to rebuild — so keep delegated edits cheap to set up, or pass
   any needed endpoints/details explicitly in the task text.
   """
@@ -140,7 +139,7 @@ type Delegate {
       step on each other's toes too much.
 
     The sub-agent shares your WORKSPACE, not your session: tools that hold
-    live state (engine-lab's engine, tui-qa's TUI session) start fresh and
+    live state (e.g. a sandbox session's container) start fresh and
     would have to rebuild — so either delegate tasks that are cheap to set
     up, or pass any needed endpoints/details explicitly in the task text.
 
