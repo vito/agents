@@ -12,6 +12,12 @@ source = "github.com/vito/editor"
 [modules.committer]
 source = "committer"
 
+[modules.contributor]
+source = "contributor"
+
+[modules.contributor.settings]
+githubToken = "cmd://gh auth token"
+
 [modules.dagger-dang-sdk.as-sdk]
 name = "dang"
 
