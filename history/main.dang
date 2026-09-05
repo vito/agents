@@ -1,18 +1,12 @@
-# history: let a Dagger coding agent read git history — both the commits it has
-# staged in its workspace this session and the checkout's real pre-session
-# history — the `git log` / `git show` half of self-review.
-#
-# `review` covers *uncommitted* changes (status/diff) and `commit` prints a
-# summary at the moment it runs, but until now nothing could look back at a
-# commit, and nothing at all could read the history the checkout arrived with.
+# history: let a Dagger coding agent read the checkout's git history — the
+# `git log` / `git show` half of self-review. `review` covers *uncommitted*
+# changes (status/diff); these tools look back at commits.
 #
 # Two API routes, deliberately layered:
 #
-#   * Workspace.git.head is a GitRef — for a workspace with staged commits it
-#     resolves to the STAGED tip, so head.log(limit:, paths:, base:) walks the
-#     staged commits and the checkout's history as one namespace. Cheap: the
-#     workspace's repository is materialized once per session either way (the
-#     existing staged-commit tools already pay it).
+#   * Workspace.git.head is a GitRef — head.log(limit:, paths:) walks the
+#     checkout's history. Cheap: the workspace's repository is materialized
+#     once per session and the walk reads straight from it.
 #   * head.tree(discardGitDir: false, depth: 0).asGit is a full GitRepository
 #     rebuilt from that materialization: ref(name:) and commit(id:) resolve
 #     arbitrary shas and tags, and GitCommit.tree gives the filesystem at a
@@ -20,8 +14,7 @@
 #     cached for the rest of the session), so it is only reached for the tools
 #     that genuinely need a tree.
 """
-Read-only view of this workspace's git history: the commits staged in this
-session and the checkout's own history.
+Read-only view of this workspace's git history.
 """
 type History {
   """
@@ -34,21 +27,14 @@ type History {
   }
 
   """
-  Show the repository's commit history, newest first — the commits you have
-  staged in this session on top of the commits the checkout arrived with.
+  Show the repository's commit history, newest first.
 
-  Each entry is one line — short hash, date, author, subject. The commits you
-  staged this session are marked [staged], and the newest few of them are
-  shown with their full message and the files they touched; older staged
-  commits fall back to the one-line form, still marked, and `full: true`
-  brings them all back. Staged commits live in the workspace and only reach
-  the user's checkout when the session is saved; everything below them is the
-  checkout's real history, which you cannot change.
+  Each entry is one line — short hash, date, author, subject — and
+  `full: true` prints every commit's full message body.
 
-  Use it to see what you have committed so far, to learn how this repository
-  writes commit messages (`full: true` prints the bodies), or — with `paths` —
-  to find out who last touched a file and why. For one commit's actual patch,
-  use `show`.
+  Use it to learn how this repository writes commit messages (`full: true`
+  prints the bodies), or — with `paths` — to find out who last touched a file
+  and why. For one commit's actual patch, use `show`.
   """
   log(
     source: Workspace!,
@@ -71,18 +57,10 @@ type History {
     """
     grep: String = null,
     """
-    Print the full message body of every commit, not just the subject — and
-    every staged commit's file rows, not only the newest few.
+    Print the full message body of every commit, not just the subject.
     """
     full: Boolean! = false,
   ): String! {
-    let git = source.git
-    # The first read of the workspace's git state, and so the first place a
-    # checkout that is not a git repository at all gives out: `Workspace.git`
-    # itself fails there, well before the walk below.
-    let stagedShas = git.stagedCommits.{{sha}}.map { c => c.sha } rescue { e: Error =>
-      return noHistory(e.message)
-    }
     # One PAST `limit` when there is no grep to widen the walk: the footer's
     # "there is more below" can only be honest if the walk was allowed to find
     # one more commit than the listing prints. `takeFirst(limit)` below drops it
@@ -91,10 +69,10 @@ type History {
     let walk = head(source).log(
       limit: scanned,
       paths: if (paths.isEmpty) { null } else { paths },
-    ).{{sha, shortSha, authorName, authoredDate, message}} rescue { e: Error =>
-      # A repository with git metadata but no resolvable HEAD — a fresh
-      # `git init` with nothing committed yet — gets past the read above and
-      # gives out here instead.
+    ).{{shortSha, authorName, authoredDate, message}} rescue { e: Error =>
+      # The first read of the workspace's git state: a synthetic workspace, a
+      # checkout that is not a git repository at all, or a fresh `git init`
+      # with nothing committed yet all give out here.
       return noHistory(e.message)
     }
     let matched = if (grep == null) {
@@ -111,26 +89,9 @@ type History {
       return emptyLog(paths, grep)
     }
 
-    # The staged section is bounded like everything else here: only the newest
-    # few staged commits render in full, and the rest fall back to the one-line
-    # form — still marked [staged], so the boundary between your work and the
-    # checkout's history stays visible. Without this the default listing grows
-    # all session long, one full commit message at a time.
-    let stagedShown = shown.filter { c => stagedShas.contains(c.sha) }.map { c => c.sha }
-    let inFull = if (full) { stagedShown } else { stagedShown.takeFirst(stagedInFull) }
-    let elidedStaged = stagedShown.length - inFull.length
-
     let entries = shown.map { c =>
-      let staged = stagedShas.contains(c.sha)
-      let mark = if (staged) { "  [staged]" } else { "" }
-      let header = `${c.shortSha}  ${when(c.authoredDate)}  ${c.authorName}${mark}`
-      if (staged and inFull.contains(c.sha)) {
-        # Your own recent work in full: message and the files the commit recorded.
-        header + "\n" +
-          indent(clampLines(c.message.trimSpace, messageLines,
-            `(message truncated — show(commit: "${c.shortSha}") for all of it)`)) +
-          stagedFileRows(source, c.sha)
-      } else if (full) {
+      let header = `${c.shortSha}  ${when(c.authoredDate)}  ${c.authorName}`
+      if (full) {
         header + "\n" +
           indent(clampLines(c.message.trimSpace, messageLines,
             `(message truncated — show(commit: "${c.shortSha}") for all of it)`))
@@ -140,7 +101,7 @@ type History {
     }
 
     # Footer notes, in the order a reader wants them: what the search covered,
-    # whether history continues below it, and what this listing abbreviated.
+    # then whether history continues below it.
     let searchNote = if (grep == null) {
       ""
     } else {
@@ -163,26 +124,19 @@ type History {
     } else {
       ""
     }
-    let stagedNote = if (elidedStaged > 0) {
-      `(${toString(elidedStaged)} older staged commit(s) shown as subjects; ` +
-        "pass full: true, or show(commit:) for one in full)"
-    } else {
-      ""
-    }
-    let notes = [searchNote, moreNote, stagedNote].filter { n => n != "" }
+    let notes = [searchNote, moreNote].filter { n => n != "" }
     let footer = if (notes.isEmpty) { "" } else { "\n\n" + notes.join("\n") }
 
-    banner(source, stagedShas) + "\n\n" + entries.join("\n\n") + footer
+    banner(source) + "\n\n" + entries.join("\n\n") + footer
   }
 
   """
   Show one commit in full: its metadata, message, per-file stats and patch —
-  `git show`, for a commit you staged this session or one from the checkout's
-  history.
+  `git show` for any commit in the checkout's history.
 
-  `commit` names it: "HEAD" (the newest commit, staged or not), a short or
-  full hash as printed by `log`, or a tag name. With `against`, the patch is
-  the difference between the two commits instead of the commit's own change,
+  `commit` names it: "HEAD" (the newest commit), a short or full hash as
+  printed by `log`, or a tag name. With `against`, the patch is the
+  difference between the two commits instead of the commit's own change,
   which is how you review a whole stack ("everything since <sha>") or compare
   against a release tag.
 
@@ -217,29 +171,12 @@ type History {
     """
     maxLines: Int! = 400,
   ): String! {
-    let git = source.git
-    let staged = git.stagedCommits.{{sha, date, authorName, authorEmail, message}} rescue { e: Error =>
+    # The first read of the workspace's git state: a checkout with no readable
+    # history gives out here, with a plain answer instead of an engine error.
+    let headSha = head(source).commitSHA rescue { e: Error =>
       return noHistory(e.message)
     }
-    let want = resolveSpec(source, commit, staged.map { c => c.sha })
-
-    # Fast path: a commit staged this session carries its own changeset, so
-    # there is no tree to materialize.
-    let stagedHit = staged.filter { c => c.sha == want }
-    if (against == null and !stagedHit.isEmpty) {
-      let patches = git.stagedCommits.{{
-        sha, changes.{{ asPatch.{{contents}}, diffStats.{{path, kind, addedLines, removedLines}} }},
-      }}.filter { c => c.sha == want }
-      let meta = stagedHit.map { c =>
-        `commit ${c.sha}  [staged this session]` + "\n" +
-        `Author: ${c.authorName} <${c.authorEmail}>` + "\n" +
-        `Date:   ${when(c.date)}` + "\n\n" +
-        indent(c.message.trimSpace)
-      }.join("")
-      let stats = patches.map { c => statBlock(c.changes.diffStats, paths, maxFiles) }.join("")
-      let patch = patches.map { c => c.changes.asPatch.contents ?? "" }.join("")
-      return meta + "\n\n" + stats + "\n\n" + patchBlock(patch, paths, maxLines)
-    }
+    let want = resolveSpec(source, commit, headSha)
 
     let repo = repository(source)
     let target = repo.commit(id: want).{{
@@ -248,7 +185,7 @@ type History {
     let baseSpec = if (against == null) {
       target.parentShas.takeFirst.join("")
     } else {
-      resolveSpec(source, against ?? "", staged.map { c => c.sha })
+      resolveSpec(source, against ?? "", headSha)
     }
     let changes = if (baseSpec == "") {
       # A root commit has no parent: everything in it is an addition.
@@ -266,7 +203,7 @@ type History {
       ""
     }
     let meta = if (against == null) {
-      `commit ${target.sha}${stagedMark(target.sha, staged.map { c => c.sha })}` + "\n" +
+      `commit ${target.sha}` + "\n" +
         `Author: ${target.authorName} <${target.authorEmail}>` + "\n" +
         `Date:   ${when(target.authoredDate)}` + mergeNote + "\n\n" +
         indent(target.message.trimSpace)
@@ -307,11 +244,12 @@ type History {
     """
     limit: Int! = 400,
   ): String! {
-    let git = source.git
-    let stagedShas = git.stagedCommits.{{sha}}.map { c => c.sha } rescue { e: Error =>
+    # The first read of the workspace's git state: a checkout with no readable
+    # history gives out here, with a plain answer instead of an engine error.
+    let headSha = head(source).commitSHA rescue { e: Error =>
       return noHistory(e.message)
     }
-    let want = resolveSpec(source, commit, stagedShas)
+    let want = resolveSpec(source, commit, headSha)
     let repo = repository(source)
     let target = repo.commit(id: want).{{shortSha, message, authoredDate}}
     let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue { e: Error =>
@@ -349,14 +287,6 @@ type History {
   # whole answer.
   let maxFiles: Int! = 40
 
-  # How many of the newest staged commits `log` renders in full. Those are the
-  # ones an agent is actually recalling — what it just did, and what it wrote
-  # about it — while an older one is something it can pull up with show(commit:)
-  # when it needs it. Unbounded, this section grows for the whole session, and
-  # it grows on the DEFAULT call, which is the one that must not flood the
-  # caller's context.
-  let stagedInFull: Int! = 3
-
   let head(source: Workspace!): Dagger.GitRef! {
     source.git.head
   }
@@ -371,11 +301,11 @@ type History {
     message.replaceMatches(`\s*\[traceparent:[^\]]*\]`, with: "").trimSpace
   }
 
-  # Where every tool's FIRST read of the workspace's git state sends its
-  # failure. A synthetic workspace, or a checkout that is not a git repository
-  # at all, fails at `Workspace.git` itself — before any walk, and identically
-  # for all three tools — so the plain-language answer has to sit on that read,
-  # not on the history walk further down.
+  # Where each tool's FIRST read of the workspace's git state sends its
+  # failure: a synthetic workspace, a checkout that is not a git repository at
+  # all, or a fresh `git init` with nothing committed yet. The plain-language
+  # answer sits on that first read — `log`'s history walk, and the HEAD probe
+  # in `show` and `fileAt` — before anything else touches the repository.
   let noHistory(reason: String!): String! {
     `This workspace has no readable git history (${plainError(reason)}). ` +
       "Your pending edits are still visible with the review tools."
@@ -391,12 +321,13 @@ type History {
   }
 
   # Resolve a user-supplied commit spelling to a full sha: "HEAD"/"" for the
-  # tip, an exact or abbreviated hash from the recent walk, or anything the
-  # repository can resolve by name (a tag, the current branch).
-  let resolveSpec(source: Workspace!, spec: String!, stagedShas: [String!]!): String! {
+  # tip (already resolved by the caller's first read), an exact or abbreviated
+  # hash from the recent walk, or anything the repository can resolve by name
+  # (a tag, the current branch).
+  let resolveSpec(source: Workspace!, spec: String!, headSha: String!): String! {
     let want = spec.trimSpace
     if (want == "" or want == "HEAD") {
-      return head(source).commitSHA
+      return headSha
     }
     if (want.containsMatch(`^[0-9a-fA-F]{4,40}$`)) {
       let known = head(source).log(limit: searchWindow).{{sha}}.map { c => c.sha }
@@ -412,29 +343,6 @@ type History {
       raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` +
         `and not a name this repository knows (${plainError(e.message)})`
     }
-  }
-
-  # Per-file rows for one staged commit, as indented rows under its message.
-  let stagedFileRows(source: Workspace!, sha: String!): String! {
-    let hit = source.git.stagedCommits.{{
-      sha, changes.{{ diffStats.{{path, kind, addedLines, removedLines}} }},
-    }}.filter { c => c.sha == sha }
-    let rows = hit.map { c =>
-      let stats = c.changes.diffStats
-      let listed = stats.takeFirst(maxFiles)
-      let text = listed.map { s =>
-        `      ${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
-      }.join("\n")
-      # Count what was dropped from the LIST, not from the rendered text: an
-      # empty list still renders as one (empty) line when re-split.
-      let omitted = stats.length - listed.length
-      if (omitted > 0) {
-        text + "\n" + `      ... ${toString(omitted)} more file(s)`
-      } else {
-        text
-      }
-    }.join("")
-    if (rows == "") { "" } else { "\n" + rows }
   }
 
   let statBlock(
@@ -512,14 +420,9 @@ type History {
       `... ${toString(lines.length - max)} of ${toString(lines.length)} lines not shown. ` + note
   }
 
-  let banner(source: Workspace!, stagedShas: [String!]!): String! {
+  let banner(source: Workspace!): String! {
     let branch = head(source).name.trimPrefix("refs/heads/") rescue { e: Error => "?" }
-    if (stagedShas.isEmpty) {
-      return `On ${branch}, HEAD ${short(head(source).commitSHA)}; nothing staged in this workspace yet.`
-    }
-    let base = head(source).log(limit: stagedShas.length + 1).{{sha}}.map { c => c.sha }.takeLast(1).join("")
-    `On ${branch}: ${toString(stagedShas.length)} commit(s) staged in this session, ` +
-      `on top of the checkout's HEAD ${short(base)}.`
+    `On ${branch}, HEAD ${short(head(source).commitSHA)}.`
   }
 
   let emptyLog(paths: [String!]!, grep: String): String! {
@@ -543,10 +446,6 @@ type History {
 
   let short(sha: String!): String! {
     sha.split("", 8).takeFirst(7).join("")
-  }
-
-  let stagedMark(sha: String!, stagedShas: [String!]!): String! {
-    if (stagedShas.contains(sha)) { "  [staged this session]" } else { "" }
   }
 
   # RFC3339 in, "2026-08-14 03:15" out: the seconds and the zone are noise in
@@ -575,20 +474,17 @@ type History {
   let systemPrompt: String! = """
     You can read this repository's git history with the History tools:
 
-    - `log` — commits newest first: the ones you have staged this session
-      (marked [staged]) on top of the checkout's own history. Pass `paths` to
-      see who last touched a file and why, `grep` to search commit messages.
+    - `log` — commits newest first. Pass `paths` to see who last touched a
+      file and why, `grep` to search commit messages, and `full: true` to
+      print full message bodies.
     - `show` — one commit in full: metadata, message, per-file stats and the
       patch. Takes "HEAD", a short hash from `log`, or a tag; `against` turns
       it into a comparison between two commits.
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
 
-    The commits you stage live in the workspace and only reach the user's
-    checkout when the session is saved; everything below them is the
-    checkout's real history, which these tools cannot change. Use `log`
-    before writing a commit message to match the repository's conventions,
-    and `show` to check what a commit of yours actually recorded.
+    Use `log` before writing a commit message to match the repository's
+    conventions, and `show` to check what a commit actually recorded.
 
     For changes that are NOT yet committed, use the review tools (`status` /
     `diff`) instead. All of these are read-only.
