@@ -6,11 +6,11 @@
 [modules.dagger-dang-sdk]
 source = "github.com/dagger/dang-sdk"
 
+[modules.editor]
+source = "github.com/vito/editor"
+
 [modules.dagger-dang-sdk.as-sdk]
 name = "dang"
-
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "editor"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "claude"
@@ -23,9 +23,6 @@ path = "contributor"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "delegate"
-
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "engine-lab"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "history"
