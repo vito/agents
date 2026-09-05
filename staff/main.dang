@@ -875,7 +875,7 @@ type Staff {
   }
 
   # The enum params are declared NULLABLE so the module keeps compiling
-  # whichever nullability a projected record hands back (history's
+  # whichever nullability a projected record hands back (committer's
   # renderKind does the same), and every case gets a trailing else arm.
   let pickLabel(
     status: WorkspaceCommitPickStatus,
