@@ -9,6 +9,9 @@ source = "github.com/dagger/dang-sdk"
 [modules.editor]
 source = "github.com/vito/editor"
 
+[modules.committer]
+source = "committer"
+
 [modules.dagger-dang-sdk.as-sdk]
 name = "dang"
 
@@ -19,19 +22,16 @@ path = "claude"
 path = "codex"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "committer"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "contributor"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "delegate"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "history"
-
-[[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "librarian"
-
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "review"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "sandbox"

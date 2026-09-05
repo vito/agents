@@ -1,9 +1,14 @@
-# history: let a Dagger coding agent read the checkout's git history — the
-# `git log` / `git show` half of self-review. `review` covers *uncommitted*
-# changes (status/diff); these tools look back at commits.
+# committer: a Dagger coding agent's git toolbox — everything git-concerned in
+# one module. It replaces the former `review` module (the uncommitted half:
+# status/diff) and `history` module (the committed half: log/show/fileAt), and
+# adds the write operation they both lacked: `commit`.
 #
-# Two API routes, deliberately layered:
+# A Dagger-native agent has no Bash tool, and the mounted Workspace is a plain
+# snapshot with NO .git, so `git` itself is never an option. Everything here
+# goes through the Dagger-native workspace git API, deliberately layered:
 #
+#   * Workspace.git.uncommitted is a Changeset of the pending changes: its
+#     .diffStats and .asPatch render the `git status` / `git diff` half.
 #   * Workspace.git.head is a GitRef — head.log(limit:, paths:) walks the
 #     checkout's history. Cheap: the workspace's repository is materialized
 #     once per session and the walk reads straight from it.
@@ -13,18 +18,152 @@
 #     commit. Costs one full checkout materialization (~5s on dagger/dagger,
 #     cached for the rest of the session), so it is only reached for the tools
 #     that genuinely need a tree.
+#   * Workspace.withCommit(message:, paths:, date:) records pending changes as
+#     a commit and returns a workspace with HEAD advanced. Returning that
+#     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
+#     workspace to the returned state. `date` is required (for reproducible
+#     commits); currentTimestamp supplies it.
 """
-Read-only view of this workspace's git history.
+Git operations on this workspace: review pending changes, read the checkout's
+history, and commit.
 """
-type History {
+type Committer {
   """
-  Compose the history tools onto a base LLM.
+  Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
     base
       .withTools(currentNode)
       .withSystemPrompt(systemPrompt)
   }
+
+  # ------------------------------------------------------- pending changes
+
+  """
+  Summarize the workspace's pending changes: one line per changed file — its
+  change kind (A/M/D/R) and added/removed line counts — followed by a totals
+  footer. This is the quick "git status"-style overview; reach for `diff` when
+  you need the actual hunks.
+
+  The marks are diff vocabulary describing the path's state relative to the
+  last commit, NOT `git status` porcelain: there is no index here, so a file
+  git would call untracked is simply `A`, and nothing distinguishes staged
+  from unstaged. One consequence worth knowing: `commit` without `paths`
+  picks up those `A` files too, unlike `git commit -a`.
+  """
+  status(
+    source: Workspace!,
+    """
+    Relative paths (files or directories) to limit the summary to, like
+    `git status -- <paths>`. A directory matches everything beneath it. Empty
+    summarizes all pending changes.
+    """
+    paths: [String!]! = [],
+  ): String! {
+    let scoped = pendingStats(source, paths)
+    if (scoped.isEmpty) {
+      if (paths.isEmpty) {
+        return "No pending changes."
+      }
+      return "No pending changes under the given paths."
+    }
+    let rows = scoped.map { s =>
+      `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
+    }
+    let added = scoped.reduce(0) { acc, s => acc + (s.addedLines ?? 0) }
+    let removed = scoped.reduce(0) { acc, s => acc + (s.removedLines ?? 0) }
+    let footer = `${toString(scoped.length)} files changed, +${toString(added)} -${toString(removed)}`
+    rows.join("\n") + "\n\n" + footer
+  }
+
+  """
+  Show the workspace's pending changes as a Git-compatible unified diff — the
+  full hunks across every changed file. Use `status` first for a compact
+  overview; use this to actually read the edits (e.g. before committing or
+  summarizing your work, or to confirm an edit landed as intended).
+
+  Pass `paths` to scope the output: the full diff of a workspace with a lot of
+  pending changes can be enormous.
+  """
+  diff(
+    source: Workspace!,
+    """
+    Relative paths (files or directories) to show the diff for, like
+    `git diff -- <paths>`. A directory matches everything beneath it. Empty
+    shows every pending change.
+    """
+    paths: [String!]! = [],
+  ): String! {
+    let changes = source.git.uncommitted
+    if (changes.isEmpty) {
+      return "No pending changes."
+    }
+    let scoped = scopePatch(changes.asPatch.contents, paths)
+    if (scoped == "") {
+      return "No pending changes under the given paths."
+    }
+    scoped
+  }
+
+  """
+  Record the workspace's pending changes as a git commit and advance HEAD.
+
+  Without `paths`, EVERYTHING `status` lists is committed — including files
+  git would call untracked, since there is no staging area here (unlike
+  `git commit -a`). With `paths`, only the changes on those paths are
+  committed and the rest stay pending.
+
+  Review with `status` / `diff` before committing, and read `log` first to
+  match this repository's commit message conventions. Authorship defaults to
+  the identity the workspace was loaded with.
+  """
+  commit(
+    source: Workspace!,
+    """
+    The commit message: a one-line subject, optionally followed by a blank
+    line and a body explaining why.
+    """
+    message: String!,
+    """
+    Literal paths (files or directories, no globs) to commit, relative to the
+    workspace root, like `git commit -- <paths>`. Empty commits every pending
+    change. A rename must include both its old and new path.
+    """
+    paths: [String!]! = [],
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): committing is a side effect on the workspace's state; a
+    # later identical call must record a fresh commit, not replay the first.
+    if (message.trimSpace == "") {
+      raise "commit: the message must not be empty"
+    }
+    let picked = pendingStats(source, paths)
+    if (picked.isEmpty) {
+      if (paths.isEmpty) {
+        raise "nothing to commit: no pending changes"
+      }
+      raise "nothing to commit under the given paths (status shows what is pending)"
+    }
+
+    let committed = source.withCommit(message, paths: paths, date: currentTimestamp)
+    # Force the commit HERE, inside the tool: without this the failure would
+    # surface later, when the engine rebinds the workspace, stripped of the
+    # context of what was being committed.
+    let sha = committed.git.head.commitSHA rescue { e: Error =>
+      raise `commit failed: ${plainError(e.message)}`
+    }
+
+    let left = committed.git.uncommitted.diffStats.{{path}}.length
+    let leftNote = if (left > 0) {
+      "\n" + `${toString(left)} file(s) remain uncommitted; status shows them.`
+    } else {
+      ""
+    }
+    print(`Committed ${short(sha)}: ${subject(message)} ` +
+      `(${toString(picked.length)} file(s))` + leftNote)
+    committed
+  }
+
+  # --------------------------------------------------------------- history
 
   """
   Show the repository's commit history, newest first.
@@ -291,6 +430,27 @@ type History {
     source.git.head
   }
 
+  # The pending changes' per-file stats, scoped to `paths`. Shared by status
+  # (to render them) and commit (to refuse an empty commit up front).
+  let pendingStats(
+    source: Workspace!,
+    paths: [String!]!,
+  ): [{{kind: DiffStatKind!, addedLines: Int!, removedLines: Int!, path: String!, oldPath: String}}]! {
+    let stats = source.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path, oldPath}}
+    if (paths.isEmpty) {
+      return stats
+    }
+    stats.filter { s =>
+      # A rename is ONE stat, keyed on the NEW path with the old one
+      # alongside in oldPath (null for every other kind). `diff` keeps a
+      # section when EITHER name in its header is scoped, so match either
+      # name here too, or the tools disagree about renames. An absent
+      # oldPath spells "" and would match the whole tree, so drop it.
+      let names = [s.path] + [s.oldPath ?? ""].filter { n => n != "" }
+      names.any { n => paths.any { p => Path(p).contains(Path(n)) } }
+    }
+  }
+
   # Engine errors carry a "[traceparent:<trace>-<span>]" marker so an agent can
   # go read the failing span's logs. Every failure these tools rescue, though,
   # is an ordinary mistake in a tool argument — a typo in a commit spelling, a
@@ -301,14 +461,14 @@ type History {
     message.replaceMatches(`\s*\[traceparent:[^\]]*\]`, with: "").trimSpace
   }
 
-  # Where each tool's FIRST read of the workspace's git state sends its
+  # Where each history tool's FIRST read of the workspace's git state sends its
   # failure: a synthetic workspace, a checkout that is not a git repository at
   # all, or a fresh `git init` with nothing committed yet. The plain-language
   # answer sits on that first read — `log`'s history walk, and the HEAD probe
   # in `show` and `fileAt` — before anything else touches the repository.
   let noHistory(reason: String!): String! {
     `This workspace has no readable git history (${plainError(reason)}). ` +
-      "Your pending edits are still visible with the review tools."
+      "Your pending edits are still visible with status / diff."
   }
 
   # The workspace's checkout as a real GitRepository: the tree at HEAD *with*
@@ -392,6 +552,10 @@ type History {
     clampLines(scoped, max, "(patch truncated — scope it with paths, or read the file with fileAt)")
   }
 
+  # Scope a patch to `paths` by slicing it into its per-file sections: each one
+  # starts with a "diff --git <old> <new>" header at the start of a line, and
+  # body lines are always prefixed (+/-/space/@/index...), so they can never be
+  # mistaken for a header.
   let scopePatch(patch: String!, paths: [String!]!): String! {
     if (paths.isEmpty) {
       return patch
@@ -400,6 +564,8 @@ type History {
     let kept = sections.filter { section =>
       let header = section.split("\n", 2).takeFirst.join("")
       header.split(" ").any { candidate =>
+        # headers are always rendered as "a/<path> b/<path>"; tolerate a bare
+        # spelling too, so scoping survives a change in patch prefixing.
         [candidate, candidate.trimPrefix("a/"), candidate.trimPrefix("b/")].uniq.any { p =>
           paths.any { scope => Path(scope).contains(Path(p)) }
         }
@@ -459,8 +625,8 @@ type History {
 
   let patchHeader: String! = "diff --git "
 
-  # Nullable: the projected record's fields inherit nullability from the
-  # nullable `changes` field they were selected through.
+  # Nullable: `show`'s stats reach here through a projection of the nullable
+  # `changes` field, whose record fields inherit its nullability.
   let renderKind(kind: DiffStatKind): String! {
     case (kind) {
       DiffStatKind.ADDED => "A"
@@ -472,8 +638,18 @@ type History {
   }
 
   let systemPrompt: String! = """
-    You can read this repository's git history with the History tools:
+    You have git tools for this workspace, covering your pending changes, the
+    checkout's history, and committing:
 
+    - `status` — a compact per-file overview of your pending changes (change
+      kind + added/removed line counts). Start here to see what you've
+      touched.
+    - `diff` — those same changes as a full Git-style unified patch, when you
+      need to read the actual hunks. Scope it with `paths`; an unscoped patch
+      can be huge.
+    - `commit` — record pending changes as a commit and advance HEAD. Without
+      `paths` it commits EVERYTHING `status` lists; with `paths`, only those
+      changes, leaving the rest pending.
     - `log` — commits newest first. Pass `paths` to see who last touched a
       file and why, `grep` to search commit messages, and `full: true` to
       print full message bodies.
@@ -483,10 +659,16 @@ type History {
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
 
-    Use `log` before writing a commit message to match the repository's
-    conventions, and `show` to check what a commit actually recorded.
+    The A/M/D/R marks in `status` describe each path relative to the last
+    commit, not `git status`'s index model — there is no staging area here,
+    so a file git would call untracked is just `A`, and `commit` without
+    `paths` includes those, unlike `git commit -a`.
 
-    For changes that are NOT yet committed, use the review tools (`status` /
-    `diff`) instead. All of these are read-only.
+    Committing well: review with `status` / `diff` first; read `log` before
+    writing a message to match the repository's conventions; keep commits
+    focused, scoping with `paths` when only part of your pending work belongs
+    together. Only commit when asked to, or when the task clearly calls for
+    it. The reading tools re-read the current state on every call, so re-run
+    them after making edits.
   """
 }
