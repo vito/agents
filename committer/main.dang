@@ -32,6 +32,13 @@ history, commit, and push.
 """
 type Committer {
   """
+  Identity to record as a "Signed-off-by:" trailer on every commit made with
+  `commit`, e.g. "Ada Lovelace <ada@example.com>". Empty (the default)
+  records no trailer.
+  """
+  signoff: String! = ""
+
+  """
   Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
@@ -118,7 +125,9 @@ type Committer {
 
   Review with `status` / `diff` before committing, and read `log` first to
   match this repository's commit message conventions. Authorship defaults to
-  the identity the workspace was loaded with.
+  the identity the workspace was loaded with. When the module is configured
+  with a `signoff` identity, a "Signed-off-by:" trailer is appended to the
+  message automatically — never write one yourself.
   """
   commit(
     source: Workspace!,
@@ -147,7 +156,7 @@ type Committer {
       raise "nothing to commit under the given paths (status shows what is pending)"
     }
 
-    let committed = source.withCommit(message, paths: paths, date: currentTimestamp)
+    let committed = source.withCommit(signedOff(message), paths: paths, date: currentTimestamp)
     # Force the commit HERE, inside the tool: without this the failure would
     # surface later, when the engine rebinds the workspace, stripped of the
     # context of what was being committed.
@@ -492,6 +501,34 @@ type Committer {
 
   let head(source: Workspace!): Dagger.GitRef! {
     source.git.head
+  }
+
+  # Append the configured Signed-off-by trailer to a commit message, the way
+  # `git commit -s` does: straight onto an existing trailer block when the
+  # message already ends in one, after a blank line otherwise. A message
+  # already carrying this exact trailer is left alone.
+  let signedOff(message: String!): String! {
+    let who = signoff.trimSpace
+    if (who == "") {
+      return message
+    }
+    let trailer = `Signed-off-by: ${who}`
+    let body = message.trimSpace
+    let lines = body.split("\n")
+    if (lines.any { line => line.trimSpace == trailer }) {
+      return message
+    }
+    # A last line shaped like a trailer ("Key: value") means the message ends
+    # in a trailer block ("Co-authored-by: ...", "Fixes: #123") and the
+    # signoff belongs inside it. A single-line message is only a subject —
+    # "fix: frobnicate" is not a trailer — so it always gets the blank line.
+    let lastLine = lines.takeLast.join("")
+    let separator = if (lines.length > 1 and lastLine.containsMatch(`^[A-Za-z][A-Za-z0-9-]*: \S`)) {
+      "\n"
+    } else {
+      "\n\n"
+    }
+    body + separator + trailer
   }
 
   # The pending changes' per-file stats, scoped to `paths`. Shared by status
