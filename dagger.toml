@@ -18,6 +18,9 @@ source = "contributor"
 [modules.contributor.settings]
 githubToken = "cmd://gh auth token"
 
+[modules.context]
+source = "context"
+
 [modules.dagger-dang-sdk.as-sdk]
 name = "dang"
 
@@ -29,6 +32,9 @@ path = "codex"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "committer"
+
+[[modules.dagger-dang-sdk.as-sdk.modules]]
+path = "context"
 
 [[modules.dagger-dang-sdk.as-sdk.modules]]
 path = "contributor"
