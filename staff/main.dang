@@ -260,19 +260,19 @@ type Staff {
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): blocks on live runtime state; each collect must wait
     # for the worker's CURRENT settling, not replay a previous outcome.
-    let settled = member(name).waitSettled
+    let settled = member(name).wait
     case (settled.state) {
-      AgentState.FAILED =>
-        `worker "${name}" FAILED: ${settled.error}` + "\n\n" +
-          `sendTo retries it from its last completed step; dismiss lets it go.`
-      AgentState.STOPPED =>
-        `worker "${name}" is stopped. Its work is still harvestable (logOf/diffOf/pull).`
+      AgentState.FAILED => `worker "${name}" FAILED: ${settled.error}` + "\n\n"
+        + `sendTo retries it from its last completed step; dismiss lets it go.`
+
+      AgentState.STOPPED => `worker "${name}" is stopped. Its work is still harvestable (logOf/diffOf/pull).`
+
       else => settled.snapshot.lastReply
     }
   }
 
   """
-  List a worker's staged commits, oldest first, each annotated with what
+  List a worker's commits, oldest first, each annotated with what
   `pull` would do with it: new, already had, redundant, or CONFLICT with the
   reason and the paths that obstruct it.
 
@@ -292,44 +292,51 @@ type Staff {
     name: String!,
     """
     Maximum number of commits to show, counting back from the newest. The
-    header line counts the whole stack regardless.
+    header line counts the whole integration plan (bounded to 100 commits;
+    larger histories fail rather than being silently truncated).
     """
     limit: Int! = 10,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments — logOf(name: "scout") twice must not replay the
     # first plan.
+    if (limit < 1) {
+      raise "limit must be positive"
+    }
     let theirs = workerWorkspace(name)
     # One batched selection: the plan forces here, and a failure here is a
     # genuine error worth surfacing raw rather than rescuing into prose.
     let picks = source.commitsFrom(source: theirs).{{
-      sha, date, authorName, message, status, reason, conflictPaths,
+      commit.{{sha, committedDate, authorName, message}},
+      status,
+      reason,
+      conflictPaths
     }}
     if (picks.isEmpty) {
-      return `Worker "${name}" has no staged commits.` + "\n\n" +
-        `Whatever it changed is still uncommitted: read it with diffOf(name: "${name}") ` +
-        `and take it with pullPending(name: "${name}").`
+      return `Worker "${name}" has no new commits relative to your workspace.` + "\n\n"
+        + `Inspect any uncommitted work with diffOf(name: "${name}") `
+        + `and take it with pullPending(name: "${name}").`
     }
 
     let newOnes = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
     let had = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKED }
     let redundant = picks.filter { p => p.status == WorkspaceCommitPickStatus.REDUNDANT }
     let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
-    let header = `${toString(picks.length)} commit(s) staged by worker "${name}": ` +
-      `${toString(newOnes.length)} new, ${toString(had.length)} already had, ` +
-      `${toString(redundant.length)} redundant, ${toString(conflicting.length)} conflicting`
+    let header = `${toString(picks.length)} commit(s) from worker "${name}": `
+      + `${toString(newOnes.length)} new, ${toString(had.length)} already had, `
+      + `${toString(redundant.length)} redundant, ${toString(conflicting.length)} conflicting`
 
     let shown = picks.takeLast(limit)
     let entries = shown.map { p =>
       let annotation = `[${pickLabel(p.status, p.reason)}${pathNote(p.conflictPaths)}]`
-      let head = `${short(p.sha)}  ${p.date}  ${p.authorName}  ${annotation}`
-      let body = p.message.split("\n").map { line => "    " + line }.join("\n")
+      let head = `${short(p.commit.sha)}  ${p.commit.committedDate}  ${p.commit.authorName}  ${annotation}`
+      let body = p.commit.message.split("\n").map { line => "    " + line }.join("\n")
       head + "\n" + body
     }
 
     let omitted = picks.length - shown.length
     let truncation = if (omitted > 0) {
-      "\n\n" + `(${toString(omitted)} older staged commit(s) not shown; raise limit to see them)`
+      "\n\n" + `(${toString(omitted)} older commit(s) not shown; raise limit to see them)`
     } else {
       ""
     }
@@ -337,7 +344,7 @@ type Staff {
       ""
     } else {
       "\n\n" + conflicting.map { p =>
-        `${short(p.sha)}: ${conflictRecovery(p.reason, name, short(p.sha))}`
+        `${short(p.commit.sha)}: ${conflictRecovery(p.reason, name, short(p.commit.sha))}`
       }.join("\n")
     }
 
@@ -347,10 +354,9 @@ type Staff {
   """
   Show what a worker changed, as a Git-compatible unified diff.
 
-  With `commit`, that staged commit's metadata, message and patch — the
+  With `commit`, that commit's metadata, message and patch — the
   detail `logOf` deliberately omits. Without it, the worker's UNCOMMITTED
-  work: a per-file summary followed by the patch, plus any edits git cannot
-  see (gitignored, or inside a nested repository).
+  work: a per-file summary followed by the patch.
 
   Pass `paths` to scope the patch; a worker's whole diff can be enormous.
   """
@@ -366,8 +372,8 @@ type Staff {
     """
     paths: [String!]! = [],
     """
-    A staged commit to show instead of the uncommitted work, as a full or
-    short sha from logOf. Empty shows the uncommitted work.
+    A commit to show instead of the uncommitted work, as a full or
+    short sha from logOf. Omit to show the uncommitted work.
     """
     commit: String = null,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
@@ -376,24 +382,26 @@ type Staff {
     let theirs = workerWorkspace(name)
 
     if (commit != null) {
-      let commits = theirs.git.stagedCommits.{{
-        sha, date, authorName, authorEmail, message,
-        changes.{{ asPatch.{{ contents }} }},
+      let sha = resolveWorkerCommit(theirs, commit, name)
+      let c = repository(theirs).commit(id: sha).{{
+        sha,
+        authoredDate,
+        authorName,
+        authorEmail,
+        message,
+        parentShas
       }}
-      if (commits.isEmpty) {
-        raise `worker "${name}" has no staged commits; its work is uncommitted — call diffOf without a commit`
+      let mergeNote = if (c.parentShas.length > 1) {
+        "\n(merge commit: patch shown against its first parent)"
+      } else {
+        ""
       }
-      let sha = resolveCommit(commits.map { c => c.sha }, commit, name)
-      # A single record has to be folded out of a filter: indexing a list
-      # yields a nullable, which no String! slot accepts.
-      let hits = commits.filter { c => c.sha == sha }
-      let meta = hits.map { c =>
-        `commit ${c.sha}` + "\n" +
-        `Author: ${c.authorName} <${c.authorEmail}>` + "\n" +
-        `Date:   ${c.date}` + "\n\n" +
-        c.message.split("\n").map { line => "    " + line }.join("\n")
-      }.join("")
-      let scoped = scopePatch(hits.map { c => c.changes.asPatch.contents ?? "" }.join(""), paths)
+      let meta =
+        `commit ${c.sha}` + "\n"
+          + `Author: ${c.authorName} <${c.authorEmail}>` + "\n"
+          + `Date:   ${c.authoredDate}` + mergeNote + "\n\n"
+          + c.message.split("\n").map { line => "    " + line }.join("\n")
+      let scoped = scopePatch(commitChanges(theirs, sha).asPatch.contents, paths)
       if (scoped == "") {
         if (paths.isEmpty) {
           return meta + "\n\n(this commit has no file changes)"
@@ -404,42 +412,26 @@ type Staff {
     }
 
     let stats = theirs.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path}}
-    let unmanaged = theirs.git.unmanaged.diffStats.{{addedLines, removedLines, path}}
     let scopedStats = if (paths.isEmpty) {
       stats
     } else {
       stats.filter { s => paths.any { p => Path(p).contains(Path(s.path)) } }
     }
-    let scopedUnmanaged = if (paths.isEmpty) {
-      unmanaged
-    } else {
-      unmanaged.filter { s => paths.any { p => Path(p).contains(Path(s.path)) } }
-    }
-    let unmanagedBlock = if (scopedUnmanaged.isEmpty) {
-      ""
-    } else {
-      "\n\n" + unmanagedHeader + "\n" + scopedUnmanaged.map { s =>
-        `?  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
-      }.join("\n")
-    }
     if (scopedStats.isEmpty) {
-      if (scopedUnmanaged.isEmpty) {
-        return `Worker "${name}" has no uncommitted changes` +
-          (if (paths.isEmpty) { "." } else { " under the given paths." }) +
-          "\n\n" + `What it committed is in logOf(name: "${name}").`
-      }
-      return `Worker "${name}" has no committable uncommitted changes.` + unmanagedBlock
+      return `Worker "${name}" has no uncommitted changes`
+        + (if (paths.isEmpty) { "." } else { " under the given paths." })
+        + "\n\n" + `What it committed is in logOf(name: "${name}").`
     }
     let summary = scopedStats.map { s =>
       `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
     }.join("\n")
     let scoped = scopePatch(theirs.git.uncommitted.asPatch.contents, paths)
     let patchBlock = if (scoped == "") { "" } else { "\n\n" + scoped }
-    `Uncommitted work in worker "${name}":` + "\n\n" + summary + patchBlock + unmanagedBlock
+    `Uncommitted work in worker "${name}":` + "\n\n" + summary + patchBlock
   }
 
   """
-  Take a worker's staged commits into your own workspace, keeping the
+  Take a worker's commits into your own workspace, keeping the
   worker's authorship, message and date.
 
   Plans first and applies ONLY what applies cleanly: commits you already
@@ -447,6 +439,10 @@ type Staff {
   commit that conflicts is reported rather than forced — with the recovery
   route for its reason. Run it again after resolving; already-pulled commits
   are recognised.
+
+  Fast-forwards when possible, otherwise cherry-picks; commit hashes may
+  change. Uncommitted worker edits are left for pullPending. Integration is
+  bounded to 100 commits in either differing history and fails above that.
 
   Reads the worker's LAST COMMITTED conversation step, so `collect` (or
   `interruptWorker`) before the harvest that matters.
@@ -466,31 +462,40 @@ type Staff {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
     let theirs = workerWorkspace(name)
-    let known = theirs.git.stagedCommits.{{sha}}.map { c => c.sha }
-    let wanted = commits.map { given => resolveCommit(known, given, name) }
+    # No history scan for an unfiltered pull: the engine walks only the
+    # differing histories. Explicit selections resolve against a bounded log.
+    let wanted = if (commits.isEmpty) {
+      [] :: [String!]!
+    } else {
+      let known = theirs.git.head.log(limit: commitSearchLimit).{{sha}}.map { c => c.sha }
+      commits.map { given => resolveCommit(known, given, name) }
+    }
     let picks = source.commitsFrom(source: theirs, commits: wanted).{{
-      sha, message, status, reason, conflictPaths,
+      commit.{{sha, message}},
+      status,
+      reason,
+      conflictPaths
     }}
     if (picks.isEmpty) {
-      print(`Worker "${name}" has no staged commits to pull. ` +
-        `Its uncommitted work is a pullPending(name: "${name}") away.`)
+      print(`Worker "${name}" has no new commits to pull. `
+        + `Its uncommitted work is a pullPending(name: "${name}") away.`)
       return source
     }
 
     let pickable = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
     let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
     let skipped = picks.filter { p =>
-      p.status == WorkspaceCommitPickStatus.PICKED or
-        p.status == WorkspaceCommitPickStatus.REDUNDANT
+      p.status == WorkspaceCommitPickStatus.PICKED
+        or p.status == WorkspaceCommitPickStatus.REDUNDANT
     }
     let conflictBlock = if (conflicting.isEmpty) {
       ""
     } else {
-      "\n\n" + `CONFLICT — ${toString(conflicting.length)} commit(s) NOT pulled:` + "\n" +
-        conflicting.map { p =>
-          `  ${short(p.sha)} ${subject(p.message)}` + "\n" +
-          `    ${conflictReason(p.reason)}${pathNote(p.conflictPaths)}` + "\n" +
-          `    -> ${conflictRecovery(p.reason, name, short(p.sha))}`
+      "\n\n" + `CONFLICT — ${toString(conflicting.length)} commit(s) NOT pulled:` + "\n"
+        + conflicting.map { p =>
+          `  ${short(p.commit.sha)} ${subject(p.commit.message)}` + "\n"
+            + `    ${conflictReason(p.reason)}${pathNote(p.conflictPaths)}` + "\n"
+            + `    -> ${conflictRecovery(p.reason, name, short(p.commit.sha))}`
         }.join("\n")
     }
     let skippedNote = if (skipped.isEmpty) {
@@ -504,18 +509,18 @@ type Staff {
       return source
     }
 
-    let staged = source.withCommitsFrom(source: theirs, commits: pickable.map { p => p.sha })
+    let integrated = source.withCommitsFrom(source: theirs, commits: pickable.map { p => p.commit.sha })
     # Force the apply HERE, inside the module: without this the failure would
     # land outside, when the engine rebinds the Workspace, stripped of which
     # worker and how many commits were involved. The rescue only enriches —
     # returning `source` instead would report a pull that never happened.
-    staged.git.head.commit rescue { e: Error =>
-      raise `pulling ${toString(pickable.length)} commit(s) from worker "${name}" failed: ${e.message}`
+    integrated.git.head.commitSHA rescue {
+      e: Error => raise `pulling ${toString(pickable.length)} commit(s) from worker "${name}" failed: ${e.message}`
     }
-    print(`Pulled ${toString(pickable.length)} commit(s) from worker "${name}":` + "\n" +
-      pickable.map { p => `  ${short(p.sha)} ${subject(p.message)}` }.join("\n") +
-      skippedNote + conflictBlock)
-    staged
+    print(`Pulled ${toString(pickable.length)} commit(s) from worker "${name}":` + "\n"
+      + pickable.map { p => `  ${short(p.commit.sha)} ${subject(p.commit.message)}` }.join("\n")
+      + skippedNote + conflictBlock)
+    integrated
   }
 
   """
@@ -523,7 +528,7 @@ type Staff {
   tree with conflict markers where it no longer fits, landing the result as
   UNCOMMITTED edits for you to resolve.
 
-  Deliberately not a mode of `pull`: a commit must never be staged with
+  Deliberately not a mode of `pull`: a commit must never be recorded with
   conflict markers inside it, so the resolution lands in your working tree
   and the commit that records it is yours. The original message is printed
   for you to reuse — the worker's authorship is lost by construction, which
@@ -543,16 +548,13 @@ type Staff {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
     let theirs = workerWorkspace(name)
-    let commits = theirs.git.stagedCommits.{{
-      sha, message, changes.{{ asPatch.{{ contents }} }},
-    }}
-    if (commits.isEmpty) {
-      raise `worker "${name}" has no staged commits to recover`
+    let sha = resolveWorkerCommit(theirs, commit, name)
+    let target = repository(theirs).commit(id: sha).{{message, parentShas}}
+    if (target.parentShas.length > 1) {
+      raise `commit ${short(sha)} is a merge commit; inspect its first-parent diff with diffOf and integrate it manually`
     }
-    let sha = resolveCommit(commits.map { c => c.sha }, commit, name)
-    let hits = commits.filter { c => c.sha == sha }
-    let message = hits.map { c => c.message }.join("")
-    let patch = hits.map { c => c.changes.asPatch.contents ?? "" }.join("")
+    let message = target.message
+    let patch = commitChanges(theirs, sha).asPatch.contents
     if (patch == "") {
       raise `commit ${short(sha)} in worker "${name}" records no file changes to apply`
     }
@@ -573,22 +575,22 @@ type Staff {
     # outright to create a file your tree already has, which is exactly the
     # shape of a DIRTY conflict over an added path. Say so, since the remedy
     # is the other branch of the conflict loop, not a retry.
-    delta.isEmpty rescue { e: Error =>
-      raise `applying commit ${short(sha)} from worker "${name}" to your tree failed: ${e.message}` +
-        ` — if that is your own uncommitted work on those paths, commit or revert it and ` +
-        `pull(name: "${name}", commits: ["${short(sha)}"]) instead`
+    delta.isEmpty rescue {
+      e: Error => raise `applying commit ${short(sha)} from worker "${name}" to your tree failed: ${e.message}`
+        + ` — if that is your own uncommitted work on those paths, commit or revert it and `
+        + `pull(name: "${name}", commits: ["${short(sha)}"]) instead`
     }
 
     let note = if (clean) {
-      "\n\n" + `NOTE: this commit applies cleanly — pull(name: "${name}", commits: ["${short(sha)}"]) ` +
-        `would take it with ${name}'s authorship intact. Prefer that unless you meant to make it yours.`
+      "\n\n" + `NOTE: this commit applies cleanly — pull(name: "${name}", commits: ["${short(sha)}"]) `
+        + `would take it with ${name}'s authorship intact. Prefer that unless you meant to make it yours.`
     } else {
       ""
     }
-    print(`Applied commit ${short(sha)} from worker "${name}" as uncommitted edits. ` +
-      `Search for conflict markers (<<<<<<<), resolve them, then commit it yourself.` + "\n\n" +
-      "Original message, to reuse:" + "\n" +
-      message.split("\n").map { line => "    " + line }.join("\n") + note)
+    print(`Applied commit ${short(sha)} from worker "${name}" as uncommitted edits. `
+      + `Search for conflict markers (<<<<<<<), resolve them, then commit it yourself.` + "\n\n"
+      + "Original message, to reuse:" + "\n"
+      + message.split("\n").map { line => "    " + line }.join("\n") + note)
     delta
   }
 
@@ -638,20 +640,17 @@ type Staff {
     # file lands, the old one is never removed. oldPath is null for every
     # other kind, and an empty scope would match the whole tree, so drop it.
     let driftStats = theirs.directory("/").changes(from: base).diffStats.{{path, oldPath}}
-    let drift = driftStats.map { s => s.path } +
-      driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
+    let drift = driftStats.map { s => s.path }
+      + driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
     if (drift.isEmpty) {
       print(`Worker "${name}" has nothing your workspace does not already have.`)
       return base.changes(from: base)
     }
 
     let pending = scopePatch(theirs.git.uncommitted.asPatch.contents, drift)
-    # Edits git cannot see (gitignored, or inside a nested repository) never
-    # appear in `uncommitted`, so they need their own patch or they are lost.
-    let untracked = scopePatch(theirs.git.unmanaged.asPatch.contents, drift)
-    if (pending == "" and untracked == "") {
-      print(`Worker "${name}" has no uncommitted work to take. ` +
-        `What it committed is in logOf(name: "${name}").`)
+    if (pending == "") {
+      print(`Worker "${name}" has no uncommitted work to take. `
+        + `What it committed is in logOf(name: "${name}").`)
       return base.changes(from: base)
     }
 
@@ -660,26 +659,18 @@ type Staff {
     } else {
       PatchConflict.FAIL
     }
-    let withPending = if (pending == "") {
-      base
-    } else {
-      base.withPatch(pending, onConflict: onConflict)
-    }
-    let applied = if (untracked == "") {
-      withPending
-    } else {
-      withPending.withPatch(untracked, onConflict: onConflict)
-    }
-    let delta = applied.changes(from: base)
+    let delta = base.withPatch(pending, onConflict: onConflict).changes(from: base)
     # Force the apply here; a swallowed failure would silently discard the
     # worker's uncommitted work.
-    delta.isEmpty rescue { e: Error =>
-      raise `taking worker "${name}"'s uncommitted work failed: ${e.message}` +
-        (if (markers) {
-          ""
-        } else {
-          ` — you and ${name} edited the same part of the same file; retry with markers: true to resolve it by hand`
-        })
+    delta.isEmpty rescue {
+      e: Error => raise `taking worker "${name}"'s uncommitted work failed: ${e.message}`
+        + (
+          if (markers) {
+            ""
+          } else {
+            ` — you and ${name} edited the same part of the same file; retry with markers: true to resolve it by hand`
+          }
+        )
     }
 
     let marked = if (markers) {
@@ -828,20 +819,49 @@ type Staff {
     harvestTarget(name).snapshot.sync.workspace
   }
 
-  # Resolve a caller-supplied sha against a worker's staged commits: exact
+  # Match the engine's explicit-pick lookup bound; never walk unlimited history.
+  let commitSearchLimit: Int! = 10000
+
+  let repository(source: Workspace!): GitRepository! {
+    source.git.head.tree(discardGitDir: false, depth: 0).asGit
+  }
+
+  let resolveWorkerCommit(source: Workspace!, given: String!, name: String!): String! {
+    let known = source.git.head.log(limit: commitSearchLimit).{{sha}}.map { c => c.sha }
+    resolveCommit(known, given, name)
+  }
+
+  # Real Git commits carry trees, not a staged patch. Root commits diff
+  # against the empty tree; merge inspection uses the first parent.
+  let commitChanges(source: Workspace!, sha: String!): Changeset! {
+    let repo = repository(source)
+    let target = repo.commit(id: sha)
+    let parent = target.parentShas.takeFirst.join("")
+    let base = if (parent == "") {
+      directory
+    } else {
+      repo.commit(id: parent).tree(discardGitDir: true)
+    }
+    target.tree(discardGitDir: true).changes(from: base)
+  }
+
+  # Resolve a caller-supplied sha against a worker's recent history: exact
   # match, else a unique prefix. logOf prints 7-char shas, so short ones are
   # what the model hands back — and a typo must be an error, never a silent
   # no-op.
   let resolveCommit(known: [String!]!, given: String!, name: String!): String! {
+    if (given == "") {
+      raise "commit SHA must not be empty; run logOf to choose a commit"
+    }
     if (known.contains(given)) {
       return given
     }
     let hits = known.filter { sha => sha.hasPrefix(given) }
     if (hits.isEmpty) {
-      raise `worker "${name}" has no staged commit "${given}"; run logOf to list them`
+      raise `worker "${name}" has no commit "${given}" in its latest ${toString(commitSearchLimit)} commits; run logOf to list candidates`
     }
     if (hits.length > 1) {
-      raise `commit "${given}" matches ${toString(hits.length)} of worker "${name}"'s staged commits; use a longer sha`
+      raise `commit "${given}" matches ${toString(hits.length)} of worker "${name}"'s recent commits; use a longer sha`
     }
     hits.join("")
   }
@@ -904,12 +924,12 @@ type Staff {
     sha: String!,
   ): String! {
     case (reason) {
-      WorkspaceCommitPickReason.DIRTY =>
-        `commit or revert your edits on those paths and pull again (keeps ${name}'s authorship), ` +
-          `or pullConflicted(name: "${name}", commit: "${sha}") to take it as your own edits`
-      WorkspaceCommitPickReason.CONTENT =>
-        `pullConflicted(name: "${name}", commit: "${sha}") lands it as uncommitted edits with ` +
-          `conflict markers; resolve them and commit it yourself`
+      WorkspaceCommitPickReason.DIRTY => `commit or revert your edits on those paths and pull again (keeps ${name}'s authorship), `
+        + `or pullConflicted(name: "${name}", commit: "${sha}") to take it as your own edits`
+
+      WorkspaceCommitPickReason.CONTENT => `pullConflicted(name: "${name}", commit: "${sha}") lands it as uncommitted edits with `
+        + `conflict markers; resolve them and commit it yourself`
+
       else => `inspect it with diffOf(name: "${name}", commit: "${sha}")`
     }
   }
@@ -943,11 +963,6 @@ type Staff {
   }
 
   let patchHeader: String! = "diff --git "
-
-  # Worded by consequence, not cause: whatever the reason git cannot see the
-  # change, what matters is that saving writes it and committing cannot.
-  let unmanagedHeader: String! =
-    "UNTRACKED BY GIT (saved on ctrl+s; git sees nothing to commit here):"
 
   # Instructions for the CHIEF agent holding these tools.
   let chiefPrompt: String! = """
@@ -1007,7 +1022,7 @@ type Staff {
 
     Harvesting is how their work reaches you:
 
-    - `logOf` lists a worker's staged commits, each annotated with what
+    - `logOf` lists a worker's commits, each annotated with what
       `pull` would do with it; `diffOf` shows one commit's patch, or the
       worker's uncommitted work.
     - `pull` takes the commits that apply cleanly, keeping the worker's
@@ -1105,7 +1120,7 @@ type PullTools {
   }
 
   """
-  List an agent's staged commits, oldest first, and show which can be pulled.
+  List an agent's commits, oldest first, and show which can be pulled.
 
   Use `chief` for the chief agent; workers keep their staff names.
   """
@@ -1124,7 +1139,7 @@ type PullTools {
   }
 
   """
-  Show an agent's staged commit or uncommitted work as a unified diff.
+  Show an agent's commit or uncommitted work as a unified diff.
   """
   diffOf(
     source: Workspace!,
@@ -1137,7 +1152,7 @@ type PullTools {
     """
     paths: [String!]! = [],
     """
-    A staged commit to show. Empty shows uncommitted work.
+    A commit to show. Omit to show uncommitted work.
     """
     commit: String = null,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
@@ -1145,7 +1160,7 @@ type PullTools {
   }
 
   """
-  Pull an agent's staged commits into your workspace, preserving authorship.
+  Pull an agent's commits into your workspace, preserving authorship.
   """
   pull(
     source: Workspace!,
@@ -1223,8 +1238,8 @@ type ChiefLine {
     # @cache(Never): a worker re-asking the same question must reach the
     # chief again, not replay the first delivery from cache.
     let msg = boss.send(question)
-    `question ${msg.ref} delivered to the chief. The answer will arrive as ` +
-      `a "[reply from agent ...]" message — keep working, or end your turn ` +
-      `to wait for it.`
+    `question ${msg.ref} delivered to the chief. The answer will arrive as `
+      + `a "[reply from agent ...]" message — keep working, or end your turn `
+      + `to wait for it.`
   }
 }
