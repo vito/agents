@@ -1,0 +1,531 @@
+# context: a session's working truth as a set of Blocks, held in module state
+# beside the conversation — not inside it.
+#
+# A conversation is an append-only log: ordered by accident, unreviewable, and
+# impossible to prune — you cannot unsay a message. A Context is a SET of
+# Blocks (a text payload plus a compact metadata header): addressable (an id
+# you can link to and supersede), editable (things can be taken OUT), and
+# idempotent (establishing the same truth twice converges on one Block).
+#
+# HOW THE BLOCKS REACH THE MODEL — the design question this module answers:
+# they are not pushed into the conversation; they are held beside it and
+# pulled.
+#
+#   * The store. `blocks` is a private Map in module state, evolved by tools
+#     returning Context! (the staff `members` pattern: the tool layer rebinds
+#     the agent's tool node to the returned state). The set therefore rides
+#     on the LLM's environment, OUTSIDE the message log: compaction rewrites
+#     messages and cannot touch it. That is the whole persistence story — no
+#     git, no volume, no store to keep in sync.
+#   * The viewport. `compose` renders a selection — manifest first, then the
+#     Blocks in kind order — into a single tool result. After a compaction
+#     squashes the transcript, one compose call re-materializes everything
+#     worth knowing.
+#   * The reflex. The @agent system prompt (which survives compaction along
+#     with the tools) teaches the discipline — write on resolution, prune on
+#     irrelevance, compose on doubt — and every mutation prints the updated
+#     index, so the tail of the transcript always carries the set's shape.
+#
+# Scope: the SESSION half of the Context/Blocks design
+# (https://gist.github.com/vito/6c12ba8aff1e3576f9ce2b9d446540f0). The
+# durable half — markdown + front matter under context/, verification
+# (anchors/asserts/drift) and its CI checks — is not here; `promote` is the
+# bridge, landing a Block in the workspace changeset for review. resolve()
+# is not here either, because it is composition: delegate the noisy legwork
+# to modules/delegate, then blockWrite only the distilled answer.
+#
+# Caveats:
+#   * State survives COMPACTION, not RECOMPOSITION: install/reload build
+#     fresh module instances, so promote anything that must outlive those.
+#   * No @cache(Never) anywhere, deliberately: every tool is a pure function
+#     of (state, args), so a cache replay is indistinguishable from a re-run
+#     — contrast staff/sandbox, whose tools carry real side effects.
+#
+# Installed in this workspace's dagger.toml, so ambient sessions here carry
+# it; other workspaces install per taste, e.g. `dagger install ./context`.
+
+"""
+What a Block IS — its role in composition, not how it came to exist.
+"""
+enum BlockKind {
+  GLOSSARY
+  FACT
+  DECISION
+  DESIGN
+  RESULT
+  QUESTION
+  NOTE
+}
+
+# Composition order: definitions land before the things that use them; loose
+# ends (questions, notes) last.
+let kindOrder: [BlockKind!]! = [
+  BlockKind.GLOSSARY,
+  BlockKind.FACT,
+  BlockKind.DECISION,
+  BlockKind.DESIGN,
+  BlockKind.RESULT,
+  BlockKind.QUESTION,
+  BlockKind.NOTE,
+]
+
+let kindLabel(kind: BlockKind!): String! {
+  toString(kind).toLower
+}
+
+# Block ids are addresses: lowercase path-shaped segments.
+let idShape: Regexp! = `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`
+
+# Size in text lines — the unit the composition budget is counted in.
+let blockLines(b: Block!): Int! {
+  b.text.split("\n").length
+}
+
+# Fork of a Block marked superseded. Kept, never deleted: the reasoning
+# outlives the conclusion.
+let asSuperseded(b: Block!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: true,
+    supersedes: b.supersedes,
+  )
+}
+
+"""
+One unit of established truth: the text payload the model reads, plus the
+compact metadata the system selects and orders it by.
+"""
+type Block {
+  """
+  Address within the Context, path-shaped: "facts/agent-composition".
+  ("id" is reserved for the engine's own object identity.)
+  """
+  address: String!
+
+  """
+  What the Block is.
+  """
+  kind: BlockKind!
+
+  """
+  The payload: distilled prose — the established truth, not the transcript
+  that led to it.
+  """
+  text: String!
+
+  """
+  Free labels; the primary selection axis for compose.
+  """
+  tags: [String!]!
+
+  """
+  Pinned Blocks are included in every composition, regardless of selection
+  and budget.
+  """
+  pin: Boolean!
+
+  """
+  Superseded Blocks are kept but never composed.
+  """
+  superseded: Boolean!
+
+  """
+  Ids of the Blocks this one replaced.
+  """
+  supersedes: [String!]!
+}
+
+"""
+Curate a Context — a set of distilled truth Blocks held in tool state, beside
+the conversation — so what a session knows survives compaction and stays
+addressable, editable, and composable.
+"""
+type Context {
+  # Blocks keyed by id. Map[...] cannot be exposed through module API, so the
+  # set stays a private `let`; plain-data values serialize into module state
+  # and rehydrate on the next call (the staff/sandbox pattern). Map iteration
+  # is key-ordered, which is exactly the ties-broken-by-address rule
+  # composition wants.
+  let blocks: Map[Block!]! = [:]
+
+  """
+  Compose the Context tools onto a base LLM.
+  """
+  agent(base: LLM!): LLM! @agent {
+    base
+      .withTools(currentNode)
+      .withSystemPrompt(systemPrompt)
+  }
+
+  """
+  Write a Block: add it to the Context, or replace the Block already at that
+  id. Membership is idempotent — establishing the same truth twice converges
+  on one Block instead of two paragraphs that mostly agree.
+
+  Write the moment you resolve something worth keeping; distill the
+  established truth, never the play-by-play that led to it.
+  """
+  blockWrite(
+    """
+    Address for the Block, path-shaped: e.g. "facts/engine-caches-by-id",
+    "decisions/no-git-store". Writing an existing id replaces that Block
+    (and revives it, if it was superseded).
+    """
+    id: String!,
+    """
+    What the Block IS: a GLOSSARY definition, an established FACT, a
+    DECISION and its why, a settled DESIGN, a measured RESULT, an open
+    QUESTION worth carrying, or a NOTE that fits nothing else.
+    """
+    kind: BlockKind!,
+    """
+    The payload: distilled prose a sharp colleague would need. Markdown
+    welcome.
+    """
+    text: String!,
+    """
+    Free labels for selection: compose(tags: [...]) pulls matching Blocks.
+    """
+    tags: [String!]! = [],
+    """
+    Pin the Block: composed every time, regardless of selection and budget.
+    For the handful of things every future turn needs.
+    """
+    pin: Boolean! = false,
+    """
+    Ids of Blocks this one replaces. They are kept but marked superseded and
+    dropped from composition — supersede a contradicted Block rather than
+    pruning it, so the reasoning stays readable.
+    """
+    supersedes: [String!]! = [],
+  ): Context! {
+    if (!id.containsMatch(idShape)) {
+      raise `block id "${id}" is not an address — use lowercase path-shaped ids like "facts/engine-caches-by-id"`
+    }
+    if (text.trimSpace == "") {
+      raise `block "${id}" needs a text payload — a Block is text plus metadata, not metadata alone`
+    }
+    supersedes.each { target =>
+      if (target == id) {
+        raise `block "${id}" cannot supersede itself`
+      }
+      if (!blocks.has(target)) {
+        raise `cannot supersede "${target}": no such block — blockIndex lists what is there`
+      }
+    }
+
+    let cleaned = tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq
+    self.blocks = blocks
+      .map { bid, b =>
+        if (supersedes.contains(bid)) { asSuperseded(b) } else { b }
+      }
+      .with(id, Block(
+        address: id,
+        kind: kind,
+        text: text,
+        tags: cleaned,
+        pin: pin,
+        superseded: false,
+        supersedes: supersedes,
+      ))
+    let note = if (supersedes.isEmpty) { "" } else { `, superseding ${supersedes.join(", ")}` }
+    print(`wrote ${id}${note}` + "\n\n" + blockIndex)
+    self
+  }
+
+  """
+  Read one Block in full: its header line and complete text. Works on
+  superseded Blocks too — the reasoning is kept — with a pointer to what
+  replaced them.
+  """
+  blockRead(
+    """
+    The Block's id, as listed by blockIndex.
+    """
+    id: String!,
+  ): String! {
+    let b = mustGet(id)
+    let note = if (b.superseded) {
+      let by = supersederOf(id)
+      if (by == "") {
+        "\n\n(superseded — kept for the reasoning, excluded from composition)"
+      } else {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
+      }
+    } else {
+      ""
+    }
+    renderBlock(b) + note
+  }
+
+  """
+  The Context at a glance: one compact line per Block — id, kind, size,
+  tags, flags — under a totals headline. This is the cheap overview; compose
+  renders the actual text.
+  """
+  blockIndex: String! {
+    if (blocks.isEmpty) {
+      return "The Context is empty — no Blocks yet. blockWrite records the first."
+    }
+    let all = ordered
+    let active = all.filter { b => !b.superseded }
+    let pinned = active.filter { b => b.pin }
+    let total = active.reduce(0) { acc, b => acc + blockLines(b) }
+    let headline = `${toString(all.length)} block(s) — ${toString(active.length)} active ` +
+      `(${toString(total)} text line(s), ${toString(pinned.length)} pinned), ` +
+      `${toString(all.length - active.length)} superseded`
+    headline + "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
+  }
+
+  """
+  Take Blocks out of the Context — the operation a log cannot perform on
+  itself. For Blocks that stopped mattering: noise, settled questions,
+  results that served their purpose.
+
+  Pruning forgets entirely. A Block that was CONTRADICTED should be
+  superseded instead (blockWrite with supersedes:), which keeps the
+  reasoning readable.
+  """
+  blockPrune(
+    """
+    Ids of the Blocks to remove, as listed by blockIndex.
+    """
+    ids: [String!]!,
+  ): Context! {
+    if (ids.isEmpty) {
+      raise "name at least one block id to prune"
+    }
+    ids.each { id =>
+      if (!blocks.has(id)) {
+        raise `no block "${id}" in the Context — blockIndex lists what is there`
+      }
+    }
+    self.blocks = ids.reduce(blocks) { acc, id => acc.without(id) }
+    print(`pruned ${ids.join(", ")}` + "\n\n" + blockIndex)
+    self
+  }
+
+  """
+  Compose the Context into one document: a manifest of what went in (and
+  what was left out, and why), then the selected Blocks in kind order —
+  glossary → fact → decision → design → result → question → note, ties
+  broken by id — so definitions land before the things that use them.
+
+  With no selectors this composes every active Block. Selectors union: a
+  Block is included when its id, its kind, or any of its tags matches.
+  Pinned Blocks are always included; superseded Blocks never are.
+
+  Call it whenever you are unsure what you know — and ALWAYS as your first
+  move after your conversation has been compacted: the Context lives in
+  tool state, not in your messages, so nothing a compaction squashed is
+  lost from here.
+  """
+  compose(
+    """
+    Ids to include. An unknown id is an error, so typos surface.
+    """
+    ids: [String!]! = [],
+    """
+    Tags to include: any Block carrying any of these.
+    """
+    tags: [String!]! = [],
+    """
+    Kinds to include.
+    """
+    kinds: [BlockKind!]! = [],
+    """
+    Ceiling on composed text lines. Blocks that do not fit are named in the
+    manifest, never silently dropped; pinned Blocks are exempt. 0 means no
+    ceiling.
+    """
+    budget: Int! = 0,
+  ): String! {
+    if (blocks.isEmpty) {
+      return "The Context is empty — nothing to compose. blockWrite records the first Block."
+    }
+    ids.each { id =>
+      if (!blocks.has(id)) {
+        raise `no block "${id}" in the Context — blockIndex lists what is there`
+      }
+    }
+
+    let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
+    let all = ordered
+    let active = all.filter { b => !b.superseded }
+    let selected = active.filter { b =>
+      b.pin or wantAll or
+        ids.contains(b.address) or
+        kinds.contains(b.kind) or
+        b.tags.any { t => tags.contains(t) }
+    }
+
+    let included: [Block!]! = []
+    let overBudget: [Block!]! = []
+    let used = 0
+    selected.each { b =>
+      let cost = blockLines(b)
+      if (b.pin or budget == 0 or used + cost <= budget) {
+        included += [b]
+        used += cost
+      } else {
+        overBudget += [b]
+      }
+    }
+
+    let manifest: [String!]! = []
+    manifest += [`CONTEXT — composed ${toString(included.length)} of ${toString(all.length)} block(s), ${toString(used)} text line(s)`]
+    included.each { b => manifest += ["  " + indexLine(b)] }
+    if (!overBudget.isEmpty) {
+      manifest += ["over budget — blockRead these, or raise the budget:"]
+      overBudget.each { b => manifest += ["  " + indexLine(b)] }
+    }
+    let notes: [String!]! = []
+    let filtered = active.length - selected.length
+    if (filtered > 0) {
+      notes += [`${toString(filtered)} active block(s) outside this selection`]
+    }
+    if (all.length > active.length) {
+      notes += [`${toString(all.length - active.length)} superseded block(s) held out`]
+    }
+    if (!notes.isEmpty) {
+      manifest += ["  (" + notes.join("; ") + " — blockIndex lists everything)"]
+    }
+
+    if (included.isEmpty) {
+      return manifest.join("\n") + "\n\n(nothing matched the selection)"
+    }
+    manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) }.join("\n\n")
+  }
+
+  """
+  Land a Block in the workspace as a markdown file with front matter under
+  context/, so it can outlive this session: the write shows up in your
+  pending changes, to be reviewed and committed alongside the code that
+  motivated it. The Block also stays in the session's Context.
+  """
+  promote(
+    source: Workspace!,
+    """
+    The Block's id, as listed by blockIndex. Its file lands at
+    "context/<id>.md".
+    """
+    id: String!,
+  ): Changeset! {
+    let b = mustGet(id)
+    let front: [String!]! = [`kind: ${kindLabel(b.kind)}`]
+    if (!b.tags.isEmpty) {
+      front += [`tags: [${b.tags.join(", ")}]`]
+    }
+    if (b.pin) {
+      front += ["pin: true"]
+    }
+    if (!b.supersedes.isEmpty) {
+      front += [`supersedes: [${b.supersedes.join(", ")}]`]
+    }
+    if (b.superseded) {
+      front += ["status: superseded"]
+    }
+    let path = `context/${id}.md`
+    let contents = "---\n" + front.join("\n") + "\n---\n\n" + b.text + "\n"
+    let base = source.directory("/")
+    print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
+      "review and commit it alongside the change that motivated it")
+    base.withNewFile(path, contents).changes(from: base)
+  }
+
+  # ---- helpers ------------------------------------------------------------
+
+  let mustGet(id: String!): Block! {
+    let b = blocks[id]
+    if (b == null) {
+      raise `no block "${id}" in the Context — blockIndex lists what is there`
+    }
+    b
+  }
+
+  # Every Block in composition order: kind rank, ties broken by address
+  # (Map iteration is key-ordered).
+  let ordered: [Block!]! {
+    kindOrder.reduce(([] :: [Block!]!)) { acc, k =>
+      acc + blocks.values.filter { b => b.kind == k }
+    }
+  }
+
+  # Who replaced a Block — scanned rather than stored, so pruning a
+  # superseder can never leave a dangling pointer.
+  let supersederOf(id: String!): String! {
+    blocks.values
+      .filter { b => b.supersedes.contains(id) }
+      .map { b => b.address }
+      .join(", ")
+  }
+
+  # One compact line of metadata: the only metadata that ever reaches the
+  # model — anything more is just prose with a colon in it.
+  let indexLine(b: Block!): String! {
+    let tags = if (b.tags.isEmpty) { "" } else { "  " + b.tags.map { t => "#" + t }.join(" ") }
+    let pin = if (b.pin) { "  pinned" } else { "" }
+    let superseded = if (b.superseded) {
+      let by = supersederOf(b.address)
+      if (by == "") { "  superseded" } else { `  superseded by ${by}` }
+    } else {
+      ""
+    }
+    `${b.address}  ${kindLabel(b.kind)}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
+  }
+
+  let headerOf(b: Block!): String! {
+    let tags = if (b.tags.isEmpty) { "" } else { " · " + b.tags.map { t => "#" + t }.join(" ") }
+    let pin = if (b.pin) { " · pinned" } else { "" }
+    `── ${b.address} · ${kindLabel(b.kind)}${tags}${pin} ──`
+  }
+
+  let renderBlock(b: Block!): String! {
+    headerOf(b) + "\n" + b.text
+  }
+
+  # Instructions for the agent holding these tools.
+  let systemPrompt: String! = """
+    You carry a CONTEXT: a set of Blocks — distilled, addressable truths —
+    stored in tool state BESIDE your conversation, not inside it. When your
+    conversation is compacted, the Blocks are untouched, and one `compose`
+    call brings everything worth knowing back. Treat the transcript as
+    scratch and the Context as the record.
+
+    WRITE AS YOU RESOLVE, not at the end. The moment you establish
+    something future turns will need — a fact verified, a decision made and
+    why, a design settled, a result measured, a question worth carrying —
+    record it with blockWrite. Distill: write the established truth a sharp
+    colleague would need, never the play-by-play that led to it. Ids are
+    path-shaped addresses ("facts/engine-caches-by-id",
+    "decisions/no-git-store"); writing an existing id replaces that Block,
+    so converging on one Block beats accumulating near-duplicates. Pin the
+    handful of things every future turn needs; tag the rest for selection.
+
+    READ IT BACK with compose: a manifest of what went in (and what was
+    left out, and why), then the Blocks, definitions first. Call it
+    whenever you are unsure what you know — ALWAYS as your first move after
+    a compaction. blockIndex is the cheap one-line-per-block overview;
+    blockRead fetches one Block in full.
+
+    CURATE. A set can have things taken out — its whole advantage over a
+    log. blockPrune drops Blocks that stopped mattering. When a new truth
+    contradicts an old one, do not prune: blockWrite the new Block with
+    supersedes: naming the old — superseded Blocks are kept out of
+    composition but preserved, because the reasoning outlives the
+    conclusion.
+
+    PROMOTE what should outlive this session: promote lands a Block as
+    markdown under context/ in your pending changes, to be reviewed and
+    committed alongside the code that motivated it. The in-session set does
+    NOT survive recomposition (install/reload), so promote before those.
+
+    If you have a delegation tool, pair them: farm noisy legwork out to a
+    sub-agent, then blockWrite only the distilled answer. The exploration
+    never enters your context; the truth it produced stays addressable.
+  """
+}
