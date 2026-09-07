@@ -3,12 +3,5 @@
   "engineVersion": "v1.0.0-0",
   "sdk": {
     "source": "dang"
-  },
-  "dependencies": [
-    {
-      "name": "editor",
-      "source": "github.com/vito/editor",
-      "pin": "f27ffcef3dd65bfe3f764af6c29e98f821dc8a81"
-    }
-  ]
+  }
 }
