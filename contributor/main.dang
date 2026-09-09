@@ -19,6 +19,14 @@
 #   (commit, then push); this tool is only the last step, so the whole
 #   contribution flow is reviewable primitives instead of one opaque leap.
 #
+# - `pushBranch` publishes the workspace's committed HEAD to a branch on a
+#   DIFFERENT repository — typically a fork, for when the agent cannot or
+#   should not push branches to the repository it checked out. Committer's
+#   push only reaches the checkout's own remote; this one names its
+#   destination, completing the fork flow: checkout upstream → edit →
+#   commit → pushBranch(repo: "you/fork", branch: "fix-x") →
+#   submitPr(branch: "you:fix-x").
+#
 # - `checkout` re-points the agent at a DIFFERENT repository: it fetches a
 #   git repo as a Workspace (GitRef.asWorkspace, authenticated with the
 #   module token so pushes work) and returns a continuation of the current
@@ -460,6 +468,85 @@ type Contributor {
   }
 
   """
+  Publish the workspace's committed HEAD to a branch on ANOTHER repository —
+  typically a fork, for when you cannot or should not push branches to the
+  repository you checked out. The committer `push` tool only reaches the
+  checkout's own remote; this one names its destination, so the fork flow is
+  checkout upstream → edit → commit → pushBranch → submitPr with branch
+  "owner:branch".
+
+  Pending changes are NOT pushed: commit first. Authentication comes from
+  the configured GitHub token when present, or the host's own git
+  credentials (e.g. SSH agent + pushInsteadOf) otherwise.
+
+  A push the remote rejects (its branch moved past ours) is an error, never
+  a takeover. To overwrite anyway, pass `expectedRemoteSHA`: the push then
+  succeeds only while the remote branch still points at that sha — a lease,
+  like `--force-with-lease` — so use it only after reading what the remote
+  moved to, and only when discarding that is the intent.
+  """
+  pushBranch(
+    source: Workspace!,
+    """
+    The destination GitHub repository, as "owner/name" (a github.com URL
+    works too) — typically your fork of the repository you checked out.
+    """
+    repo: String!,
+    """
+    Destination branch name on that repository, e.g. "fix-span-leak".
+    """
+    branch: String!,
+    """
+    Lease on the destination branch: omit for a plain push (fast-forwards and
+    branch creation only), or pass the sha the remote branch is expected to
+    point at to force-update it from exactly that state.
+    """
+    expectedRemoteSHA: String = null,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): pushing is an effect on the remote; a later identical
+    # call must push again, not replay the first result.
+    if (branch.trimSpace == "") {
+      raise "pushBranch: the destination branch must not be empty"
+    }
+    let slug = normalizeSlug(repo)
+    let url = if (slug.containsMatch(`^[^/:]+/[^/]+$`)) {
+      "https://github.com/" + slug
+    } else {
+      repo
+    }
+    # The first read of the workspace's git state: a workspace with no
+    # readable history gets the plain answer, not a push error.
+    source.git.head.commitSHA rescue { e: Error =>
+      return `This workspace has no readable git history (${plainError(e.message)}); ` +
+        "there is nothing to push. Pending edits are still visible with status / diff."
+    }
+    let result = source.git.head.push(
+      to: authenticated(url),
+      branch: branch,
+      expectedRemoteSHA: expectedRemoteSHA,
+    ).{{ref, previousSHA, sha, disposition}} rescue { e: Error =>
+      raise `push to ${slug} failed: ${plainError(e.message)}`
+    }
+    let summary = case (result.disposition) {
+      GitPushDisposition.UP_TO_DATE =>
+        `${result.ref} on ${slug} is already up to date at ${short(result.sha)}; nothing to push.`
+      GitPushDisposition.CREATED =>
+        `Pushed ${result.ref} (new branch) to ${slug} at ${short(result.sha)}.`
+      GitPushDisposition.FORCED =>
+        `Pushed ${result.ref} to ${slug}: forced ${short(result.previousSHA)} -> ${short(result.sha)}.`
+      else =>
+        `Pushed ${result.ref} to ${slug}: ${short(result.previousSHA)} -> ${short(result.sha)}.`
+    }
+    let left = source.git.uncommitted.diffStats.{{path}}.length
+    let leftNote = if (left > 0) {
+      "\n" + `${toString(left)} file(s) remain uncommitted and were not pushed; status shows them.`
+    } else {
+      ""
+    }
+    summary + leftNote
+  }
+
+  """
   Switch this conversation to a checkout of a DIFFERENT git repository.
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
@@ -716,6 +803,14 @@ type Contributor {
     `submitPr` with a real title and a body written for a reviewer. It
     targets the configured remote unless you pass `repo`.
 
+    `pushBranch` publishes the workspace's committed HEAD to a branch on
+    ANOTHER repository — typically a fork, for when you cannot or should
+    not push branches to the repository you checked out (the committer
+    `push` only reaches the checkout's own remote). The fork flow is:
+    checkout upstream → edit → commit → pushBranch(repo: "you/fork",
+    branch: "fix-x") → submitPr(branch: "you:fix-x"). Pending changes are
+    not pushed: commit first.
+
     `checkout` replaces this conversation's workspace with a fresh checkout
     of another git repository — for when work belongs somewhere else, e.g.
     an upstream bug in a dependency. Your tools come along and simply
@@ -723,8 +818,8 @@ type Contributor {
     defines are composed on top of them. The switch is one-way: your
     previous workspace, pending changes included, is left behind. A checked
     out workspace cannot export back to the host — its work leaves only by
-    commit + push — so the full errand is checkout → edit → commit → push →
-    submitPr.
+    commit + push — so the full errand is checkout → edit → commit → push
+    (or pushBranch, to a fork) → submitPr.
 
     Because checkout is one-way, prefer delegating the whole errand when you
     have the means to (e.g. a staff worker or sub-agent whose workspace is a
