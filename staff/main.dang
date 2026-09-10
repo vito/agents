@@ -695,7 +695,7 @@ type Staff {
     name: String!,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): imperatively mutates runtime state.
-    member(name).interrupt
+    member(name).pause(interrupt: true)
     `${name} interrupted: parked PAUSED with completed steps kept; sendTo resumes it`
   }
 
