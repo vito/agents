@@ -247,6 +247,21 @@ type Contributor {
       raise noTokenError
     }
 
+    # gh expands {owner}/{repo} itself by asking git about the working
+    # directory — and the toolbox container has no repository, so that road
+    # ends at "fatal: not a git repository". Resolve them here instead, from
+    # the configured remote, which is what the docstring promises anyway.
+    let expanded = path
+    if (path.contains("{owner}") or path.contains("{repo}")) {
+      if (remote == "") {
+        raise noRemoteForPlaceholdersError
+      }
+      let parts = remoteSlug.split("/", 2)
+      expanded = path
+        .replace("{owner}", parts[0] ?? "")
+        .replace("{repo}", parts[1] ?? "")
+    }
+
     let script = """
       set -eu
       # Secret commands (e.g. `gh auth token`) commonly emit a trailing
@@ -260,7 +275,7 @@ type Contributor {
     """
 
     let ran = toolbox
-      .withEnvVariable("API_PATH", path)
+      .withEnvVariable("API_PATH", expanded)
       .withEnvVariable("JQ_EXPR", jq)
       .withEnvVariable("PAGINATE", if (paginate) { "1" } else { "" })
       # live read: never serve API responses from the exec cache
@@ -765,6 +780,15 @@ type Contributor {
   let noRemoteError: String! = """
     No GitHub remote is configured, so a bare PR number cannot be resolved.
     Set the repository in dagger.toml (or pass a full PR URL instead):
+
+        [env.dev.modules.contributor.settings]
+        remote = "dagger/dagger"
+  """
+
+  let noRemoteForPlaceholdersError: String! = """
+    No GitHub remote is configured, so {owner}/{repo} placeholders cannot be
+    resolved. Set the repository in dagger.toml (or spell out the owner/name
+    in the path instead):
 
         [env.dev.modules.contributor.settings]
         remote = "dagger/dagger"
