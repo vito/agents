@@ -55,7 +55,10 @@
 # only as a secret env var (GH_TOKEN) — never baked into an image layer,
 # never echoed. `remote` names the GitHub repository bare PR numbers resolve
 # against; it's a property of the project rather than of any one task (a
-# permanent fork would simply configure a different value).
+# permanent fork would simply configure a different value). When no remote
+# is configured, the tools fall back to the checkout's own origin remote:
+# the toolbox mounts the workspace's git directory at .git, so git — and
+# therefore gh — sees the repository it is operating on.
 
 # Tail-truncate command output to keep tool results context-friendly.
 let tailLines = 200
@@ -119,6 +122,9 @@ type Contributor {
 
         [env.dev.modules.contributor.settings]
         remote = "dagger/dagger"
+
+    When unset, tools that need a repository fall back to the origin remote
+    of the workspace's own checkout.
     """
     remote: String! = "",
   ) {
@@ -141,11 +147,12 @@ type Contributor {
   with their file, line, and diff context.
 
   Accepts a bare PR number (resolved against the configured remote
-  repository) or a full PR URL. A link to a single comment — the
-  `#discussion_r<id>` URLs GitHub hands out — narrows the output to just
-  that comment's thread.
+  repository, or the checkout's own origin remote when none is configured)
+  or a full PR URL. A link to a single comment — the `#discussion_r<id>`
+  URLs GitHub hands out — narrows the output to just that comment's thread.
   """
   reviewComments(
+    source: Workspace!,
     """
     The pull request to read: a number like "13831", a URL like
     "https://github.com/dagger/dagger/pull/13831", or a single-comment link
@@ -182,12 +189,7 @@ type Contributor {
     # Fetch every review comment on the PR, then let jq group them into
     # threads (replies carry in_reply_to_id pointing at the thread root) and
     # render them — narrowed to one thread when DISCUSSION_ID is set.
-    let script = """
-      set -eu
-      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
-      # newline; HTTP headers reject it.
-      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
-      export GH_TOKEN
+    let script = resolveRepoSh + "\n" + """
       if [ -n "$DISCUSSION_ID" ]; then
         printf '## Review thread discussion_r%s on %s#%s\n\n' "$DISCUSSION_ID" "$OWNER_REPO" "$PR_NUMBER"
       else
@@ -197,7 +199,7 @@ type Contributor {
       printf '%s' "$comments" | jq -rs -f /tmp/render.jq
     """
 
-    let ran = toolbox
+    let ran = toolbox(source)
       .withNewFile("/tmp/render.jq", renderJq)
       .withEnvVariable("OWNER_REPO", repo)
       .withEnvVariable("PR_NUMBER", number)
@@ -228,10 +230,12 @@ type Contributor {
   need (e.g. ".items[].path").
   """
   ghApi(
+    source: Workspace!,
     """
     The API path to GET, e.g. "repos/dagger/dagger/releases/latest" or
     "search/code?q=repo:badlogic/pi-mono+toolSnippets". A leading slash is
-    fine. Placeholders {owner}/{repo} resolve against the configured remote.
+    fine. Placeholders {owner}/{repo} resolve against the configured remote,
+    or the checkout's own origin remote when none is configured.
     """
     path: String!,
     """
@@ -259,15 +263,23 @@ type Contributor {
       # newline; HTTP headers reject it.
       GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
       export GH_TOKEN
+      # A configured remote wins for {owner}/{repo} placeholders; without
+      # one, gh resolves them itself from the checkout's git directory,
+      # which the toolbox mounts at .git.
+      if [ -n "$OWNER_REPO" ]; then
+        GH_REPO="$OWNER_REPO"
+        export GH_REPO
+      fi
       set -- api --method GET "${API_PATH#/}"
       if [ -n "$PAGINATE" ]; then set -- "$@" --paginate; fi
       if [ -n "$JQ_EXPR" ]; then set -- "$@" --jq "$JQ_EXPR"; fi
       gh "$@"
     """
 
-    let ran = toolbox
+    let ran = toolbox(source)
       .withEnvVariable("API_PATH", path)
       .withEnvVariable("JQ_EXPR", jq)
+      .withEnvVariable("OWNER_REPO", remoteSlug)
       .withEnvVariable("PAGINATE", if (paginate) { "1" } else { "" })
       # live read: never serve API responses from the exec cache
       .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
@@ -291,9 +303,11 @@ type Contributor {
   not the human operator. Calls without the prefix are rejected.
   """
   prComment(
+    source: Workspace!,
     """
     The pull request to comment on: a number like "13831" (resolved against
-    the configured remote) or a URL like
+    the configured remote, or the checkout's origin remote when none is
+    configured) or a URL like
     "https://github.com/dagger/dagger/pull/13831".
     """
     pr: String!,
@@ -349,12 +363,7 @@ type Contributor {
     # the PR's current head commit); plain feedback is an issue comment on
     # the PR conversation. The body travels as a file, never spliced into
     # shell source.
-    let script = """
-      set -eu
-      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
-      # newline; HTTP headers reject it.
-      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
-      export GH_TOKEN
+    let script = resolveRepoSh + "\n" + """
       if [ -n "$FILE_PATH" ]; then
         head_sha="$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER" --jq .head.sha)"
         set -- api --method POST "repos/$OWNER_REPO/pulls/$PR_NUMBER/comments" \
@@ -373,7 +382,7 @@ type Contributor {
       fi
     """
 
-    let ran = toolbox
+    let ran = toolbox(source)
       .withNewFile("/tmp/body.md", body)
       .withEnvVariable("OWNER_REPO", repo)
       .withEnvVariable("PR_NUMBER", number)
@@ -401,6 +410,7 @@ type Contributor {
   your work with the git tools before calling this.
   """
   submitPr(
+    source: Workspace!,
     """
     The head branch to open the pull request from — the branch you pushed,
     e.g. "fix-span-leak". For a PR from a fork, qualify it as "owner:branch".
@@ -416,8 +426,9 @@ type Contributor {
     body: String! = "",
     """
     The GitHub repository to open the pull request on, as "owner/name" (a
-    github.com URL works too). Empty targets the configured remote — pass
-    this explicitly after a `checkout` of another repository.
+    github.com URL works too). Empty targets the configured remote, or the
+    checkout's own origin remote when none is configured — so after a
+    `checkout` this defaults to the repository you checked out.
     """
     repo: String! = "",
     """
@@ -437,14 +448,12 @@ type Contributor {
       raise noTokenError
     }
     let slug = if (repo == "") { remoteSlug } else { normalizeSlug(repo) }
+    # For messages only: slug may be empty, meaning "whatever the checkout's
+    # origin remote says" — the script resolves it.
+    let where = if (slug == "") { "the checkout's repository" } else { slug }
 
     # The body travels as a file, never spliced into shell source.
-    let script = """
-      set -eu
-      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
-      # newline; HTTP headers reject it.
-      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
-      export GH_TOKEN
+    let script = resolveRepoSh + "\n" + """
       set -- pr create --repo "$OWNER_REPO" --head "$BRANCH" \
         --title "$PR_TITLE" --body-file /tmp/pr.md
       if [ -n "$BASE_BRANCH" ]; then set -- "$@" --base "$BASE_BRANCH"; fi
@@ -452,7 +461,7 @@ type Contributor {
       gh "$@"
     """
 
-    let ran = toolbox
+    let ran = toolbox(source)
       .withNewFile("/tmp/pr.md", body)
       .withEnvVariable("OWNER_REPO", slug)
       .withEnvVariable("BRANCH", branch)
@@ -466,7 +475,7 @@ type Contributor {
       .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
 
     if (ran.exitCode != 0) {
-      raise `opening a pull request on ${slug} from ${branch} failed (exit ${toString(ran.exitCode)}):` +
+      raise `opening a pull request on ${where} from ${branch} failed (exit ${toString(ran.exitCode)}):` +
         "\n\n" + tail(ran.combinedOutput)
     }
 
@@ -485,9 +494,11 @@ type Contributor {
   fork).
   """
   updatePr(
+    source: Workspace!,
     """
     The pull request to update: a number like "13831" (resolved against
-    the configured remote) or a URL like
+    the configured remote, or the checkout's origin remote when none is
+    configured) or a URL like
     "https://github.com/dagger/dagger/pull/13831".
     """
     pr: String!,
@@ -560,12 +571,7 @@ type Contributor {
     # a file, never spliced into shell source, and gh's own stdout chatter
     # is dropped so stdout carries just the summary (stderr still reaches
     # the error path via combinedOutput).
-    let script = """
-      set -eu
-      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
-      # newline; HTTP headers reject it.
-      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
-      export GH_TOKEN
+    let script = resolveRepoSh + "\n" + """
       url="https://github.com/$OWNER_REPO/pull/$PR_NUMBER"
       pr_json="$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER")"
       was_state="$(printf '%s' "$pr_json" | jq -r .state)"
@@ -600,7 +606,7 @@ type Contributor {
       printf 'Updated %s: %s\n' "$url" "$summary"
     """
 
-    let ran = toolbox
+    let ran = toolbox(source)
       .withNewFile("/tmp/body.md", body ?? "")
       .withEnvVariable("OWNER_REPO", repo)
       .withEnvVariable("PR_NUMBER", number)
@@ -794,21 +800,52 @@ type Contributor {
 
   # ---- helpers ------------------------------------------------------------
 
-  # Shared toolbox for GitHub operations: git, gh, and jq.
-  let toolbox: Container! {
+  # Shared toolbox for GitHub operations: git, gh, and jq, with the
+  # workspace's git directory mounted at .git so git — and therefore gh —
+  # sees the checkout: its origin remote resolves bare PR numbers and
+  # {owner}/{repo} placeholders when no remote is configured.
+  let toolbox(source: Workspace!): Container! {
     container
       .from("alpine:3.20")
       .withExec(["apk", "add", "--no-cache", "git", "github-cli", "jq"])
+      # The mounted git dir arrives with whatever ownership the engine gives
+      # it; keep git from refusing to read a repo it thinks is someone
+      # else's.
+      .withExec(["git", "config", "--global", "--add", "safe.directory", "*"])
+      .withWorkdir("/workspace")
+      .withDirectory("/workspace/.git", source.git.directory)
   }
 
-  # The configured remote normalized to "owner/name". Raises when no remote
-  # is configured.
+  # The configured remote normalized to "owner/name", or "" when none is
+  # configured — the shell side (resolveRepoSh) then falls back to the
+  # checkout's own origin remote, which toolbox mounts at .git.
   let remoteSlug: String! {
     if (remote == "") {
-      raise noRemoteError
+      ""
+    } else {
+      normalizeSlug(remote)
     }
-    normalizeSlug(remote)
   }
+
+  # Shell preamble for every gh-running script: sanitize the token, then
+  # resolve OWNER_REPO from the checkout's origin remote when the caller
+  # left it empty (no configured remote) — normalizeSlug's normalization,
+  # in sed.
+  let resolveRepoSh: String! = """
+    set -eu
+    # Secret commands (e.g. `gh auth token`) commonly emit a trailing
+    # newline; HTTP headers reject it.
+    GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
+    export GH_TOKEN
+    if [ -z "${OWNER_REPO:-}" ]; then
+      origin="$(git remote get-url origin 2>/dev/null || true)"
+      if [ -z "$origin" ]; then
+        echo "cannot resolve the GitHub repository: no remote is configured and the checkout has no origin remote" >&2
+        exit 1
+      fi
+      OWNER_REPO="$(printf '%s' "$origin" | sed -E -e 's#^.*github\.com[:/]##' -e 's#\.git$##' -e 's#/$##')"
+    fi
+  """
 
   # Normalize a repository reference to "owner/name" (full https/ssh
   # github.com URLs work too; anything else passes through).
@@ -918,14 +955,6 @@ type Contributor {
     written by a machine, not the human operator.
   """
 
-  let noRemoteError: String! = """
-    No GitHub remote is configured, so a bare PR number cannot be resolved.
-    Set the repository in dagger.toml (or pass a full PR URL instead):
-
-        [env.dev.modules.contributor.settings]
-        remote = "dagger/dagger"
-  """
-
   # Instructions for the agent holding these tools.
   let systemPrompt: String! = """
     You have GitHub tools: `reviewComments` and `ghApi` for reading,
@@ -941,7 +970,8 @@ type Contributor {
 
     `reviewComments` reads the review comment threads on a pull request —
     each with its file, line, and diff context. Pass a PR number (resolved
-    against the project's configured GitHub remote) or a full PR URL; the
+    against the configured GitHub remote, falling back to the checkout's
+    own origin remote) or a full PR URL; the
     single-comment links people paste in conversation (ending in
     #discussion_r<id>) narrow the output to just that comment's thread. When
     asked to look at or address review feedback, read the thread first and
@@ -958,7 +988,8 @@ type Contributor {
     ordinary flow you already know, made of reviewable steps: edit, review
     with the git tools, `commit`, `push` to a feature branch, then
     `submitPr` with a real title and a body written for a reviewer. It
-    targets the configured remote unless you pass `repo`.
+    targets the configured remote — or the checkout's own origin remote
+    when none is configured — unless you pass `repo`.
 
     `updatePr` edits a pull request that already exists: retitle it,
     rewrite its body, retarget its base branch, flip it between draft and
