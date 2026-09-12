@@ -21,32 +21,52 @@ githubToken = "cmd://gh auth token"
 [modules.context]
 source = "context"
 
-[modules.dagger-dang-sdk.as-sdk]
-name = "dang"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "claude"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "codex"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "committer"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "context"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "contributor"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "delegate"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "librarian"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "sandbox"
 
-[[modules.dagger-dang-sdk.as-sdk.modules]]
-path = "staff"
+
+[sdks.dang]
+module = "dagger-dang-sdk"
+
+[sdks.dang.scopes.claude]
+is-module = true
+name = "claude"
+
+[sdks.dang.scopes.codex]
+is-module = true
+clients = ["github.com/dagger/dagger/modules/wolfi@f2aefc20cf41b5ed7922df7244e0f10ddc6031f7"]
+name = "codex"
+
+[sdks.dang.scopes.committer]
+is-module = true
+name = "committer"
+
+[sdks.dang.scopes.context]
+is-module = true
+name = "context"
+
+[sdks.dang.scopes.contributor]
+is-module = true
+name = "contributor"
+
+[sdks.dang.scopes.delegate]
+is-module = true
+name = "delegate"
+
+[sdks.dang.scopes.librarian]
+is-module = true
+name = "librarian"
+
+[sdks.dang.scopes.sandbox]
+is-module = true
+name = "sandbox"
+
+[sdks.dang.scopes.staff]
+is-module = true
+name = "staff"
