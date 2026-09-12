@@ -565,28 +565,32 @@ type Contributor {
     }
 
     # The current state is read first so repeated calls converge instead of
-    # erroring (gh refuses to close a closed PR, etc.). Reopen happens
-    # before everything else so draft/ready flips work on a PR being
-    # revived; close happens last for the same reason. The body travels as
-    # a file, never spliced into shell source, and gh's own stdout chatter
-    # is dropped so stdout carries just the summary (stderr still reaches
-    # the error path via combinedOutput).
+    # erroring (closing a closed PR, etc.). Reopen happens before everything
+    # else so draft/ready flips work on a PR being revived; close happens
+    # last for the same reason. Metadata lands via REST PATCH — `gh pr edit`
+    # would be the obvious tool, but its GraphQL preamble still selects
+    # Projects (classic) fields, which GitHub now rejects outright; only the
+    # draft flip has no REST route, so `gh pr ready` handles that alone. The
+    # body travels as a file, never spliced into shell source, and gh's own
+    # stdout chatter is dropped so stdout carries just the summary (stderr
+    # still reaches the error path via combinedOutput).
     let script = resolveRepoSh + "\n" + """
       url="https://github.com/$OWNER_REPO/pull/$PR_NUMBER"
-      pr_json="$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER")"
+      api="repos/$OWNER_REPO/pulls/$PR_NUMBER"
+      pr_json="$(gh api "$api")"
       was_state="$(printf '%s' "$pr_json" | jq -r .state)"
       was_draft="$(printf '%s' "$pr_json" | jq -r .draft)"
       summary=""
       note() { summary="${summary:+$summary, }$1"; }
       if [ "$NEW_STATE" = "open" ]; then
         if [ "$was_state" = "open" ]; then note "already open"
-        else gh pr reopen "$url" >/dev/null; note "reopened"; fi
+        else gh api --method PATCH "$api" -f state=open >/dev/null; note "reopened"; fi
       fi
       if [ -n "$SET_TITLE" ] || [ -n "$SET_BODY" ] || [ -n "$BASE_BRANCH" ]; then
-        set -- pr edit "$url"
-        if [ -n "$SET_TITLE" ]; then set -- "$@" --title "$PR_TITLE"; note "title"; fi
-        if [ -n "$SET_BODY" ]; then set -- "$@" --body-file /tmp/body.md; note "body"; fi
-        if [ -n "$BASE_BRANCH" ]; then set -- "$@" --base "$BASE_BRANCH"; note "base -> $BASE_BRANCH"; fi
+        set -- api --method PATCH "$api"
+        if [ -n "$SET_TITLE" ]; then set -- "$@" -f "title=$PR_TITLE"; note "title"; fi
+        if [ -n "$SET_BODY" ]; then set -- "$@" -F "body=@/tmp/body.md"; note "body"; fi
+        if [ -n "$BASE_BRANCH" ]; then set -- "$@" -f "base=$BASE_BRANCH"; note "base -> $BASE_BRANCH"; fi
         gh "$@" >/dev/null
       fi
       case "$SET_DRAFT" in
@@ -601,7 +605,7 @@ type Contributor {
       esac
       if [ "$NEW_STATE" = "closed" ]; then
         if [ "$was_state" = "closed" ]; then note "already closed"
-        else gh pr close "$url" >/dev/null; note "closed"; fi
+        else gh api --method PATCH "$api" -f state=closed >/dev/null; note "closed"; fi
       fi
       printf 'Updated %s: %s\n' "$url" "$summary"
     """
