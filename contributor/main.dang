@@ -19,6 +19,12 @@
 #   (commit, then push); this tool is only the last step, so the whole
 #   contribution flow is reviewable primitives instead of one opaque leap.
 #
+# - `updatePr` edits a pull request that already exists — title, body,
+#   base branch, draft/ready state, open/closed — so iterating on a
+#   submission doesn't require a new PR or a human detour. Metadata only:
+#   the code side of a PR changes by pushing more commits to its head
+#   branch (committer's push, or pushBranch for a fork).
+#
 # - `pushBranch` publishes the workspace's committed HEAD to a branch on a
 #   DIFFERENT repository — typically a fork, for when the agent cannot or
 #   should not push branches to the repository it checked out. Committer's
@@ -468,6 +474,156 @@ type Contributor {
   }
 
   """
+  Update an existing pull request: retitle it, rewrite its body, retarget
+  its base branch, flip it between draft and ready for review, or close and
+  reopen it.
+
+  Every argument besides `pr` is optional, and only the ones you pass
+  change — the rest of the pull request stays exactly as it is. This edits
+  the PR's metadata, not its commits: new code reaches a PR by pushing more
+  commits to its head branch (the committer `push`, or `pushBranch` for a
+  fork).
+  """
+  updatePr(
+    """
+    The pull request to update: a number like "13831" (resolved against
+    the configured remote) or a URL like
+    "https://github.com/dagger/dagger/pull/13831".
+    """
+    pr: String!,
+    """
+    New pull request title. Omitted leaves the title unchanged.
+    """
+    title: String = null,
+    """
+    New pull request body (Markdown), replacing the old one entirely — so
+    re-state everything worth keeping. Omitted leaves the body unchanged.
+    """
+    body: String = null,
+    """
+    New base branch the pull request merges into (retargeting). Omitted
+    leaves the base unchanged.
+    """
+    baseBranch: String = null,
+    """
+    true converts the pull request to a draft; false marks it ready for
+    review. Omitted leaves its draft state unchanged.
+    """
+    draft: Boolean = null,
+    """
+    "closed" closes the pull request; "open" reopens it. Omitted leaves it
+    as-is.
+    """
+    state: String = null,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): updating a PR is a side effect, not something to
+    # replay from the session cache.
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    if (title == null and body == null and baseBranch == null and draft == null and state == null) {
+      raise "nothing to update: pass at least one of `title`, `body`, `baseBranch`, `draft`, or `state`"
+    }
+    if (state != null) {
+      if (state != "open" and state != "closed") {
+        raise `not a pull request state: "${state}" — pass "open" to reopen or "closed" to close`
+      }
+    }
+    if (baseBranch != null) {
+      if (baseBranch.trimSpace == "") {
+        raise "updatePr: `baseBranch` must not be empty"
+      }
+    }
+
+    # Same PR-reference forms as prComment: a bare number resolves against
+    # the configured remote, a github.com PR URL names its own repository.
+    let repo = ""
+    let number = ""
+    let ref = pr.trimPrefix("#")
+    if (ref.containsMatch(`^\d+$`)) {
+      repo = remoteSlug
+      number = ref
+    } else {
+      let m = ref.match(`github\.com/([^/]+)/([^/]+)/pull/(\d+)`)
+      if (m == null) {
+        raise `not a pull request reference: "${pr}" — pass a PR number or a github.com PR URL`
+      }
+      repo = (m.captures[0] ?? "") + "/" + (m.captures[1] ?? "")
+      number = m.captures[2] ?? ""
+    }
+
+    # The current state is read first so repeated calls converge instead of
+    # erroring (gh refuses to close a closed PR, etc.). Reopen happens
+    # before everything else so draft/ready flips work on a PR being
+    # revived; close happens last for the same reason. The body travels as
+    # a file, never spliced into shell source, and gh's own stdout chatter
+    # is dropped so stdout carries just the summary (stderr still reaches
+    # the error path via combinedOutput).
+    let script = """
+      set -eu
+      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
+      # newline; HTTP headers reject it.
+      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
+      export GH_TOKEN
+      url="https://github.com/$OWNER_REPO/pull/$PR_NUMBER"
+      pr_json="$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER")"
+      was_state="$(printf '%s' "$pr_json" | jq -r .state)"
+      was_draft="$(printf '%s' "$pr_json" | jq -r .draft)"
+      summary=""
+      note() { summary="${summary:+$summary, }$1"; }
+      if [ "$NEW_STATE" = "open" ]; then
+        if [ "$was_state" = "open" ]; then note "already open"
+        else gh pr reopen "$url" >/dev/null; note "reopened"; fi
+      fi
+      if [ -n "$SET_TITLE" ] || [ -n "$SET_BODY" ] || [ -n "$BASE_BRANCH" ]; then
+        set -- pr edit "$url"
+        if [ -n "$SET_TITLE" ]; then set -- "$@" --title "$PR_TITLE"; note "title"; fi
+        if [ -n "$SET_BODY" ]; then set -- "$@" --body-file /tmp/body.md; note "body"; fi
+        if [ -n "$BASE_BRANCH" ]; then set -- "$@" --base "$BASE_BRANCH"; note "base -> $BASE_BRANCH"; fi
+        gh "$@" >/dev/null
+      fi
+      case "$SET_DRAFT" in
+        true)
+          if [ "$was_draft" = "true" ]; then note "already a draft"
+          else gh pr ready --undo "$url" >/dev/null; note "converted to draft"; fi
+          ;;
+        false)
+          if [ "$was_draft" = "false" ]; then note "already ready for review"
+          else gh pr ready "$url" >/dev/null; note "marked ready for review"; fi
+          ;;
+      esac
+      if [ "$NEW_STATE" = "closed" ]; then
+        if [ "$was_state" = "closed" ]; then note "already closed"
+        else gh pr close "$url" >/dev/null; note "closed"; fi
+      fi
+      printf 'Updated %s: %s\n' "$url" "$summary"
+    """
+
+    let ran = toolbox
+      .withNewFile("/tmp/body.md", body ?? "")
+      .withEnvVariable("OWNER_REPO", repo)
+      .withEnvVariable("PR_NUMBER", number)
+      .withEnvVariable("SET_TITLE", if (title == null) { "" } else { "1" })
+      .withEnvVariable("PR_TITLE", title ?? "")
+      .withEnvVariable("SET_BODY", if (body == null) { "" } else { "1" })
+      .withEnvVariable("BASE_BRANCH", baseBranch ?? "")
+      .withEnvVariable("SET_DRAFT", if (draft == null) { "" } else if (draft ?? false) { "true" } else { "false" })
+      .withEnvVariable("NEW_STATE", state ?? "")
+      # updating must actually happen every time, not be served from the
+      # exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+
+    if (ran.exitCode != 0) {
+      raise `updating ${repo}#${number} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
+    }
+
+    ran.stdout.trimSpace
+  }
+
+  """
   Publish the workspace's committed HEAD to a branch on ANOTHER repository —
   typically a fork, for when you cannot or should not push branches to the
   repository you checked out. The committer `push` tool only reaches the
@@ -774,7 +930,8 @@ type Contributor {
   let systemPrompt: String! = """
     You have GitHub tools: `reviewComments` and `ghApi` for reading,
     `prComment` for review feedback, `submitPr` for opening pull requests,
-    and `checkout` for switching this conversation to another repository.
+    `updatePr` for editing them afterwards, and `checkout` for switching
+    this conversation to another repository.
 
     `ghApi` GETs any GitHub REST API path with authentication — code search
     ("search/code?q=repo:owner/name+needle"), PR/issue metadata, releases,
@@ -802,6 +959,12 @@ type Contributor {
     with the git tools, `commit`, `push` to a feature branch, then
     `submitPr` with a real title and a body written for a reviewer. It
     targets the configured remote unless you pass `repo`.
+
+    `updatePr` edits a pull request that already exists: retitle it,
+    rewrite its body, retarget its base branch, flip it between draft and
+    ready for review, or close and reopen it. Only the arguments you pass
+    change. It edits metadata only — new code reaches a PR by pushing more
+    commits to its head branch (`push`, or `pushBranch` for a fork).
 
     `pushBranch` publishes the workspace's committed HEAD to a branch on
     ANOTHER repository — typically a fork, for when you cannot or should
