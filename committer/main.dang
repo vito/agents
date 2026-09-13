@@ -4,8 +4,9 @@
 # adds the write operation they both lacked: `commit`.
 #
 # A Dagger-native agent has no Bash tool, and the mounted Workspace is a plain
-# snapshot with NO .git, so `git` itself is never an option. Everything here
-# goes through the Dagger-native workspace git API, deliberately layered:
+# snapshot with NO .git, so `git` itself is never an option for the agent.
+# Everything here goes through the Dagger-native workspace git API where it
+# has the verb, deliberately layered:
 #
 #   * Workspace.git.uncommitted is a Changeset of the pending changes: its
 #     .diffStats and .asPatch render the `git status` / `git diff` half.
@@ -18,6 +19,11 @@
 #     commit. Costs one full checkout materialization (~5s on dagger/dagger,
 #     cached for the rest of the session), so it is only reached for the tools
 #     that genuinely need a tree.
+#   * `plumbing` mounts that same materialization into a pinned git container
+#     for the verbs the native API lacks: blame, the content pickaxe
+#     (`git log -S`), and object-name resolution for abbreviated hashes.
+#     Read-only, and it rides the same cached checkout as `repository`, so
+#     the extra layer costs no extra materialization.
 #   * Workspace.withCommit(message:, paths:, date:) records pending changes as
 #     a commit and returns a workspace with HEAD advanced. Returning that
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
@@ -246,7 +252,9 @@ type Committer {
 
   Use it to learn how this repository writes commit messages (`full: true`
   prints the bodies), or — with `paths` — to find out who last touched a file
-  and why. For one commit's actual patch, use `show`.
+  and why. `pickaxe` hunts by content instead of message: the commits that
+  added or removed an exact string, however long ago. For one commit's actual
+  patch, use `show`.
   """
   log(
     source: Workspace!,
@@ -269,6 +277,17 @@ type Committer {
     """
     grep: String = null,
     """
+    Only show commits that change the NUMBER of occurrences of this exact
+    string in some file's content — `git log -S`, the pickaxe. A commit that
+    adds or removes the string matches; one that merely moves it within a
+    file does not, which is exactly what makes this the tool for "when did
+    this line land, and why". The string is matched literally, not as a
+    pattern, against content rather than messages, and — unlike `grep` — the
+    search walks ALL history, not a bounded window. Composes with `paths` to
+    scope where the string is looked for.
+    """
+    pickaxe: String = null,
+    """
     Print the full message body of every commit, not just the subject.
     """
     full: Boolean! = false,
@@ -278,14 +297,23 @@ type Committer {
     # one more commit than the listing prints. `takeFirst(limit)` below drops it
     # again, so the extra entry is never rendered.
     let scanned = if (grep == null) { limit + 1 } else { searchWindow }
-    let walk = head(source).log(
-      limit: scanned,
-      paths: if (paths.isEmpty) { null } else { paths },
-    ).{{shortSha, authorName, authoredDate, message}} rescue { e: Error =>
-      # The first read of the workspace's git state: a synthetic workspace, a
-      # checkout that is not a git repository at all, or a fresh `git init`
-      # with nothing committed yet all give out here.
-      return noHistory(e.message)
+    let walk: [{{shortSha: String!, authorName: String!, authoredDate: String!, message: String!}}!]! = if (pickaxe == null) {
+      head(source).log(
+        limit: scanned,
+        paths: if (paths.isEmpty) { null } else { paths },
+      ).{{shortSha, authorName, authoredDate, message}} rescue { e: Error =>
+        # The first read of the workspace's git state: a synthetic workspace, a
+        # checkout that is not a git repository at all, or a fresh `git init`
+        # with nothing committed yet all give out here.
+        return noHistory(e.message)
+      }
+    } else {
+      # The same first-read guard, on a probe: the pickaxe walk runs real
+      # git, whose failures past this point are worth surfacing as errors.
+      head(source).commitSHA rescue { e: Error =>
+        return noHistory(e.message)
+      }
+      pickaxeCommits(source, pickaxe ?? "", paths, scanned)
     }
     let matched = if (grep == null) {
       walk
@@ -298,7 +326,7 @@ type Committer {
     let shown = matched.takeFirst(limit)
 
     if (shown.isEmpty) {
-      return emptyLog(paths, grep)
+      return emptyLog(paths, grep, pickaxe)
     }
 
     let entries = shown.map { c =>
@@ -320,8 +348,11 @@ type Committer {
       let more = matched.length - shown.length
       # `paths` narrows the walk before the pattern is applied, so the window
       # the match count refers to is the recent commits that touched those
-      # paths — not recent history as a whole.
-      let window = if (paths.isEmpty) {
+      # paths — not recent history as a whole. A pickaxe narrows it further
+      # still, to the commits the pickaxe selected.
+      let window = if (pickaxe != null) {
+        `the last ${toString(searchWindow)} commits the pickaxe selected`
+      } else if (paths.isEmpty) {
         `the last ${toString(searchWindow)} commits`
       } else {
         `the last ${toString(searchWindow)} commits touching the given paths`
@@ -332,7 +363,11 @@ type Committer {
     # Only meaningful without a grep: a grep listing walks the whole search
     # window and reports its own leftovers above.
     let moreNote = if (grep == null and matched.length > shown.length) {
-      "(more history below; raise limit to see it)"
+      if (pickaxe == null) {
+        "(more history below; raise limit to see it)"
+      } else {
+        "(more pickaxe matches below; raise limit to see them)"
+      }
     } else {
       ""
     }
@@ -362,8 +397,9 @@ type Committer {
     source: Workspace!,
     """
     The commit to show: "HEAD", a short or full hash from `log`, or a tag
-    name. Short hashes are resolved by scanning recent history, so an old one
-    may need its full form; the error says so when that happens.
+    name. Abbreviated hashes resolve against the object database — anything
+    `log` prints works, no matter how old — and an ambiguous abbreviation is
+    an error, never a guess.
     """
     commit: String! = "HEAD",
     """
@@ -484,10 +520,101 @@ type Committer {
       "\n\n" + numbered.join("\n") + footer
   }
 
+  """
+  Attribute every line of a file to the commit that last touched it — `git
+  blame`, compacted: consecutive lines owned by the same commit collapse into
+  one row with their line range, short hash, date, author, and subject.
+
+  This is the one-call answer to "when did this line land, and why" — follow
+  a row up with `show(commit:)` for the full change, or `fileAt` to read the
+  file as that commit left it. Attribution reads COMMITTED history: pending
+  edits are invisible here (`diff` shows those), so line numbers refer to the
+  file at HEAD.
+
+  A long-lived file can dissolve into hundreds of hunks, so the table is
+  capped; narrow with `startLine`/`endLine` (the footer says where to resume,
+  and `fileAt` numbers lines to steer by).
+  """
+  blame(
+    source: Workspace!,
+    """
+    Path of the file to blame, relative to the repository root.
+    """
+    path: String!,
+    """
+    First line of the range to attribute, 1-based. Empty starts at the top of
+    the file.
+    """
+    startLine: Int = null,
+    """
+    Last line of the range to attribute, inclusive. Empty runs to the end of
+    the file.
+    """
+    endLine: Int = null,
+  ): String! {
+    # The first read of the workspace's git state: a checkout with no readable
+    # history gives out here, with a plain answer instead of an engine error.
+    let headSha = head(source).commitSHA rescue { e: Error =>
+      return noHistory(e.message)
+    }
+    if (startLine != null and endLine != null and (endLine ?? 0) < (startLine ?? 0)) {
+      raise "blame: endLine must not be smaller than startLine"
+    }
+    let range = if (startLine == null and endLine == null) {
+      [] :: [String!]!
+    } else {
+      # An empty end spells "to the last line" in git's -L syntax.
+      let to = if (endLine == null) { "" } else { toString(endLine ?? 1) }
+      ["-L", toString(startLine ?? 1) + "," + to]
+    }
+    let ran = plumbing(source).withExec(
+      ["git", "blame", "--porcelain"] + range + ["HEAD", "--", path],
+      expect: ReturnType.ANY,
+    ).{{exitCode, stdout, stderr}}
+    if (ran.exitCode != 0) {
+      if (ran.stderr.contains("no such path")) {
+        raise `${path} does not exist at ${short(headSha)}` +
+          ` — it may have been deleted or renamed; log(paths: ["${path}"]) shows the commits that touched it`
+      }
+      raise `blame failed: ${plainError(ran.stderr)}`
+    }
+    let hunks = blameHunks(ran.stdout)
+    if (hunks.isEmpty) {
+      return `${path} at ${short(headSha)} has no lines to attribute.`
+    }
+
+    let firstLine = hunks.reduce(0) { acc, h => if (acc == 0) { h.start } else { acc } }
+    let lastLine = hunks.reduce(0) { acc, h => if (h.end > acc) { h.end } else { acc } }
+    let capped = hunks.takeFirst(maxHunks)
+    let repo = repository(source)
+    let rows = capped.map { h =>
+      let c = repo.commit(id: h.sha).{{shortSha, authorName, authoredDate, message}}
+      let span = if (h.start == h.end) {
+        toString(h.start)
+      } else {
+        `${toString(h.start)}-${toString(h.end)}`
+      }
+      `${span.padLeft(9)}  ${c.shortSha}  ${when(c.authoredDate)}  ${c.authorName}  ${subject(c.message)}`
+    }
+    # Never let a hunk-per-line file flood the caller's context: cap the
+    # table, and hand back the exact startLine to resume from.
+    let omitted = hunks.length - capped.length
+    let footer = if (omitted > 0) {
+      let shownEnd = capped.reduce(0) { acc, h => h.end }
+      "\n\n" + `... ${toString(omitted)} of ${toString(hunks.length)} hunk(s) not shown. ` +
+        `Continue with startLine: ${toString(shownEnd + 1)}.`
+    } else {
+      ""
+    }
+    `${path} — blame at ${short(headSha)}, lines ${toString(firstLine)}-${toString(lastLine)} ` +
+      `in ${toString(hunks.length)} hunk(s)` + "\n\n" + rows.join("\n") + footer
+  }
+
   # ---------------------------------------------------------------- helpers
 
-  # How far back short hashes and `grep` reach. The walk itself is cheap once
-  # the workspace's repository is materialized.
+  # How far back `grep` reaches (abbreviated hashes resolve against the
+  # object database instead, and have no window). The walk itself is cheap
+  # once the workspace's repository is materialized.
   let searchWindow: Int! = 500
 
   # Per-commit message cap in `log`, so one essay-length commit body cannot
@@ -498,6 +625,11 @@ type Committer {
   # (generated code, a vendor bump), and the stat list alone would then be the
   # whole answer.
   let maxFiles: Int! = 40
+
+  # Per-call hunk cap in `blame`. A long-lived file churned line by line can
+  # dissolve into a hunk per line, and the attribution table alone would then
+  # be the whole answer.
+  let maxHunks: Int! = 100
 
   let head(source: Workspace!): Dagger.GitRef! {
     source.git.head
@@ -581,28 +713,121 @@ type Committer {
     source.git.head.tree(discardGitDir: false, depth: 0).asGit
   }
 
+  # Real git over the checkout, for the verbs the native API lacks: blame,
+  # the content pickaxe, and object-name resolution. Mounts the SAME
+  # materialization `repository` reads — the tree at HEAD with its .git — so
+  # the two layers can never disagree about history, and the checkout is only
+  # paid for once. Read-only: nothing run in here writes back.
+  let plumbing(source: Workspace!): Dagger.Container! {
+    container
+      .from("alpine:3.20")
+      .withExec(["apk", "add", "--no-cache", "git"])
+      # The mount's owner is whatever the engine materialized; never let
+      # git's dubious-ownership check turn that into a failure.
+      .withExec(["git", "config", "--global", "safe.directory", "*"])
+      .withMountedDirectory("/repo", source.git.head.tree(discardGitDir: false, depth: 0))
+      .withWorkdir("/repo")
+  }
+
+  # Commits that change the number of occurrences of `needle`, newest first —
+  # `git log -S` against the checkout. git walks the WHOLE history here, not
+  # a bounded window: the pickaxe exists to find the commit nobody remembers.
+  # Returns the native walk's record shape, with each hit's metadata read
+  # back through the engine, so `log` renders both walks identically.
+  let pickaxeCommits(
+    source: Workspace!,
+    needle: String!,
+    paths: [String!]!,
+    limit: Int!,
+  ): [{{shortSha: String!, authorName: String!, authoredDate: String!, message: String!}}!]! {
+    if (needle == "") {
+      raise "pickaxe: the string must not be empty"
+    }
+    let scope = if (paths.isEmpty) { [] :: [String!]! } else { ["--"] + paths }
+    let ran = plumbing(source).withExec(
+      ["git", "log", "--format=%H", "-n", toString(limit), "-S" + needle] + scope,
+      expect: ReturnType.ANY,
+    ).{{exitCode, stdout, stderr}}
+    if (ran.exitCode != 0) {
+      raise `pickaxe failed: ${plainError(ran.stderr)}`
+    }
+    let repo = repository(source)
+    ran.stdout.split("\n").filter { line => line != "" }.map { sha =>
+      repo.commit(id: sha).{{shortSha, authorName, authoredDate, message}}
+    }
+  }
+
+  # Slice `git blame --porcelain` output into hunks. A group header is
+  # "<sha> <orig> <final> <count>": it opens a run of <count> consecutive
+  # lines attributed to <sha>, starting at final-file line <final>. Nothing
+  # else can match the pattern — headers within a run drop the <count>, and
+  # content lines are tab-prefixed. Adjacent runs from the same commit merge:
+  # the reader cares about which commit owns which lines, not the original
+  # line numbers git happens to group by.
+  let blameHunks(porcelain: String!): [{{sha: String!, start: Int!, end: Int!}}!]! {
+    let groups = porcelain.matchAll(`(?m)^([0-9a-f]{40}) \d+ (\d+) (\d+)$`).map { m =>
+      let start = toInt(m.captures[1] ?? "0")
+      {{
+        sha: m.captures[0] ?? "",
+        start: start,
+        end: start + toInt(m.captures[2] ?? "1") - 1,
+      }}
+    }
+    groups.reduce([] :: [{{sha: String!, start: Int!, end: Int!}}!]!) { acc, g =>
+      let last = acc.takeLast
+      if (last.any { p => p.sha == g.sha and p.end + 1 == g.start }) {
+        acc.dropLast + last.map { p => {{sha: p.sha, start: p.start, end: g.end}} }
+      } else {
+        acc + [g]
+      }
+    }
+  }
+
+  # Digits to Int. There is no direct String→Int cast, but digits are valid
+  # JSON.
+  let toInt(digits: String!): Int! {
+    JSON.decode(digits)
+  }
+
+  # Resolve a hash-shaped spec against the checkout's object database — real
+  # object-name resolution, the way `git rev-parse` does it because it IS
+  # `git rev-parse` — so any hash `log` ever printed resolves, no matter how
+  # old. Null when nothing matches (the spec may still be a ref name); an
+  # abbreviation matching several objects raises, since silently picking one
+  # would answer about the wrong commit.
+  let revParse(source: Workspace!, hash: String!): String {
+    let ran = plumbing(source).withExec(
+      ["git", "rev-parse", "--verify", "--end-of-options", hash + "^{commit}"],
+      expect: ReturnType.ANY,
+    ).{{exitCode, stdout, stderr}}
+    if (ran.exitCode == 0) {
+      return ran.stdout.trimSpace
+    }
+    if (ran.stderr.contains("ambiguous")) {
+      raise `commit "${hash}" is ambiguous; use a longer hash`
+    }
+    null
+  }
+
   # Resolve a user-supplied commit spelling to a full sha: "HEAD"/"" for the
   # tip (already resolved by the caller's first read), an exact or abbreviated
-  # hash from the recent walk, or anything the repository can resolve by name
-  # (a tag, the current branch).
+  # hash resolved against the object database, or anything the repository can
+  # resolve by name (a tag, the current branch).
   let resolveSpec(source: Workspace!, spec: String!, headSha: String!): String! {
     let want = spec.trimSpace
     if (want == "" or want == "HEAD") {
       return headSha
     }
     if (want.containsMatch(`^[0-9a-fA-F]{4,40}$`)) {
-      let known = head(source).log(limit: searchWindow).{{sha}}.map { c => c.sha }
-      let hits = known.filter { sha => sha == want.toLower or sha.hasPrefix(want.toLower) }
-      if (hits.length > 1) {
-        raise `commit "${spec}" is ambiguous (${toString(hits.length)} matches); use a longer hash`
+      let hit = revParse(source, want.toLower)
+      if (hit != null) {
+        return hit
       }
-      if (!hits.isEmpty) {
-        return hits.join("")
-      }
+      # Fall through: a short hex string can also be a branch or tag name.
     }
     repository(source).ref(name: want).commitSHA rescue { e: Error =>
-      raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` +
-        `and not a name this repository knows (${plainError(e.message)})`
+      raise `cannot resolve commit "${spec}": not an object in this repository, ` +
+        `and not a name it knows (${plainError(e.message)})`
     }
   }
 
@@ -692,10 +917,18 @@ type Committer {
     `On ${branch}, HEAD ${short(head(source).commitSHA)}.`
   }
 
-  let emptyLog(paths: [String!]!, grep: String): String! {
+  let emptyLog(paths: [String!]!, grep: String, pickaxe: String): String! {
+    let scope = if (paths.isEmpty) { "." } else { " under the given paths." }
+    if (pickaxe != null) {
+      let dug = `No commit changes the number of occurrences of "${pickaxe ?? ""}"`
+      if (grep != null) {
+        return dug + ` with a message matching "${grep ?? ""}"` + scope
+      }
+      return dug + scope
+    }
     if (grep != null) {
       return `No commit message in the last ${toString(searchWindow)} commits matches "${grep ?? ""}"` +
-        (if (paths.isEmpty) { "." } else { " under the given paths." })
+        scope
     }
     if (paths.isEmpty) {
       return "No commit history in this workspace."
@@ -756,13 +989,18 @@ type Committer {
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
       hatch, for when overwriting the remote is genuinely intended.
     - `log` — commits newest first. Pass `paths` to see who last touched a
-      file and why, `grep` to search commit messages, and `full: true` to
-      print full message bodies.
+      file and why, `grep` to search commit messages, `pickaxe` to dig up the
+      commits that added or removed an exact string (`git log -S`, over ALL
+      history), and `full: true` to print full message bodies.
     - `show` — one commit in full: metadata, message, per-file stats and the
       patch. Takes "HEAD", a short hash from `log`, or a tag; `against` turns
       it into a comparison between two commits.
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
+    - `blame` — who last touched each line of a file, hunk by hunk: each row
+      is a line range with its commit's short hash, date, author, and
+      subject. Scope big files with startLine/endLine, then follow a row up
+      with `show`.
 
     The A/M/D/R marks in `status` describe each path relative to the last
     commit, not `git status`'s index model — there is no staging area here,
