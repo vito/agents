@@ -3,7 +3,10 @@
 # Run `dagger workspace update` to refresh the pinned versions.
 [["version","2"]]
 ["","git-latest",["github.com/dagger/dang-sdk"],"refs/tags/v1.0.1"]
+["","git-latest",["github.com/dagger/sdk-helpers",["version","v1"]],"refs/tags/v1.0.4"]
 ["","git-latest",["github.com/vito/editor"],"refs/heads/main"]
 ["","git-sha",["github.com/dagger/dang-sdk","refs/heads/main"],"6dde4a9ca2cb598bf281ba36778d2428ad53aa48"]
 ["","git-sha",["github.com/dagger/dang-sdk","refs/tags/v1.0.1"],"6dde4a9ca2cb598bf281ba36778d2428ad53aa48"]
+["","git-sha",["github.com/dagger/sdk-helpers","refs/tags/v1.0.4"],"6c883f657933ecb06ae86d56d9cd1f8785346bb1"]
 ["","git-sha",["github.com/vito/editor","refs/heads/main"],"5481e5ce3a8b97ffb8beaee3a569ad9100e16167"]
+["","vanity-url",["https://dagger.io/sdk/helpers"],"https://github.com/dagger/sdk-helpers"]

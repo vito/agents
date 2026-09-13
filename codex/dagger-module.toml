@@ -6,5 +6,4 @@ engineVersion = "v1.0.0-0"
 
 [[dependencies]]
   name = "wolfi"
-  source = "github.com/dagger/dagger/modules/wolfi"
-  pin = "f2aefc20cf41b5ed7922df7244e0f10ddc6031f7"
+  source = "github.com/dagger/dagger/modules/wolfi@f2aefc20cf41b5ed7922df7244e0f10ddc6031f7"
