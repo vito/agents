@@ -13,8 +13,8 @@
 #     checkout's history. Cheap: the workspace's repository is materialized
 #     once per session and the walk reads straight from it.
 #   * head.asRepository exposes the backing GitRepository directly: ref(name:)
-#     and commit(id:) resolve full/short shas and names through the engine,
-#     and GitCommit.tree gives the filesystem at a commit.
+#     resolves hashes and names; commit(id:) accepts full/short shas, and
+#     GitCommit.tree gives the filesystem at a commit.
 #   * Workspace.withCommit(message:, paths:, date:) records pending changes as
 #     a commit and returns a workspace with HEAD advanced. Returning that
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
@@ -650,7 +650,7 @@ type Committer {
     if (want == "" or want == "HEAD") {
       return headSha
     }
-    source.git.head.asRepository.commit(id: want).sha rescue {
+    source.git.head.asRepository.ref(name: want).commitSHA rescue {
       e: Error => raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
     }
   }
