@@ -63,7 +63,8 @@ def expect_error(fragment, action):
     try:
         action()
     except RuntimeError as error:
-        assert fragment in str(error), str(error)
+        if fragment is not None:
+            assert fragment in str(error), str(error)
     else:
         raise AssertionError(f"expected error containing {fragment!r}")
 
@@ -94,13 +95,18 @@ def main():
         assert "staged" not in log, log
         patch = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha[:7]))
         assert "-base" in patch and "+worker" in patch and "worker change" in patch, patch
+        assert f"commit {worker_sha}\n" in patch, patch
+        assert harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha)) == patch
         root_patch = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(root_sha))
         assert "+base" in root_patch and "root fixture" in root_patch, root_patch
         scoped = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha) + ', paths: ["other.txt"]')
         assert "no changes under the given paths" in scoped, scoped
         expect_error("limit must be positive", lambda: harvest(staff, base, "logOf", ", limit: 0"))
-        expect_error("SHA must not be empty", lambda: harvest(staff, base, "pull", ', commits: [""]', '{ id }'))
-        expect_error("has no commit", lambda: harvest(staff, base, "diffOf", ', commit: "not-a-sha"'))
+        # Commit validation belongs to the engine; do not pin its error wording.
+        for invalid in ("", "not-a-sha"):
+            expect_error(None, lambda: harvest(staff, base, "pull", ', commits: ' + json.dumps([invalid]), '{ id }'))
+            expect_error(None, lambda: harvest(staff, base, "diffOf", ', commit: ' + json.dumps(invalid)))
+            expect_error(None, lambda: harvest(staff, base, "pullConflicted", ', commit: ' + json.dumps(invalid), '{ id }'))
 
         pulled = harvest(staff, base, "pull", selection="{ id git { head { commitSHA } } }")
         assert pulled["git"]["head"]["commitSHA"] == worker_sha, pulled

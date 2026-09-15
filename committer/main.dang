@@ -12,12 +12,9 @@
 #   * Workspace.git.head is a GitRef — head.log(limit:, paths:) walks the
 #     checkout's history. Cheap: the workspace's repository is materialized
 #     once per session and the walk reads straight from it.
-#   * head.tree(discardGitDir: false, depth: 0).asGit is a full GitRepository
-#     rebuilt from that materialization: ref(name:) and commit(id:) resolve
-#     arbitrary shas and tags, and GitCommit.tree gives the filesystem at a
-#     commit. Costs one full checkout materialization (~5s on dagger/dagger,
-#     cached for the rest of the session), so it is only reached for the tools
-#     that genuinely need a tree.
+#   * head.asRepository exposes the backing GitRepository directly: ref(name:)
+#     and commit(id:) resolve full/short shas and names through the engine,
+#     and GitCommit.tree gives the filesystem at a commit.
 #   * Workspace.withCommit(message:, paths:, date:) records pending changes as
 #     a commit and returns a workspace with HEAD advanced. Returning that
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
@@ -398,8 +395,7 @@ type Committer {
     source: Workspace!,
     """
     The commit to show: "HEAD", a short or full hash from `log`, or a tag
-    name. Short hashes are resolved by scanning recent history, so an old one
-    may need its full form; the error says so when that happens.
+    name. Hashes and names are resolved directly by the repository.
     """
     commit: String! = "HEAD",
     """
@@ -591,8 +587,7 @@ type Committer {
 
   # ---------------------------------------------------------------- helpers
 
-  # How far back short hashes and `grep` reach. The walk itself is cheap once
-  # the workspace's repository is materialized.
+  # Bound commit-message searches in `log`; commit resolution has no window.
   let searchWindow: Int! = 500
 
   # Per-commit message cap in `log`, so one essay-length commit body cannot
@@ -648,27 +643,15 @@ type Committer {
     `This workspace has no readable git history (${plainError(reason)}). ` + "Your pending edits are still visible with status / diff."
   }
 
-  # Resolve a user-supplied commit spelling to a full sha: "HEAD"/"" for the
-  # tip (already resolved by the caller's first read), an exact or abbreviated
-  # hash from the recent walk, or anything the repository can resolve by name
-  # (a tag, the current branch).
+  # Resolve full or abbreviated hashes and named refs through the engine.
+  # HEAD/empty uses the tip already resolved by the caller's first read.
   let resolveSpec(source: Workspace!, spec: String!, headSha: String!): String! {
     let want = spec.trimSpace
     if (want == "" or want == "HEAD") {
       return headSha
     }
-    if (want.containsMatch(`^[0-9a-fA-F]{4,40}$`)) {
-      let known = head(source).log(limit: searchWindow).{{sha}}.map { c => c.sha }
-      let hits = known.filter { sha => sha == want.toLower or sha.hasPrefix(want.toLower) }
-      if (hits.length > 1) {
-        raise `commit "${spec}" is ambiguous (${toString(hits.length)} matches); use a longer hash`
-      }
-      if (!hits.isEmpty) {
-        return hits.join("")
-      }
-    }
-    source.git.head.asRepository.ref(name: want).commitSHA rescue {
-      e: Error => raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` + `and not a name this repository knows (${plainError(e.message)})`
+    source.git.head.asRepository.commit(id: want).sha rescue {
+      e: Error => raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
     }
   }
 

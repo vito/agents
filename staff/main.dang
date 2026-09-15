@@ -354,8 +354,7 @@ type Staff {
     let theirs = workerWorkspace(name)
 
     if (commit != null) {
-      let sha = resolveWorkerCommit(theirs, commit, name)
-      let c = repository(theirs).commit(id: sha).{{
+      let c = repository(theirs).commit(id: commit).{{
         sha,
         authoredDate,
         authorName,
@@ -373,7 +372,7 @@ type Staff {
           + `Author: ${c.authorName} <${c.authorEmail}>` + "\n"
           + `Date:   ${c.authoredDate}` + mergeNote + "\n\n"
           + c.message.split("\n").map { line => "    " + line }.join("\n")
-      let scoped = scopePatch(commitChanges(theirs, sha).asPatch.contents, paths)
+      let scoped = scopePatch(commitChanges(theirs, c.sha).asPatch.contents, paths)
       if (scoped == "") {
         if (paths.isEmpty) {
           return meta + "\n\n(this commit has no file changes)"
@@ -434,15 +433,7 @@ type Staff {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
     let theirs = workerWorkspace(name)
-    # No history scan for an unfiltered pull: the engine walks only the
-    # differing histories. Explicit selections resolve against a bounded log.
-    let wanted = if (commits.isEmpty) {
-      [] :: [String!]!
-    } else {
-      let known = theirs.git.head.log(limit: commitSearchLimit).{{sha}}.map { c => c.sha }
-      commits.map { given => resolveCommit(known, given, name) }
-    }
-    let picks = source.commitsFrom(source: theirs, commits: wanted).{{
+    let picks = source.commitsFrom(source: theirs, commits: commits).{{
       commit.{{sha, message}},
       status,
       reason,
@@ -520,8 +511,8 @@ type Staff {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
     let theirs = workerWorkspace(name)
-    let sha = resolveWorkerCommit(theirs, commit, name)
-    let target = repository(theirs).commit(id: sha).{{message, parentShas}}
+    let target = repository(theirs).commit(id: commit).{{sha, message, parentShas}}
+    let sha = target.sha
     if (target.parentShas.length > 1) {
       raise `commit ${short(sha)} is a merge commit; inspect its first-parent diff with diffOf and integrate it manually`
     }
@@ -791,16 +782,8 @@ type Staff {
     harvestTarget(name).snapshot.sync.workspace
   }
 
-  # Match the engine's explicit-pick lookup bound; never walk unlimited history.
-  let commitSearchLimit: Int! = 10000
-
   let repository(source: Workspace!): GitRepository! {
-    source.git.head.tree(discardGitDir: false, depth: 0).asGit
-  }
-
-  let resolveWorkerCommit(source: Workspace!, given: String!, name: String!): String! {
-    let known = source.git.head.log(limit: commitSearchLimit).{{sha}}.map { c => c.sha }
-    resolveCommit(known, given, name)
+    source.git.head.asRepository
   }
 
   # Real Git commits carry trees, not a staged patch. Root commits diff
@@ -815,27 +798,6 @@ type Staff {
       repo.commit(id: parent).tree(discardGitDir: true)
     }
     target.tree(discardGitDir: true).changes(from: base)
-  }
-
-  # Resolve a caller-supplied sha against a worker's recent history: exact
-  # match, else a unique prefix. logOf prints 7-char shas, so short ones are
-  # what the model hands back — and a typo must be an error, never a silent
-  # no-op.
-  let resolveCommit(known: [String!]!, given: String!, name: String!): String! {
-    if (given == "") {
-      raise "commit SHA must not be empty; run logOf to choose a commit"
-    }
-    if (known.contains(given)) {
-      return given
-    }
-    let hits = known.filter { sha => sha.hasPrefix(given) }
-    if (hits.isEmpty) {
-      raise `worker "${name}" has no commit "${given}" in its latest ${toString(commitSearchLimit)} commits; run logOf to list candidates`
-    }
-    if (hits.length > 1) {
-      raise `commit "${given}" matches ${toString(hits.length)} of worker "${name}"'s recent commits; use a longer sha`
-    }
-    hits.join("")
   }
 
   # Slice a patch into its per-file sections and keep the ones under `paths`.
