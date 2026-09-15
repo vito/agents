@@ -34,12 +34,11 @@
 #   submitPr(branch: "you:fix-x").
 #
 # - `checkout` re-points the agent at a DIFFERENT repository: it fetches a
-#   git repo as a Workspace (GitRef.asWorkspace, authenticated with the
-#   module token so pushes work) and returns a continuation of the current
-#   conversation bound to that checkout. The agent keeps its own toolset —
-#   tools live on the conversation, and their `Workspace!` args simply
-#   auto-fill from the new binding — and the target workspace's agents, if
-#   it has any, are composed ON TOP (minus modules the originating
+#   git repo as a Workspace (GitRef.asWorkspace) and returns a continuation
+#   of the current conversation bound to that checkout. The agent keeps its
+#   own toolset — tools live on the conversation, and their `Workspace!` args
+#   simply auto-fill from the new binding — and the target workspace's agents,
+#   if it has any, are composed ON TOP (minus modules the originating
 #   workspace already provides). A checked-out workspace refuses export by
 #   construction, so the only way its changes leave is commit + push.
 #
@@ -51,7 +50,7 @@
 # exactly that while its own workspace stays put.
 #
 # Configuration lives in dagger.toml settings, not per-call arguments:
-# `githubToken` authenticates every GitHub operation, reaching the container
+# `githubToken` authenticates GitHub API operations, reaching the container
 # only as a secret env var (GH_TOKEN) — never baked into an image layer,
 # never echoed. `remote` names the GitHub repository bare PR numbers resolve
 # against; it's a property of the project rather than of any one task (a
@@ -101,16 +100,16 @@ type Contributor {
 
   new(
     """
-    A GitHub token used to authenticate API calls, push branches, and open
-    pull requests.
+    A GitHub token used to authenticate API calls, including opening pull
+    requests.
 
     Wire it up in dagger.toml settings rather than passing it around:
 
         [env.dev.modules.contributor.settings]
         githubToken = "env://GITHUB_TOKEN"
 
-    Without it, only public repositories can be checked out, and everything
-    that talks to the GitHub API is unavailable.
+    Without it, everything that talks to the GitHub API is unavailable.
+    Git operations use the host's own git credentials instead.
     """
     githubToken: Secret = null,
     """
@@ -640,9 +639,9 @@ type Contributor {
   checkout upstream → edit → commit → pushBranch → submitPr with branch
   "owner:branch".
 
-  Pending changes are NOT pushed: commit first. Authentication comes from
-  the configured GitHub token when present, or the host's own git
-  credentials (e.g. SSH agent + pushInsteadOf) otherwise.
+  Pending changes are NOT pushed: commit first. The push API handles
+  authentication using the host's own git credentials and respects
+  pushInsteadOf URL rewrites (e.g. HTTPS to SSH).
 
   A push the remote rejects (its branch moved past ours) is an error, never
   a takeover. To overwrite anyway, pass `expectedRemoteSHA`: the push then
@@ -685,7 +684,7 @@ type Contributor {
       e: Error => return `This workspace has no readable git history (${plainError(e.message)}); ` + "there is nothing to push. Pending edits are still visible with status / diff."
     }
     let result = source.git.head.push(
-      to: authenticated(url),
+      to: git(url),
       branch: branch,
       expectedRemoteSHA: expectedRemoteSHA,
     ).{{ref, previousSHA, sha, disposition}} rescue {
@@ -724,8 +723,8 @@ type Contributor {
   workspace is a disposable copy) instead of switching yourself.
 
   A checked-out workspace cannot export back to the host: the only way work
-  leaves it is commit + push (then submitPr). The configured GitHub token
-  authenticates the checkout, so pushes to repositories it can write to work.
+  leaves it is commit + push (then submitPr). Git authentication is handled
+  by the API using the host's own git credentials, not the GitHub token.
   """
   checkout(
     llm: LLM!,
@@ -749,9 +748,9 @@ type Contributor {
     # @cache(Never): resolves a live remote and rebinds the conversation; a
     # later identical call must fetch the repo as it is then.
     let ref = if (branch == "") {
-      authenticated(repo).head
+      git(repo).head
     } else {
-      authenticated(repo).branch(branch)
+      git(repo).branch(branch)
     }
     # Force the resolution HERE, inside the tool, so a typo'd URL or branch
     # fails as this call instead of poisoning the continuation.
@@ -857,17 +856,6 @@ type Contributor {
     } else {
       (m.captures[0] ?? "") + "/" + (m.captures[1] ?? "")
     }
-  }
-
-  # The repository at `url`, carrying the module token when one is configured
-  # so private fetches and later pushes authenticate; without one, public
-  # repositories still work read-only.
-  let authenticated(url: String!): Dagger.GitRepository! {
-    let tok = token
-    if (tok == null) {
-      return git(url)
-    }
-    git(url, httpAuthToken: tok)
   }
 
   # A checkout with the target's own agents left out: the fallback when
