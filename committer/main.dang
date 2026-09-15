@@ -35,7 +35,7 @@ type Committer {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: ["checkMessages"])
+      .withTools(currentNode, except: ["checkMessages", "checkFiltering"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -55,9 +55,8 @@ type Committer {
   status(
     source: Workspace!,
     """
-    Relative paths (files or directories) to limit the summary to, like
-    `git status -- <paths>`. A directory matches everything beneath it. Empty
-    summarizes all pending changes.
+    Glob patterns to include, relative to the workspace root (e.g. "src/**"
+    or "**/*.go"). Empty summarizes all pending changes.
     """
     paths: [String!]! = [],
   ): String! {
@@ -89,9 +88,8 @@ type Committer {
   diff(
     source: Workspace!,
     """
-    Relative paths (files or directories) to show the diff for, like
-    `git diff -- <paths>`. A directory matches everything beneath it. Empty
-    shows every pending change.
+    Glob patterns to include, relative to the workspace root (e.g. "src/**"
+    or "**/*.go"). Empty shows every pending change.
     """
     paths: [String!]! = [],
   ): String! {
@@ -99,7 +97,7 @@ type Committer {
     if (changes.isEmpty) {
       return "No pending changes."
     }
-    let scoped = scopePatch(changes.asPatch.contents, paths)
+    let scoped = changes.filter(include: paths).asPatch.contents
     if (scoped == "") {
       return "No pending changes under the given paths."
     }
@@ -134,16 +132,17 @@ type Committer {
     """
     message: String!,
     """
-    Literal paths (files or directories, no globs) to commit, relative to the
-    workspace root, like `git commit -- <paths>`. Empty commits every pending
-    change. A rename must include both its old and new path.
+    Glob patterns to commit, relative to the workspace root (e.g. "src/**"
+    or "**/*.go"). Empty commits every pending change. Patterns must match
+    both sides of a rename or neither; a nonempty selection matching nothing
+    is an error.
     """
     paths: [String!]! = [],
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): committing is a side effect on the workspace's state; a
     # later identical call must record a fresh commit, not replay the first.
     message = formatMessage(message)
-    let picked = pendingStats(source, paths)
+    let picked = pendingStats(source, paths).filter { s => !s.path.hasSuffix("/") }
     if (picked.isEmpty) {
       if (paths.isEmpty) {
         raise "nothing to commit: no pending changes"
@@ -151,9 +150,18 @@ type Committer {
       raise "nothing to commit under the given paths (status shows what is pending)"
     }
 
+    # withCommit takes literal paths. Expand from the same filtered stats
+    # used above, excluding directory rows so they cannot widen the selection
+    # to unmatched siblings. Preserve both names of selected renames.
+    let selectedPaths = if (paths.isEmpty) {
+      [] :: [String!]!
+    } else {
+      (picked.map { s => s.path }
+        + picked.map { s => s.oldPath ?? "" }.filter { p => p != "" }).uniq
+    }
     let committed = source.withCommit(
       message,
-      paths: paths,
+      paths: selectedPaths,
       date: currentTimestamp,
       signoff: true,
     )
@@ -286,8 +294,9 @@ type Committer {
     """
     limit: Int! = 20,
     """
-    Only show commits that touched these paths (files or directories),
-    relative to the repository root, like `git log -- <paths>`.
+    Only show commits touching these Git path patterns, relative to the
+    repository root (e.g. "src/**" or "**/*.go"), like `git log -- <paths>`.
+    Empty includes all paths.
     """
     paths: [String!]! = [],
     """
@@ -404,9 +413,9 @@ type Committer {
     """
     against: String = null,
     """
-    Relative paths (files or directories) to limit the patch to. The totals
-    line above the file stats still counts the whole commit; the rows under
-    it are scoped to these paths, like the patch itself.
+    Glob patterns to include, relative to the repository root (e.g. "src/**"
+    or "**/*.go"). Empty shows all changes. Totals still count the whole
+    commit; file rows and the patch are limited to the matching changes.
     """
     paths: [String!]! = [],
     """
@@ -446,10 +455,7 @@ type Committer {
         .tree(discardGitDir: true)
         .changes(from: repo.commit(id: baseSpec).tree(discardGitDir: true))
     }
-    let selected = changes.{{
-      asPatch.{{contents}},
-      diffStats.{{path, kind, addedLines, removedLines}}
-    }}
+    let patch = changes.filter(include: paths).asPatch.contents
     let mergeNote = if (against == null and target.parentShas.length > 1) {
       "\n" + `(merge commit: shown against its first parent ${short(baseSpec)})`
     } else {
@@ -460,8 +466,8 @@ type Committer {
     } else {
       `Difference from ${short(baseSpec)} to ${target.shortSha}` + "\n" + `  ${target.shortSha}  ${when(target.authoredDate)}  ${target.authorName}  ${subject(target.message)}`
     }
-    meta + "\n\n" + statBlock(selected.diffStats, paths, maxFiles) + "\n\n" + patchBlock(
-      selected.asPatch.contents,
+    meta + "\n\n" + statBlock(changes, paths, maxFiles) + "\n\n" + patchBlock(
+      patch,
       paths,
       maxLines,
     )
@@ -585,6 +591,60 @@ type Committer {
     "Commit-message checks passed."
   }
 
+  """
+  Check glob filtering and commits on a private frozen workspace.
+  """
+  checkFiltering(source: Workspace!): String! @check {
+    # Returning a String keeps fixture commits local to this check; the
+    # caller's workspace and host checkout are never rebound or exported.
+    let root = "glob-check-" + Random.string
+    let base = source.git.head.asWorkspace
+      .withNewFile(root + "/edit.go", "before\n")
+      .withNewFile(root + "/delete.go", "remove\n")
+      .withNewFile(root + "/old.go", "rename\n")
+      .withNewFile(root + "/keep.txt", "keep\n")
+      .withCommit("fixture", paths: [root], date: "2026-09-15T12:00:00Z")
+    let working = base
+      .withNewFile(root + "/edit.go", "after\n")
+      .withoutFile(root + "/delete.go")
+      .withoutFile(root + "/old.go")
+      .withNewFile(root + "/new.go", "rename\n")
+      .withNewFile(root + "/newdir/added.go", "added\n")
+      .withNewFile(root + "/space name.go", "space\n")
+      .withNewFile(root + "/quote\"name.go", "quote\n")
+      .withNewFile(root + "/keep.txt", "unselected\n")
+      .withNewFile(root + "/newdir/keep.txt", "unselected sibling\n")
+    let patterns = [root + "/**/*.go"]
+    let summary = status(working, paths: patterns)
+    assert { summary.contains("edit.go") and summary.contains("newdir/added.go") }
+    assert { !summary.contains("keep.txt") }
+    let patch = diff(working, paths: patterns)
+    assert { patch.contains("+after") and patch.contains("+added") }
+    assert { patch.contains("-remove") and !patch.contains("unselected") }
+    assert { diff(working, paths: [root + "/**/*.rs"]).contains("No pending changes") }
+    assert { diff(working, paths: [root + "/newdir/added.?o"]).contains("+added") }
+    assert { diff(working, paths: [root + "/newdir/[a]dded.go"]).contains("+added") }
+    let message = "test: select glob changes\n\nExercise the public commit selection."
+    let selected = commit(working, message, paths: patterns)
+    let remaining = selected.git.uncommitted.diffStats.{{path}}
+      .map { s => s.path }.filter { p => !p.hasSuffix("/") }
+    assert { remaining == [root + "/keep.txt", root + "/newdir/keep.txt"] }
+    assert { selected.directory("/").changes(from: working.directory("/")).isEmpty }
+    let shown = show(selected, paths: [root + "/**/added.*"])
+    assert { shown.contains("+added") and !shown.contains("+after") }
+    assert { show(selected, paths: [root + "/**/*.rs"]).contains("no changes under the given paths") }
+    let noMatch = commit(working, message, paths: [root + "/**/*.rs"]).git.head.commitSHA rescue {
+      e: Error => e.message
+    }
+    assert { noMatch.contains("nothing to commit") }
+    let splitRename = commit(working, message, paths: [root + "/old.*"]).git.head.commitSHA rescue {
+      e: Error => e.message
+    }
+    assert { splitRename.contains("split the rename") }
+    assert { commit(working, message).git.uncommitted.isEmpty }
+    "Glob filtering and commit checks passed."
+  }
+
   # ---------------------------------------------------------------- helpers
 
   # Bound commit-message searches in `log`; commit resolution has no window.
@@ -608,20 +668,8 @@ type Committer {
   let pendingStats(
     source: Workspace!,
     paths: [String!]!,
-  ): [{{kind: DiffStatKind!, addedLines: Int!, removedLines: Int!, path: String!, oldPath: String}}]! {
-    let stats = source.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path, oldPath}}
-    if (paths.isEmpty) {
-      return stats
-    }
-    stats.filter { s =>
-      # A rename is ONE stat, keyed on the NEW path with the old one
-      # alongside in oldPath (null for every other kind). `diff` keeps a
-      # section when EITHER name in its header is scoped, so match either
-      # name here too, or the tools disagree about renames. An absent
-      # oldPath spells "" and would match the whole tree, so drop it.
-      let names = [s.path] + [s.oldPath ?? ""].filter { n => n != "" }
-      names.any { n => paths.any { p => Path(p).contains(Path(n)) } }
-    }
+  ): [{{kind: DiffStatKind!, addedLines: Int!, removedLines: Int!, path: String!, oldPath: String}}!]! {
+    source.git.uncommitted.filter(include: paths).diffStats.{{kind, addedLines, removedLines, path, oldPath}}
   }
 
   # Engine errors carry a "[traceparent:<trace>-<span>]" marker so an agent can
@@ -656,21 +704,18 @@ type Committer {
   }
 
   let statBlock(
-    stats: [{{path: String!, kind: DiffStatKind!, addedLines: Int!, removedLines: Int!}}]!,
+    changes: Changeset!,
     paths: [String!]!,
     max: Int!,
   ): String! {
+    let stats = changes.diffStats.{{path, kind, addedLines, removedLines}}
     if (stats.isEmpty) {
       return "(no file changes)"
     }
     let added = stats.reduce(0) { acc, s => acc + (s.addedLines ?? 0) }
     let removed = stats.reduce(0) { acc, s => acc + (s.removedLines ?? 0) }
     let totals = `${toString(stats.length)} file(s) changed, +${toString(added)} -${toString(removed)}`
-    let scoped = if (paths.isEmpty) {
-      stats
-    } else {
-      stats.filter { s => paths.any { p => Path(p).contains(Path(s.path ?? "")) } }
-    }
+    let scoped = changes.filter(include: paths).diffStats.{{path, kind, addedLines, removedLines}}
     if (scoped.isEmpty) {
       return totals + "\n" + "  (none under the given paths)"
     }
@@ -689,42 +734,16 @@ type Committer {
     totals + scopeNote + "\n" + rows.join("\n") + note
   }
 
-  # Scope a patch to `paths` and clamp it to `max` lines.
+  # Clamp an already-scoped patch to `max` lines.
   let patchBlock(patch: String, paths: [String!]!, max: Int!): String! {
     let text = patch ?? ""
     if (text.trimSpace == "") {
+      if (!paths.isEmpty) {
+        return "(no changes under the given paths)"
+      }
       return "(this commit records no file changes)"
     }
-    let scoped = scopePatch(text, paths)
-    if (scoped == "") {
-      return "(no changes under the given paths)"
-    }
-    clampLines(scoped, max, "(patch truncated — scope it with paths, or read the file with fileAt)")
-  }
-
-  # Scope a patch to `paths` by slicing it into its per-file sections: each one
-  # starts with a "diff --git <old> <new>" header at the start of a line, and
-  # body lines are always prefixed (+/-/space/@/index...), so they can never be
-  # mistaken for a header.
-  let scopePatch(patch: String!, paths: [String!]!): String! {
-    if (paths.isEmpty) {
-      return patch
-    }
-    let sections = patch.trimPrefix(patchHeader).split("\n" + patchHeader)
-    let kept = sections.filter { section =>
-      let header = section.split("\n", 2).takeFirst.join("")
-      header.split(" ").any { candidate =>
-        # headers are always rendered as "a/<path> b/<path>"; tolerate a bare
-        # spelling too, so scoping survives a change in patch prefixing.
-        [candidate, candidate.trimPrefix("a/"), candidate.trimPrefix("b/")].uniq.any { p =>
-          paths.any { scope => Path(scope).contains(Path(p)) }
-        }
-      }
-    }
-    if (kept.isEmpty) {
-      return ""
-    }
-    kept.map { section => patchHeader + section }.join("\n")
+    clampLines(text, max, "(patch truncated — scope it with paths, or read the file with fileAt)")
   }
 
   let clampLines(text: String!, max: Int!, note: String!): String! {
@@ -844,8 +863,6 @@ type Committer {
     let clock = parts.dropFirst.join("").split("", 6).takeFirst(5).join("")
     if (clock == "") { day } else { day + " " + clock }
   }
-
-  let patchHeader: String! = "diff --git "
 
   # Nullable: `show`'s stats reach here through a projection of the nullable
   # `changes` field, whose record fields inherit its nullability.

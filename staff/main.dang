@@ -22,8 +22,7 @@
 # module call has engine identity, which withTools needs — a locally
 # constructed Dang object does not.
 #
-# NOT registered in dagger.toml: load explicitly, e.g.
-# `dagger -m ./modules/staff`.
+# Registered in dagger.toml; can also be loaded directly with `dagger -m ./staff`.
 """
 Hire and direct a staff of asynchronous worker agents: spawn them by name,
 steer and observe them while they run, and collect their results.
@@ -40,12 +39,13 @@ type Staff {
   # so they can never address a corpse.
   let tombstones: Map[Agent!]! = [:]
 
-  # Not really tools: chiefLine/pullTools are spawn's plumbing, and
-  # workerPrompt/workerPromptFor are public constants (tests build worker
-  # recordings against their exact text). Excluded from the chief's binding.
-  # Workers bind only the dedicated PullTools object, never this full Staff
-  # object.
-  let plumbing = ["chiefLine", "pullTools", "workerPrompt", "workerPromptFor"]
+  # Public for self-calls, not chief tools: roster bookkeeping and worker
+  # plumbing. Prompt constants and regression checks are excluded too.
+  # Workers bind only the dedicated PullTools object, never this full Staff.
+  let plumbing = [
+    "withWorker", "withDismissed", "chiefLine", "pullTools",
+    "workerPrompt", "workerPromptFor", "checkFiltering", "checkTools"
+  ]
 
   """
   Compose the staff-chief tools onto a base LLM.
@@ -339,8 +339,8 @@ type Staff {
     """
     name: String!,
     """
-    Relative paths (files or directories) to limit the diff to. Empty shows
-    everything.
+    Glob patterns to include, relative to the workspace root (e.g. "src/**"
+    or "**/*.go"). Empty shows everything.
     """
     paths: [String!]! = [],
     """
@@ -372,7 +372,7 @@ type Staff {
           + `Author: ${c.authorName} <${c.authorEmail}>` + "\n"
           + `Date:   ${c.authoredDate}` + mergeNote + "\n\n"
           + c.message.split("\n").map { line => "    " + line }.join("\n")
-      let scoped = scopePatch(commitChanges(theirs, c.sha).asPatch.contents, paths)
+      let scoped = commitChanges(theirs, c.sha).filter(include: paths).asPatch.contents
       if (scoped == "") {
         if (paths.isEmpty) {
           return meta + "\n\n(this commit has no file changes)"
@@ -382,12 +382,8 @@ type Staff {
       return meta + "\n\n" + scoped
     }
 
-    let stats = theirs.git.uncommitted.diffStats.{{kind, addedLines, removedLines, path}}
-    let scopedStats = if (paths.isEmpty) {
-      stats
-    } else {
-      stats.filter { s => paths.any { p => Path(p).contains(Path(s.path)) } }
-    }
+    let changes = theirs.git.uncommitted.filter(include: paths)
+    let scopedStats = changes.diffStats.{{kind, addedLines, removedLines, path}}
     if (scopedStats.isEmpty) {
       return `Worker "${name}" has no uncommitted changes`
         + (if (paths.isEmpty) { "." } else { " under the given paths." })
@@ -396,7 +392,7 @@ type Staff {
     let summary = scopedStats.map { s =>
       `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
     }.join("\n")
-    let scoped = scopePatch(theirs.git.uncommitted.asPatch.contents, paths)
+    let scoped = changes.asPatch.contents
     let patchBlock = if (scoped == "") { "" } else { "\n\n" + scoped }
     `Uncommitted work in worker "${name}":` + "\n\n" + summary + patchBlock
   }
@@ -594,14 +590,9 @@ type Staff {
     # with no 3-way — it rejects an already-applied hunk. Restrict the patch
     # to the files where the two trees genuinely differ. Partial overlap
     # INSIDE a file still fails; that is what markers: true is for.
-    # Both sides of a rename, because the two views disagree about it: a
-    # rename is ONE diffStat, keyed on the new path with oldPath alongside,
-    # while asPatch runs `git diff --no-renames` (rename headers do not
-    # survive --no-prefix) and so spells it out as a delete section naming
-    # only the old path plus an add section naming only the new one. Scoping
-    # on `path` alone drops the delete and half-applies the rename: the new
-    # file lands, the old one is never removed. oldPath is null for every
-    # other kind, and an empty scope would match the whole tree, so drop it.
+    # Keep both names of a rename: filtering one side intentionally yields
+    # only an addition or deletion. Drop absent old paths so an empty name
+    # does not select the whole tree.
     let driftStats = theirs.directory("/").changes(from: base).diffStats.{{path, oldPath}}
     let drift = driftStats.map { s => s.path }
       + driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
@@ -610,7 +601,7 @@ type Staff {
       return base.changes(from: base)
     }
 
-    let pending = scopePatch(theirs.git.uncommitted.asPatch.contents, drift)
+    let pending = scopeLiteralChanges(theirs.git.uncommitted, drift).asPatch.contents
     if (pending == "") {
       print(`Worker "${name}" has no uncommitted work to take. `
         + `What it committed is in logOf(name: "${name}").`)
@@ -721,6 +712,74 @@ type Staff {
     ChiefLine(boss)
   }
 
+  """
+  Check public glob filtering and literal internal drift paths without model calls.
+  """
+  checkFiltering(source: Workspace!): String! @check {
+    let root = "staff-glob-check-" + Random.string
+    let base = source.git.head.asWorkspace
+    let working = base
+      .withNewFile(root + "/one.go", "one\n")
+      .withNewFile(root + "/nested/two.go", "two\n")
+      .withNewFile(root + "/nested/keep.txt", "unselected\n")
+    let worker = llm.withWorkspace(working).spawn(name: "filter-fixture")
+    let fixture = Dagger.staff.withWorker("fixture", worker)
+    let patch = fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.go"])
+    assert { patch.contains("+one") and patch.contains("+two") }
+    assert { !patch.contains("keep.txt") }
+    assert { fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.rs"]).contains("no uncommitted changes") }
+    let committed = working.withCommit("fixture", paths: [root], date: "2026-09-15T12:00:00Z")
+    let committedWorker = llm.withWorkspace(committed).spawn(name: "committed-filter-fixture")
+    let committedFixture = Dagger.staff.withWorker("fixture", committedWorker)
+    let committedPatch = committedFixture.diffOf(
+      source: base, name: "fixture", paths: [root + "/**/*.go"], commit: committed.git.head.commitSHA,
+    )
+    assert { committedPatch.contains("+one") and committedPatch.contains("+two") }
+    assert { !committedPatch.contains("unselected") }
+    worker.stop
+    committedWorker.stop
+
+    let before = directory
+      .withNewFile("old name.txt", "rename\n")
+      .withNewFile("delete me.txt", "remove\n")
+    let after = before.withoutFile("old name.txt").withoutFile("delete me.txt")
+      .withNewFile("new name.txt", "rename\n")
+    let names = [
+      "space name.txt", "tab\tname.txt", "line\nname.txt", "quote\"name.txt",
+      "back\\slash.txt", "[literal].txt", "*.txt", "?.txt", "!literal.txt",
+      " leading.txt", "trailing.txt ", "a/inside.txt", "a/nested/leaf.txt", "outside.txt"
+    ]
+    names.each { name => after = after.withNewFile(name, "added\n") }
+    let changes = after.changes(from: before)
+    names.each { name =>
+      let selected = scopeLiteralChanges(changes, [name])
+      assert { selected.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [name] }
+      assert { selected.asPatch.contents.contains("+added") }
+    }
+    assert { scopeLiteralChanges(changes, ["./a/"]).diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == ["a/inside.txt", "a/nested/leaf.txt"] }
+    assert { scopeLiteralChanges(changes, ["missing"]).isEmpty }
+    assert { scopeLiteralChanges(changes, []).asPatch.contents == changes.asPatch.contents }
+    assert { scopeLiteralChanges(changes, ["."]).asPatch.contents == changes.asPatch.contents }
+    assert { scopeLiteralChanges(changes, [""]).asPatch.contents == changes.asPatch.contents }
+    assert { scopeLiteralChanges(changes, ["delete me.txt"]).removedPaths == ["delete me.txt"] }
+    assert { scopeLiteralChanges(changes, ["old name.txt"]).removedPaths == ["old name.txt"] }
+    assert { scopeLiteralChanges(changes, ["new name.txt"]).addedPaths == ["new name.txt"] }
+    let renamed = scopeLiteralChanges(changes, ["old name.txt", "new name.txt"])
+    assert { renamed.diffStats.{{kind}}.map { s => s.kind } == [DiffStatKind.RENAMED] }
+    "Staff filtering checks passed."
+  }
+
+  """
+  Check that internal bookkeeping remains absent from the chief's tools.
+  """
+  checkTools: String! @check {
+    let tools = agent(llm).tools
+    assert { tools.contains("spawn") and tools.contains("dismiss") }
+    assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
+    assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
+    "Staff tool visibility checks passed."
+  }
+
   # Address a member by name, with a helpful miss.
   let member(name: String!): Agent! {
     let member = members[name]
@@ -800,32 +859,23 @@ type Staff {
     target.tree(discardGitDir: true).changes(from: base)
   }
 
-  # Slice a patch into its per-file sections and keep the ones under `paths`.
-  # Each section starts with a "diff --git <old> <new>" header at the start of
-  # a line, and body lines are always prefixed (+/-/space/@/index...), so they
-  # can never be mistaken for a header.
-  let scopePatch(patch: String!, paths: [String!]!): String! {
-    if (patch == "") {
-      return ""
+  # Only pullPending's computed drift paths need literal matching. Public
+  # diff filters accept native globs and bypass this escaping entirely.
+  let scopeLiteralChanges(changes: Changeset!, paths: [String!]!): Changeset! {
+    if (paths.isEmpty or paths.any { p => Path(p) == Path(".") }) {
+      return changes
     }
-    if (paths.isEmpty) {
-      return patch
+    let include = paths.map { p =>
+      Path(p).string
+        .replace("\\", "\\\\")
+        .replace("*", "\\*")
+        .replace("?", "\\?")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("!", "[!]")
+        .rewriteMatches(`\s`) { m => "[" + m.string + "]" }
     }
-    let sections = patch.trimPrefix(patchHeader).split("\n" + patchHeader)
-    let kept = sections.filter { section =>
-      let header = section.split("\n", 2).takeFirst.join("")
-      header.split(" ").any { candidate =>
-        # headers are always rendered as "a/<path> b/<path>"; tolerate a bare
-        # spelling too, so scoping survives a change in patch prefixing.
-        [candidate, candidate.trimPrefix("a/"), candidate.trimPrefix("b/")].uniq.any { p =>
-          paths.any { scope => Path(scope).contains(Path(p)) }
-        }
-      }
-    }
-    if (kept.isEmpty) {
-      return ""
-    }
-    kept.map { section => patchHeader + section }.join("\n")
+    changes.filter(include: include)
   }
 
   # The enum params are declared NULLABLE so the module keeps compiling
@@ -895,8 +945,6 @@ type Staff {
       else => "?"
     }
   }
-
-  let patchHeader: String! = "diff --git "
 
   # Instructions for the CHIEF agent holding these tools.
   let chiefPrompt: String! = """
@@ -1083,7 +1131,8 @@ type PullTools {
     """
     name: String!,
     """
-    Relative paths to limit the diff to. Empty shows everything.
+    Glob patterns to include (e.g. "src/**" or "**/*.go"), relative to the
+    source workspace root. Empty shows everything.
     """
     paths: [String!]! = [],
     """
