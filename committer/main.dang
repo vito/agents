@@ -23,12 +23,14 @@
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
 #     workspace to the returned state. `date` is required (for reproducible
 #     commits); currentTimestamp supplies it.
+#   * Workspace.withReset(commit:, hard: false) moves HEAD while preserving
+#     the working tree, so commits can be redone without losing pending edits.
 #   * GitRef.push publishes HEAD to the checkout's remote, engine-side (no
 #     host checkout involved), with an optional lease in the style of
 #     `--force-with-lease`. An effect on the remote, so never cached.
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, commit, and push.
+history, commit, reset, and push.
 """
 type Committer {
   """
@@ -36,7 +38,7 @@ type Committer {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: ["checkMessages"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -115,17 +117,23 @@ type Committer {
   `git commit -a`). With `paths`, only the changes on those paths are
   committed and the rest stay pending.
 
-  Review with `status` / `diff` before committing, and read `log` first to
-  match this repository's commit message conventions. Authorship defaults to
-  the identity the workspace was loaded with.
+  Review with `status` / `diff` before committing, and read `log` first for
+  scope names and wording. Subjects must use `scope: summary` and fit in 50
+  characters, including the scope. A blank line and brief description are
+  required; explain why when the reason is interesting and non-obvious.
+  Authorship defaults to the identity the workspace was loaded with.
 
+  Description prose is word-wrapped at 80 characters. Existing line breaks,
+  indented/fenced code, and trailers are preserved; long tokens are not split.
   Commits are automatically signed-off.
   """
   commit(
     source: Workspace!,
     """
-    The commit message: a one-line subject, optionally followed by a blank
-    line and a body explaining why.
+    A `scope: summary` subject of at most 50 characters, then a blank line
+    and a brief description. Include the why for interesting, non-obvious
+    changes; don't pad obvious changes with boilerplate. Prose is wrapped
+    at 80 characters without rewriting indented/fenced code or trailers.
     """
     message: String!,
     """
@@ -137,9 +145,7 @@ type Committer {
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): committing is a side effect on the workspace's state; a
     # later identical call must record a fresh commit, not replay the first.
-    if (message.trimSpace == "") {
-      raise "commit: the message must not be empty"
-    }
+    message = formatMessage(message)
     let picked = pendingStats(source, paths)
     if (picked.isEmpty) {
       if (paths.isEmpty) {
@@ -169,6 +175,40 @@ type Committer {
     }
     print(`Committed ${short(sha)}: ${subject(message)} ` + `(${toString(picked.length)} file(s))` + leftNote)
     committed
+  }
+
+  """
+  Move HEAD to a chosen commit without changing the working tree.
+
+  Use this to redo or combine local commits: read `log`, choose the commit to
+  return to, reset, then review `status` / `diff` and commit again. Changes
+  from the undone commits and any pending edits remain in the workspace.
+  There is deliberately no hard-reset mode here.
+
+  Rewrites local history; only use when asked to undo or rewrite commits.
+  Does not push or change the remote. Record the old HEAD before resetting
+  so it can be used as a recovery target.
+  """
+  reset(
+    source: Workspace!,
+    """
+    The commit to move HEAD to. Use a commit hash from `log`; it is required
+    so resetting never silently chooses how much history to undo.
+    """
+    commit: String!,
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    if (commit.trimSpace == "") {
+      raise "reset: specify the commit to move HEAD to (log shows the history)"
+    }
+    let previous = head(source).commitSHA
+    let reset = source.withReset(commit: commit.trimSpace, hard: false)
+    # Force evaluation before returning the workspace, like commit: failures
+    # should surface here, not while the agent is rebinding its workspace.
+    let sha = reset.git.head.commitSHA rescue {
+      e: Error => raise `reset failed: ${plainError(e.message)}`
+    }
+    print(`Reset HEAD from ${previous} to ${sha}. Working tree preserved; review status / diff before committing again.`)
+    reset
   }
 
   """
@@ -485,6 +525,62 @@ type Committer {
     `${path} at ${target.shortSha} (${when(target.authoredDate)}) — ${subject(target.message)}` + "\n\n" + numbered.join("\n") + footer
   }
 
+  """
+  Check commit-message validation and conservative description wrapping.
+  """
+  checkMessages: String! @check {
+    let valid = "committer: enforce commit style\n\nKeep history readable."
+    assert { formatMessage(valid) == valid }
+    assert { formatMessage(valid.replace("\n", "\r\n")) == valid }
+    let fifty = "scope: " + "".padRight(43).replace(" ", "é")
+    assert { formatMessage(fifty + "\n\nDescription.") == fifty + "\n\nDescription." }
+    [
+      "",
+      "unscoped subject\n\nDescription.",
+      ": missing scope\n\nDescription.",
+      "scope: \n\nDescription.",
+      "scope:  extra space\n\nDescription.",
+      " scope: leading space\n\nDescription.",
+      "scope: trailing space \n\nDescription.",
+      fifty + "x\n\nDescription.",
+      "scope: missing body",
+      "scope: missing separator\nDescription.",
+      "scope: empty body\n\n \t\n",
+    ].each { invalid =>
+      let result = formatMessage(invalid) rescue { e: Error => e.message }
+      assert { result.hasPrefix("commit:") }
+    }
+
+    let eighty = ["123456789", "123456789", "123456789", "123456789", "123456789", "123456789", "123456789", "123456789"].join(" ") + "x"
+    assert { eighty.split("").length == 80 }
+    assert { wrapDescription(eighty) == eighty }
+    assert { wrapDescription(eighty + " next") == eighty + "\nnext" }
+    assert { wrapDescription("short  line\nanother\n\nparagraph") == "short  line\nanother\n\nparagraph" }
+    let long = eighty + " next words"
+    [" ", "    ", "\t", "Signed-off-by: ", "Co-authored-by: "].each { prefix =>
+      assert { wrapDescription(prefix + long) == prefix + long }
+    }
+    ["- ", "* ", "+ ", "1. ", "12) "].each { prefix =>
+      let wrapped = wrapDescription(prefix + long)
+      assert { wrapped.hasPrefix(prefix) }
+      assert { wrapped.split("\n").all { line => line.split("").length <= 80 } }
+      assert { wrapped.split("\n").dropFirst.all { line => line.hasPrefix("".padRight(prefix.split("").length)) } }
+      assert { wrapDescription(wrapped) == wrapped }
+    }
+    ["```", "~~~~"].each { fence =>
+      let code = fence + "lang\n" + long + "\n\n  " + long + "\n" + fence
+      assert { wrapDescription(code + "\n" + long) == code + "\n" + eighty + "\nnext words" }
+    }
+    let nested = "````\n```\n" + long + "\n````"
+    assert { wrapDescription(nested) == nested }
+    assert { wrapDescription("~~~\n" + long) == "~~~\n" + long }
+    let url = "https://example.com/" + "".padRight(90).replace(" ", "x")
+    assert { wrapDescription("See " + url + " for details.") == "See\n" + url + "\nfor details." }
+    let wrapped = formatMessage("scope: wrap prose\n\n" + long + "\n\n    " + long)
+    assert { formatMessage(wrapped) == wrapped }
+    "Commit-message checks passed."
+  }
+
   # ---------------------------------------------------------------- helpers
 
   # How far back short hashes and `grep` reach. The walk itself is cheap once
@@ -678,6 +774,76 @@ type Committer {
     text.split("\n").map { line => "    " + line }.join("\n")
   }
 
+  # Validate before touching the workspace. Count Unicode characters, not
+  # bytes; never silently truncate a subject or invent a rationale.
+  let formatMessage(message: String!): String! {
+    let lines = message.replace("\r\n", "\n").split("\n")
+    let title = lines.takeFirst.join("")
+    if (!title.containsMatch(`^[A-Za-z0-9][A-Za-z0-9_./-]*: \S.*$`) or title != title.trimSpace) {
+      raise "commit: use a scoped subject such as 'committer: enforce commit style'"
+    }
+    if (title.split("").length > 50) {
+      raise `commit: subject is ${toString(title.split("").length)} characters; maximum is 50 including scope`
+    }
+    if (lines.length < 3 or lines[1] != "") {
+      raise "commit: follow the subject with a blank line and a brief description"
+    }
+    let body = lines.dropFirst(2).join("\n")
+    if (body.trimSpace == "") {
+      raise "commit: add a brief description; explain why when interesting and non-obvious"
+    }
+    title + "\n\n" + wrapDescription(body)
+  }
+
+  # Conservative rather than a Markdown reflow: keep existing line breaks
+  # and all indented lines verbatim (including tabs). Fences may contain
+  # unindented code. Trailer-like lines must not be split: Git parses them.
+  let wrapDescription(body: String!): String! {
+    let fence = ""
+    body.split("\n").map { line =>
+      let trimmed = line.trimLeft(" \t")
+      if (fence != "") {
+        let closing = trimmed.trimRight(" \t")
+        if (closing.hasPrefix(fence) and closing.trim(fence.split("").takeFirst.join("")) == "") {
+          fence = ""
+        }
+        continue line
+      }
+      let opening = trimmed.match("^(`{3,}|~{3,})")
+      if (opening != null) {
+        fence = opening.string
+        continue line
+      }
+      if (line == "" or line.hasPrefix(" ") or line.hasPrefix("\t") or line.containsMatch(`^[A-Za-z0-9-]+: `)) {
+        continue line
+      }
+      let marker = line.match(`^(?:[-+*]|[0-9]+[.)]) +`)
+      let prefix = if (marker == null) { "" } else { marker.string }
+      wrapLine(line.trimPrefix(prefix), prefix)
+    }.join("\n")
+  }
+
+  let wrapLine(text: String!, prefix: String!): String! {
+    if ((prefix + text).split("").length <= 80) {
+      return prefix + text
+    }
+    let result: [String!]! = []
+    let line = prefix
+    let hasWord = false
+    let continuation = "".padRight(prefix.split("").length)
+    text.splitMatches(`\s+`).filter { word => word != "" }.each { word =>
+      let candidate = line + (if (hasWord) { " " } else { "" }) + word
+      if (hasWord and candidate.split("").length > 80) {
+        result += [line]
+        line = continuation + word
+      } else {
+        line = candidate
+      }
+      hasWord = true
+    }
+    (result + [line]).join("\n")
+  }
+
   let subject(message: String!): String! {
     message.split("\n", 2).takeFirst.join("")
   }
@@ -722,6 +888,12 @@ type Committer {
     - `commit` — record pending changes as a commit and advance HEAD. Without
       `paths` it commits EVERYTHING `status` lists; with `paths`, only those
       changes, leaving the rest pending.
+    - `reset` — move HEAD to a chosen commit, keeping the working tree and
+      pending edits intact. Only use when asked to undo or rewrite commits.
+      Read `log` and record the old HEAD first; then reset, review `status` /
+      `diff`, and commit again. No hard reset, and no remote changes. Rewriting
+      published history needs explicit authorization, not an automatic force
+      push after a rejection.
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
@@ -740,12 +912,22 @@ type Committer {
     so a file git would call untracked is just `A`, and `commit` without
     `paths` includes those, unlike `git commit -a`.
 
-    Committing well: review with `status` / `diff` first; read `log` before
-    writing a message to match the repository's conventions; keep commits
-    focused, scoping with `paths` when only part of your pending work belongs
-    together. Only commit when asked to, or when the task clearly calls for
-    it — and only push when asked: a push leaves the workspace and publishes
-    to the remote. The reading tools re-read the current state on every call,
-    so re-run them after making edits.
+    Committing well: review with `status` / `diff` first; read `log` for scope
+    names and wording. Keep each commit focused on one logical change, scoping
+    with `paths` when only part of your pending work belongs together.
+
+    Commit style is enforced: use `scope: summary` (e.g. `committer: wrap
+    descriptions`), at most 50 characters TOTAL including the scope. Choose
+    a meaningful component/area scope. Follow it with a blank line and a brief
+    description of the change. Explain why when the motivation or tradeoff is
+    interesting and non-obvious; don't restate the subject, invent reasons,
+    or add boilerplate just to say "why". The tool wraps prose at 80 characters,
+    keeping existing line breaks, indented/fenced code and trailers intact;
+    long tokens remain unbroken and lists get hanging indentation.
+
+    Only commit when asked to, or when the task clearly calls for it — and
+    only push when asked: a push leaves the workspace and publishes to the
+    remote. The reading tools re-read the current state on every call, so
+    re-run them after making edits.
   """
 }
