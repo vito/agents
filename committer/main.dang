@@ -32,13 +32,6 @@ history, commit, and push.
 """
 type Committer {
   """
-  Identity to record as a "Signed-off-by:" trailer on every commit made with
-  `commit`, e.g. "Ada Lovelace <ada@example.com>". Empty (the default)
-  records no trailer.
-  """
-  signoff: String! = ""
-
-  """
   Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
@@ -48,7 +41,6 @@ type Committer {
   }
 
   # ------------------------------------------------------- pending changes
-
   """
   Summarize the workspace's pending changes: one line per changed file — its
   change kind (A/M/D/R) and added/removed line counts — followed by a totals
@@ -125,9 +117,9 @@ type Committer {
 
   Review with `status` / `diff` before committing, and read `log` first to
   match this repository's commit message conventions. Authorship defaults to
-  the identity the workspace was loaded with. When the module is configured
-  with a `signoff` identity, a "Signed-off-by:" trailer is appended to the
-  message automatically — never write one yourself.
+  the identity the workspace was loaded with.
+
+  Commits are automatically signed-off.
   """
   commit(
     source: Workspace!,
@@ -156,12 +148,17 @@ type Committer {
       raise "nothing to commit under the given paths (status shows what is pending)"
     }
 
-    let committed = source.withCommit(signedOff(message), paths: paths, date: currentTimestamp)
+    let committed = source.withCommit(
+      message,
+      paths: paths,
+      date: currentTimestamp,
+      signoff: true,
+    )
     # Force the commit HERE, inside the tool: without this the failure would
     # surface later, when the engine rebinds the workspace, stripped of the
     # context of what was being committed.
-    let sha = committed.git.head.commitSHA rescue { e: Error =>
-      raise `commit failed: ${plainError(e.message)}`
+    let sha = committed.git.head.commitSHA rescue {
+      e: Error => raise `commit failed: ${plainError(e.message)}`
     }
 
     let left = committed.git.uncommitted.diffStats.{{path}}.length
@@ -170,8 +167,7 @@ type Committer {
     } else {
       ""
     }
-    print(`Committed ${short(sha)}: ${subject(message)} ` +
-      `(${toString(picked.length)} file(s))` + leftNote)
+    print(`Committed ${short(sha)}: ${subject(message)} ` + `(${toString(picked.length)} file(s))` + leftNote)
     committed
   }
 
@@ -208,24 +204,23 @@ type Committer {
     # The HEAD probe is the same first-read guard as the history tools': a
     # workspace with no readable history gets the plain answer, not a push
     # error.
-    head(source).commitSHA rescue { e: Error =>
-      return noHistory(e.message)
+    head(source).commitSHA rescue {
+      e: Error => return noHistory(e.message)
     }
     let result = head(source).push(
       branch: branch,
       expectedRemoteSHA: expectedRemoteSHA,
-    ).{{ref, previousSHA, sha, disposition}} rescue { e: Error =>
-      raise `push failed: ${plainError(e.message)}`
+    ).{{ref, previousSHA, sha, disposition}} rescue {
+      e: Error => raise `push failed: ${plainError(e.message)}`
     }
     let summary = case (result.disposition) {
-      GitPushDisposition.UP_TO_DATE =>
-        `${result.ref} is already up to date at ${short(result.sha)}; nothing to push.`
-      GitPushDisposition.CREATED =>
-        `Pushed ${result.ref} (new branch) at ${short(result.sha)}.`
-      GitPushDisposition.FORCED =>
-        `Pushed ${result.ref}: forced ${short(result.previousSHA)} -> ${short(result.sha)}.`
-      else =>
-        `Pushed ${result.ref}: ${short(result.previousSHA)} -> ${short(result.sha)}.`
+      GitPushDisposition.UP_TO_DATE => `${result.ref} is already up to date at ${short(result.sha)}; nothing to push.`
+
+      GitPushDisposition.CREATED => `Pushed ${result.ref} (new branch) at ${short(result.sha)}.`
+
+      GitPushDisposition.FORCED => `Pushed ${result.ref}: forced ${short(result.previousSHA)} -> ${short(result.sha)}.`
+
+      else => `Pushed ${result.ref}: ${short(result.previousSHA)} -> ${short(result.sha)}.`
     }
     let left = source.git.uncommitted.diffStats.{{path}}.length
     let leftNote = if (left > 0) {
@@ -237,7 +232,6 @@ type Committer {
   }
 
   # --------------------------------------------------------------- history
-
   """
   Show the repository's commit history, newest first.
 
@@ -281,12 +275,13 @@ type Committer {
     let walk = head(source).log(
       limit: scanned,
       paths: if (paths.isEmpty) { null } else { paths },
-    ).{{shortSha, authorName, authoredDate, message}} rescue { e: Error =>
-      # The first read of the workspace's git state: a synthetic workspace, a
-      # checkout that is not a git repository at all, or a fresh `git init`
-      # with nothing committed yet all give out here.
-      return noHistory(e.message)
+    ).{{shortSha, authorName, authoredDate, message}} rescue {
+      e: Error => return noHistory(e.message)
     }
+    # The first read of the workspace's git state: a synthetic workspace, a
+    # checkout that is not a git repository at all, or a fresh `git init`
+    # with nothing committed yet all give out here.
+
     let matched = if (grep == null) {
       walk
     } else {
@@ -304,9 +299,11 @@ type Committer {
     let entries = shown.map { c =>
       let header = `${c.shortSha}  ${when(c.authoredDate)}  ${c.authorName}`
       if (full) {
-        header + "\n" +
-          indent(clampLines(c.message.trimSpace, messageLines,
-            `(message truncated — show(commit: "${c.shortSha}") for all of it)`))
+        header + "\n" + indent(clampLines(
+          c.message.trimSpace,
+          messageLines,
+          `(message truncated — show(commit: "${c.shortSha}") for all of it)`,
+        ))
       } else {
         header + "\n" + indent(subject(c.message))
       }
@@ -326,8 +323,7 @@ type Committer {
       } else {
         `the last ${toString(searchWindow)} commits touching the given paths`
       }
-      `(${toString(matched.length)} match(es) in ${window}` +
-        (if (more > 0) { `; ${toString(more)} not shown, raise limit)` } else { ")" })
+      `(${toString(matched.length)} match(es) in ${window}` + (if (more > 0) { `; ${toString(more)} not shown, raise limit)` } else { ")" })
     }
     # Only meaningful without a grep: a grep listing walks the whole search
     # window and reports its own leftovers above.
@@ -385,14 +381,20 @@ type Committer {
   ): String! {
     # The first read of the workspace's git state: a checkout with no readable
     # history gives out here, with a plain answer instead of an engine error.
-    let headSha = head(source).commitSHA rescue { e: Error =>
-      return noHistory(e.message)
+    let headSha = head(source).commitSHA rescue {
+      e: Error => return noHistory(e.message)
     }
     let want = resolveSpec(source, commit, headSha)
 
     let repo = repository(source)
     let target = repo.commit(id: want).{{
-      sha, shortSha, authorName, authorEmail, authoredDate, message, parentShas,
+      sha,
+      shortSha,
+      authorName,
+      authorEmail,
+      authoredDate,
+      message,
+      parentShas
     }}
     let baseSpec = if (against == null) {
       target.parentShas.takeFirst.join("")
@@ -403,11 +405,14 @@ type Committer {
       # A root commit has no parent: everything in it is an addition.
       repo.commit(id: want).tree(discardGitDir: true).changes(from: directory)
     } else {
-      repo.commit(id: want).tree(discardGitDir: true)
+      repo
+        .commit(id: want)
+        .tree(discardGitDir: true)
         .changes(from: repo.commit(id: baseSpec).tree(discardGitDir: true))
     }
     let selected = changes.{{
-      asPatch.{{contents}}, diffStats.{{path, kind, addedLines, removedLines}},
+      asPatch.{{contents}},
+      diffStats.{{path, kind, addedLines, removedLines}}
     }}
     let mergeNote = if (against == null and target.parentShas.length > 1) {
       "\n" + `(merge commit: shown against its first parent ${short(baseSpec)})`
@@ -415,16 +420,15 @@ type Committer {
       ""
     }
     let meta = if (against == null) {
-      `commit ${target.sha}` + "\n" +
-        `Author: ${target.authorName} <${target.authorEmail}>` + "\n" +
-        `Date:   ${when(target.authoredDate)}` + mergeNote + "\n\n" +
-        indent(target.message.trimSpace)
+      `commit ${target.sha}` + "\n" + `Author: ${target.authorName} <${target.authorEmail}>` + "\n" + `Date:   ${when(target.authoredDate)}` + mergeNote + "\n\n" + indent(target.message.trimSpace)
     } else {
-      `Difference from ${short(baseSpec)} to ${target.shortSha}` + "\n" +
-        `  ${target.shortSha}  ${when(target.authoredDate)}  ${target.authorName}  ${subject(target.message)}`
+      `Difference from ${short(baseSpec)} to ${target.shortSha}` + "\n" + `  ${target.shortSha}  ${when(target.authoredDate)}  ${target.authorName}  ${subject(target.message)}`
     }
-    meta + "\n\n" + statBlock(selected.diffStats, paths, maxFiles) + "\n\n" +
-      patchBlock(selected.asPatch.contents, paths, maxLines)
+    meta + "\n\n" + statBlock(selected.diffStats, paths, maxFiles) + "\n\n" + patchBlock(
+      selected.asPatch.contents,
+      paths,
+      maxLines,
+    )
   }
 
   """
@@ -458,15 +462,14 @@ type Committer {
   ): String! {
     # The first read of the workspace's git state: a checkout with no readable
     # history gives out here, with a plain answer instead of an engine error.
-    let headSha = head(source).commitSHA rescue { e: Error =>
-      return noHistory(e.message)
+    let headSha = head(source).commitSHA rescue {
+      e: Error => return noHistory(e.message)
     }
     let want = resolveSpec(source, commit, headSha)
     let repo = repository(source)
     let target = repo.commit(id: want).{{shortSha, message, authoredDate}}
-    let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue { e: Error =>
-      raise `${path} does not exist at ${target.shortSha}: ${plainError(e.message)}` +
-        ` — it may have been added later, deleted, or renamed; log(paths: ["${path}"]) shows the commits that touched it`
+    let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue {
+      e: Error => raise `${path} does not exist at ${target.shortSha}: ${plainError(e.message)}` + ` — it may have been added later, deleted, or renamed; log(paths: ["${path}"]) shows the commits that touched it`
     }
     let lines = contents.split("\n")
     let page = lines.dropFirst(offset).takeFirst(limit)
@@ -475,13 +478,11 @@ type Committer {
     }
     let shown = offset + page.length
     let footer = if (shown < lines.length) {
-      "\n\n" + `(showing lines ${toString(offset + 1)}-${toString(shown)} of ${toString(lines.length)}; ` +
-        `pass offset: ${toString(shown)} for more)`
+      "\n\n" + `(showing lines ${toString(offset + 1)}-${toString(shown)} of ${toString(lines.length)}; ` + `pass offset: ${toString(shown)} for more)`
     } else {
       ""
     }
-    `${path} at ${target.shortSha} (${when(target.authoredDate)}) — ${subject(target.message)}` +
-      "\n\n" + numbered.join("\n") + footer
+    `${path} at ${target.shortSha} (${when(target.authoredDate)}) — ${subject(target.message)}` + "\n\n" + numbered.join("\n") + footer
   }
 
   # ---------------------------------------------------------------- helpers
@@ -501,34 +502,6 @@ type Committer {
 
   let head(source: Workspace!): Dagger.GitRef! {
     source.git.head
-  }
-
-  # Append the configured Signed-off-by trailer to a commit message, the way
-  # `git commit -s` does: straight onto an existing trailer block when the
-  # message already ends in one, after a blank line otherwise. A message
-  # already carrying this exact trailer is left alone.
-  let signedOff(message: String!): String! {
-    let who = signoff.trimSpace
-    if (who == "") {
-      return message
-    }
-    let trailer = `Signed-off-by: ${who}`
-    let body = message.trimSpace
-    let lines = body.split("\n")
-    if (lines.any { line => line.trimSpace == trailer }) {
-      return message
-    }
-    # A last line shaped like a trailer ("Key: value") means the message ends
-    # in a trailer block ("Co-authored-by: ...", "Fixes: #123") and the
-    # signoff belongs inside it. A single-line message is only a subject —
-    # "fix: frobnicate" is not a trailer — so it always gets the blank line.
-    let lastLine = lines.takeLast.join("")
-    let separator = if (lines.length > 1 and lastLine.containsMatch(`^[A-Za-z][A-Za-z0-9-]*: \S`)) {
-      "\n"
-    } else {
-      "\n\n"
-    }
-    body + separator + trailer
   }
 
   # The pending changes' per-file stats, scoped to `paths`. Shared by status
@@ -568,8 +541,7 @@ type Committer {
   # answer sits on that first read — `log`'s history walk, and the HEAD probe
   # in `show` and `fileAt` — before anything else touches the repository.
   let noHistory(reason: String!): String! {
-    `This workspace has no readable git history (${plainError(reason)}). ` +
-      "Your pending edits are still visible with status / diff."
+    `This workspace has no readable git history (${plainError(reason)}). ` + "Your pending edits are still visible with status / diff."
   }
 
   # The workspace's checkout as a real GitRepository: the tree at HEAD *with*
@@ -600,9 +572,8 @@ type Committer {
         return hits.join("")
       }
     }
-    repository(source).ref(name: want).commitSHA rescue { e: Error =>
-      raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` +
-        `and not a name this repository knows (${plainError(e.message)})`
+    repository(source).ref(name: want).commitSHA rescue {
+      e: Error => raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` + `and not a name this repository knows (${plainError(e.message)})`
     }
   }
 
@@ -683,19 +654,19 @@ type Committer {
     if (lines.length <= max) {
       return text
     }
-    lines.takeFirst(max).join("\n") + "\n\n" +
-      `... ${toString(lines.length - max)} of ${toString(lines.length)} lines not shown. ` + note
+    lines.takeFirst(max).join("\n") + "\n\n" + `... ${toString(lines.length - max)} of ${toString(lines.length)} lines not shown. ` + note
   }
 
   let banner(source: Workspace!): String! {
-    let branch = head(source).name.trimPrefix("refs/heads/") rescue { e: Error => "?" }
+    let branch = head(source).name.trimPrefix("refs/heads/") rescue {
+      e: Error => "?"
+    }
     `On ${branch}, HEAD ${short(head(source).commitSHA)}.`
   }
 
   let emptyLog(paths: [String!]!, grep: String): String! {
     if (grep != null) {
-      return `No commit message in the last ${toString(searchWindow)} commits matches "${grep ?? ""}"` +
-        (if (paths.isEmpty) { "." } else { " under the given paths." })
+      return `No commit message in the last ${toString(searchWindow)} commits matches "${grep ?? ""}"` + (if (paths.isEmpty) { "." } else { " under the given paths." })
     }
     if (paths.isEmpty) {
       return "No commit history in this workspace."
