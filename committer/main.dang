@@ -426,7 +426,7 @@ type Committer {
     }
     let want = resolveSpec(source, commit, headSha)
 
-    let repo = repository(source)
+    let repo = source.git.head.asRepository
     let target = repo.commit(id: want).{{
       sha,
       shortSha,
@@ -506,7 +506,7 @@ type Committer {
       e: Error => return noHistory(e.message)
     }
     let want = resolveSpec(source, commit, headSha)
-    let repo = repository(source)
+    let repo = source.git.head.asRepository
     let target = repo.commit(id: want).{{shortSha, message, authoredDate}}
     let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue {
       e: Error => raise `${path} does not exist at ${target.shortSha}: ${plainError(e.message)}` + ` — it may have been added later, deleted, or renamed; log(paths: ["${path}"]) shows the commits that touched it`
@@ -547,7 +547,9 @@ type Committer {
       "scope: missing separator\nDescription.",
       "scope: empty body\n\n \t\n",
     ].each { invalid =>
-      let result = formatMessage(invalid) rescue { e: Error => e.message }
+      let result = formatMessage(invalid) rescue {
+        e: Error => e.message
+      }
       assert { result.hasPrefix("commit:") }
     }
 
@@ -564,7 +566,13 @@ type Committer {
       let wrapped = wrapDescription(prefix + long)
       assert { wrapped.hasPrefix(prefix) }
       assert { wrapped.split("\n").all { line => line.split("").length <= 80 } }
-      assert { wrapped.split("\n").dropFirst.all { line => line.hasPrefix("".padRight(prefix.split("").length)) } }
+      assert {
+        wrapped.split("\n").dropFirst.all { line =>
+          line.hasPrefix(
+            "".padRight(prefix.split("").length),
+          )
+        }
+      }
       assert { wrapDescription(wrapped) == wrapped }
     }
     ["```", "~~~~"].each { fence =>
@@ -640,15 +648,6 @@ type Committer {
     `This workspace has no readable git history (${plainError(reason)}). ` + "Your pending edits are still visible with status / diff."
   }
 
-  # The workspace's checkout as a real GitRepository: the tree at HEAD *with*
-  # its .git (depth 0 = full history, so tags and old commits resolve), read
-  # back as a repository. Every caller must use these exact arguments — the
-  # engine caches the materialization per argument set, and a second spelling
-  # would pay for it twice.
-  let repository(source: Workspace!): Dagger.GitRepository! {
-    source.git.head.tree(discardGitDir: false, depth: 0).asGit
-  }
-
   # Resolve a user-supplied commit spelling to a full sha: "HEAD"/"" for the
   # tip (already resolved by the caller's first read), an exact or abbreviated
   # hash from the recent walk, or anything the repository can resolve by name
@@ -668,7 +667,7 @@ type Committer {
         return hits.join("")
       }
     }
-    repository(source).ref(name: want).commitSHA rescue {
+    source.git.head.asRepository.ref(name: want).commitSHA rescue {
       e: Error => raise `cannot resolve commit "${spec}": not a hash in the last ${toString(searchWindow)} commits, ` + `and not a name this repository knows (${plainError(e.message)})`
     }
   }
@@ -804,7 +803,9 @@ type Committer {
       let trimmed = line.trimLeft(" \t")
       if (fence != "") {
         let closing = trimmed.trimRight(" \t")
-        if (closing.hasPrefix(fence) and closing.trim(fence.split("").takeFirst.join("")) == "") {
+        if (closing.hasPrefix(fence) and closing.trim(
+          fence.split("").takeFirst.join(""),
+        ) == "") {
           fence = ""
         }
         continue line
