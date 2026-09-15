@@ -12,6 +12,9 @@ source = "github.com/vito/editor"
 [modules.committer]
 source = "committer"
 
+[modules.staff]
+source = "staff"
+
 [modules.contributor]
 source = "contributor"
 
