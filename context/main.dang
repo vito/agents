@@ -95,6 +95,28 @@ let asSuperseded(b: Block!): Block! {
   )
 }
 
+# Front matter for a promoted Block: ONE YAML encoding of the whole metadata
+# record, never hand-assembled lines — so a tag holding a comma, colon, quote
+# or newline round-trips instead of corrupting the document. Every field is
+# spelled out (empty lists, `pin: false`, `status: null`) in favor of a
+# stable shape over a minimal one. Newline-terminated.
+let frontMatter(b: Block!): String! {
+  let status: String = if (b.superseded) { "superseded" } else { null }
+  let doc = YAML.encode({{
+    kind: kindLabel(b.kind),
+    tags: b.tags,
+    pin: b.pin,
+    supersedes: b.supersedes,
+    status: status,
+  }})
+  if (doc.hasSuffix("\n")) { doc } else { doc + "\n" }
+}
+
+# The promoted file: front matter, then the payload verbatim.
+let promoted(b: Block!): String! {
+  "---\n" + frontMatter(b) + "---\n\n" + b.text + "\n"
+}
+
 """
 One unit of established truth: the text payload the model reads, plus the
 compact metadata the system selects and orders it by.
@@ -157,7 +179,7 @@ type Context {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: ["checkPromote"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -416,25 +438,84 @@ type Context {
     id: String!,
   ): Changeset! {
     let b = mustGet(id)
-    let front: [String!]! = [`kind: ${kindLabel(b.kind)}`]
-    if (!b.tags.isEmpty) {
-      front += [`tags: [${b.tags.join(", ")}]`]
-    }
-    if (b.pin) {
-      front += ["pin: true"]
-    }
-    if (!b.supersedes.isEmpty) {
-      front += [`supersedes: [${b.supersedes.join(", ")}]`]
-    }
-    if (b.superseded) {
-      front += ["status: superseded"]
-    }
     let path = `context/${id}.md`
-    let contents = "---\n" + front.join("\n") + "\n---\n\n" + b.text + "\n"
     let base = source.directory("/")
     print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
-    base.withNewFile(path, contents).changes(from: base)
+    base.withNewFile(path, promoted(b)).changes(from: base)
+  }
+
+  """
+  Check the promoted file shape: front matter is one YAML encoding of the
+  Block's metadata (so arbitrary tag strings survive), and the payload is
+  untouched.
+  """
+  checkPromote: String! @check {
+    # Metadata that would break a hand-rolled `[a, b]` list: separators,
+    # mapping indicators, quotes, and a newline inside a single tag.
+    let awkward = ["plain", "a, b", "key: value", "\"quoted\"", "multi\nline", "#hash", "- dash"]
+    let fresh = Block(
+      address: "facts/new",
+      kind: BlockKind.FACT,
+      text: "new truth",
+      tags: awkward,
+      pin: true,
+      superseded: false,
+      supersedes: ["facts/old"],
+    )
+    let stale = asSuperseded(fresh)
+    let plain = Block(
+      address: "notes/plain",
+      kind: BlockKind.NOTE,
+      text: "one line",
+      tags: [],
+      pin: false,
+      superseded: false,
+      supersedes: [],
+    )
+
+    # Round trip: decoding the front matter yields exactly the values encoded.
+    let decoded = YAML.decode(frontMatter(fresh)) :: {{
+      kind: String!,
+      tags: [String!]!,
+      pin: Boolean!,
+      supersedes: [String!]!,
+      status: String,
+    }}!
+    assert { decoded.kind == "fact" }
+    assert { decoded.tags == awkward }
+    assert { decoded.pin }
+    assert { decoded.supersedes == ["facts/old"] }
+    assert { decoded.status == null }
+    assert { (YAML.decode(frontMatter(stale)) :: {{status: String}}!).status == "superseded" }
+
+    # Defaults are spelled out rather than omitted: the file shape is stable
+    # and does not depend on which fields happen to be set.
+    let defaults = frontMatter(plain)
+    assert { defaults.contains("kind: note") }
+    assert { defaults.contains("tags: []") }
+    assert { defaults.contains("pin: false") }
+    assert { defaults.contains("supersedes: []") }
+    assert { defaults.contains("status: null") }
+
+    # The payload follows the front matter verbatim, newline-terminated —
+    # even one that carries its own `---` lines.
+    let payload = "# Heading\n\n---\nnot: front matter\n---\n\ntrailing spaces  \n"
+    let body = Block(
+      address: "notes/payload",
+      kind: BlockKind.NOTE,
+      text: payload,
+      tags: [],
+      pin: false,
+      superseded: false,
+      supersedes: [],
+    )
+    assert { promoted(body) == "---\n" + frontMatter(body) + "---\n\n" + payload + "\n" }
+    assert { promoted(plain).hasSuffix("---\n\none line\n") }
+
+    # Checks stay out of the agent's toolset.
+    assert { !agent(llm).tools.contains("checkPromote") }
+    "Promotion front-matter checks passed."
   }
 
   # ---- helpers ------------------------------------------------------------
