@@ -15,7 +15,7 @@
 #   * head.asRepository exposes the backing GitRepository directly: ref(name:)
 #     resolves hashes and names; commit(id:) accepts full/short shas, and
 #     GitCommit.tree gives the filesystem at a commit.
-#   * Workspace.withCommit(message:, paths:, date:) records pending changes as
+#   * Workspace.withCommit(changes:, message:, date:) records selected changes as
 #     a commit and returns a workspace with HEAD advanced. Returning that
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
 #     workspace to the returned state. `date` is required (for reproducible
@@ -133,16 +133,17 @@ type Committer {
     message: String!,
     """
     Glob patterns to commit, relative to the workspace root (e.g. "src/**"
-    or "**/*.go"). Empty commits every pending change. Patterns must match
-    both sides of a rename or neither; a nonempty selection matching nothing
-    is an error.
+    or "**/*.go"). Empty commits every pending change. Selecting only one
+    side of a rename selects an addition or deletion. Selections conflicting
+    with the working tree fail, as does a nonempty selection matching nothing.
     """
     paths: [String!]! = [],
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): committing is a side effect on the workspace's state; a
     # later identical call must record a fresh commit, not replay the first.
     message = formatMessage(message)
-    let picked = pendingStats(source, paths).filter { s => !s.path.hasSuffix("/") }
+    let changes = source.git.uncommitted.filter(include: paths)
+    let picked = changes.diffStats.{{path}}.filter { s => !s.path.hasSuffix("/") }
     if (picked.isEmpty) {
       if (paths.isEmpty) {
         raise "nothing to commit: no pending changes"
@@ -150,18 +151,9 @@ type Committer {
       raise "nothing to commit under the given paths (status shows what is pending)"
     }
 
-    # withCommit takes literal paths. Expand from the same filtered stats
-    # used above, excluding directory rows so they cannot widen the selection
-    # to unmatched siblings. Preserve both names of selected renames.
-    let selectedPaths = if (paths.isEmpty) {
-      [] :: [String!]!
-    } else {
-      (picked.map { s => s.path }
-        + picked.map { s => s.oldPath ?? "" }.filter { p => p != "" }).uniq
-    }
     let committed = source.withCommit(
-      message,
-      paths: selectedPaths,
+      changes: changes,
+      message: message,
       date: currentTimestamp,
       signoff: true,
     )
@@ -446,14 +438,10 @@ type Committer {
     } else {
       resolveSpec(source, against ?? "", headSha)
     }
-    let changes = if (baseSpec == "") {
-      # A root commit has no parent: everything in it is an addition.
-      repo.commit(id: want).tree(discardGitDir: true).changes(from: directory)
+    let changes = if (against == null) {
+      repo.commit(id: want).changes
     } else {
-      repo
-        .commit(id: want)
-        .tree(discardGitDir: true)
-        .changes(from: repo.commit(id: baseSpec).tree(discardGitDir: true))
+      repo.commit(id: want).changes(against: repo.commit(id: baseSpec))
     }
     let patch = changes.filter(include: paths).asPatch.contents
     let mergeNote = if (against == null and target.parentShas.length > 1) {
@@ -598,12 +586,16 @@ type Committer {
     # Returning a String keeps fixture commits local to this check; the
     # caller's workspace and host checkout are never rebound or exported.
     let root = "glob-check-" + Random.string
-    let base = source.git.head.asWorkspace
+    let fixture = source.git.head.asWorkspace
       .withNewFile(root + "/edit.go", "before\n")
       .withNewFile(root + "/delete.go", "remove\n")
       .withNewFile(root + "/old.go", "rename\n")
       .withNewFile(root + "/keep.txt", "keep\n")
-      .withCommit("fixture", paths: [root], date: "2026-09-15T12:00:00Z")
+    let base = fixture.withCommit(
+      changes: fixture.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture",
+      date: "2026-09-15T12:00:00Z",
+    )
     let working = base
       .withNewFile(root + "/edit.go", "after\n")
       .withoutFile(root + "/delete.go")
@@ -637,10 +629,18 @@ type Committer {
       e: Error => e.message
     }
     assert { noMatch.contains("nothing to commit") }
-    let splitRename = commit(working, message, paths: [root + "/old.*"]).git.head.commitSHA rescue {
+    ["old", "new"].each { side =>
+      let filtered = working.git.uncommitted
+        .filter(include: [root + "/" + side + ".go"]).diffStats.{{path, kind}}
+      let expectedKind = if (side == "old") { DiffStatKind.REMOVED } else { DiffStatKind.ADDED }
+      assert { filtered.map { s => s.path } == [root + "/" + side + ".go"] }
+      assert { filtered.all { s => s.kind == expectedKind } }
+    }
+    # Deleting only the old name conflicts with the working tree's rename.
+    let splitRename = commit(working, message, paths: [root + "/old.go"]).git.head.commitSHA rescue {
       e: Error => e.message
     }
-    assert { splitRename.contains("split the rename") }
+    assert { splitRename.contains("CONFLICT (rename/delete)") }
     assert { commit(working, message).git.uncommitted.isEmpty }
     "Glob filtering and commit checks passed."
   }
@@ -663,8 +663,7 @@ type Committer {
     source.git.head
   }
 
-  # The pending changes' per-file stats, scoped to `paths`. Shared by status
-  # (to render them) and commit (to refuse an empty commit up front).
+  # The pending changes' per-file stats, scoped to `paths`, for status.
   let pendingStats(
     source: Workspace!,
     paths: [String!]!,

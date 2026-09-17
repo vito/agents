@@ -278,7 +278,7 @@ type Staff {
     let theirs = workerWorkspace(name)
     # One batched selection: the plan forces here, and a failure here is a
     # genuine error worth surfacing raw rather than rescuing into prose.
-    let picks = source.commitsFrom(source: theirs).{{
+    let picks = source.compareCommitsFrom(source: theirs).{{
       commit.{{sha, committedDate, authorName, message}},
       status,
       reason,
@@ -429,7 +429,7 @@ type Staff {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
     let theirs = workerWorkspace(name)
-    let picks = source.commitsFrom(source: theirs, commits: commits).{{
+    let picks = source.compareCommitsFrom(source: theirs, commits: commits).{{
       commit.{{sha, message}},
       status,
       reason,
@@ -520,7 +520,7 @@ type Staff {
 
     # Advisory, not a refusal: if the commit would apply cleanly, pull keeps
     # the worker's authorship and this does not.
-    let planned = source.commitsFrom(source: theirs, commits: [sha]).{{status}}
+    let planned = source.compareCommitsFrom(source: theirs, commits: [sha]).{{status}}
     let clean = planned.any { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
 
     let base = source.directory("/")
@@ -728,7 +728,11 @@ type Staff {
     assert { patch.contains("+one") and patch.contains("+two") }
     assert { !patch.contains("keep.txt") }
     assert { fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.rs"]).contains("no uncommitted changes") }
-    let committed = working.withCommit("fixture", paths: [root], date: "2026-09-15T12:00:00Z")
+    let committed = working.withCommit(
+      changes: working.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture",
+      date: "2026-09-15T12:00:00Z",
+    )
     let committedWorker = llm.withWorkspace(committed).spawn(name: "committed-filter-fixture")
     let committedFixture = Dagger.staff.withWorker("fixture", committedWorker)
     let committedPatch = committedFixture.diffOf(
@@ -845,18 +849,9 @@ type Staff {
     source.git.head.asRepository
   }
 
-  # Real Git commits carry trees, not a staged patch. Root commits diff
-  # against the empty tree; merge inspection uses the first parent.
+  # Native commit changes handle root commits and first-parent merge diffs.
   let commitChanges(source: Workspace!, sha: String!): Changeset! {
-    let repo = repository(source)
-    let target = repo.commit(id: sha)
-    let parent = target.parentShas.takeFirst.join("")
-    let base = if (parent == "") {
-      directory
-    } else {
-      repo.commit(id: parent).tree(discardGitDir: true)
-    }
-    target.tree(discardGitDir: true).changes(from: base)
+    repository(source).commit(id: sha).changes
   }
 
   # Only pullPending's computed drift paths need literal matching. Public

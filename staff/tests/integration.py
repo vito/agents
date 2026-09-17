@@ -42,8 +42,11 @@ def edit(ws, path, content):
 
 
 def commit(ws, message):
-    return workspace_field(ws, 'withCommit(message: ' + json.dumps(message)
-                           + ', date: "2026-09-06T12:00:00Z") { id }')["withCommit"]["id"]
+    changes = workspace_field(ws, "git { uncommitted { id } }")["git"]["uncommitted"]["id"]
+    return query('query($ws: ID!, $changes: ID!, $message: String!) { node(id: $ws) '
+                 '{ ... on Workspace { withCommit(changes: $changes, message: $message, '
+                 'date: "2026-09-06T12:00:00Z") { id } } } }',
+                 ws=ws, changes=changes, message=message)["node"]["withCommit"]["id"]
 
 
 def roster(ws):
