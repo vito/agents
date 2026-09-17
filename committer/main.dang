@@ -30,12 +30,19 @@ Git operations on this workspace: review pending changes, read the checkout's
 history, commit, reset, and push.
 """
 type Committer {
+  # Keep the workspace being left so reset can restore pruned history too.
+  let saved: Map[Workspace!]! = [:]
+
+  let plumbing = [
+    "withSavedWorkspace", "checkMessages", "checkFiltering"
+  ]
+
   """
   Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: ["checkMessages", "checkFiltering"])
+      .withTools(currentNode, except: plumbing)
       .withSystemPrompt(systemPrompt)
   }
 
@@ -116,7 +123,7 @@ type Committer {
   scope names and wording. Subjects must use `scope: summary` and fit in 50
   characters, including the scope. A blank line and brief description are
   required; explain why when the reason is interesting and non-obvious.
-  Authorship defaults to the identity the workspace was loaded with.
+  Authorship defaults to your Git identity.
 
   Description prose is word-wrapped at 80 characters. Existing line breaks,
   indented/fenced code, and trailers are preserved; long tokens are not split.
@@ -175,37 +182,76 @@ type Committer {
   }
 
   """
-  Move HEAD to a chosen commit without changing the working tree.
+  Reset to a commit, or restore a workspace saved by an earlier reset.
 
   Use this to redo or combine local commits: read `log`, choose the commit to
   return to, reset, then review `status` / `diff` and commit again. Changes
-  from the undone commits and any pending edits remain in the workspace.
-  There is deliberately no hard-reset mode here.
+  from the undone commits and any pending edits remain in the workspace
+  when resetting to a commit that has not been saved.
+
+  Each reset saves the workspace being left under its HEAD hash. Returning
+  to a saved hash restores that entire workspace, including its pending
+  edits, rather than carrying over your current working tree. The workspace
+  you leave is saved in turn, so you can go back again. Full hashes or unique
+  prefixes of at least four characters select saved workspaces.
+  Each hash keeps its most recently saved workspace.
 
   Rewrites local history; only use when asked to undo or rewrite commits.
-  Does not push or change the remote. Record the old HEAD before resetting
-  so it can be used as a recovery target.
+  Does not push or change the remote.
   """
   reset(
+    llm: LLM!,
     source: Workspace!,
     """
-    The commit to move HEAD to. Use a commit hash from `log`; it is required
-    so resetting never silently chooses how much history to undo.
+    The commit to move HEAD to, or a saved HEAD hash printed by an earlier
+    reset. Required so resetting never silently chooses how much history
+    to undo.
     """
     commit: String!,
-  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
-    if (commit.trimSpace == "") {
+  ): LLM! @cache(policy: FunctionCachePolicy.Never) {
+    let want = commit.trimSpace
+    if (want == "") {
       raise "reset: specify the commit to move HEAD to (log shows the history)"
     }
-    let previous = head(source).commitSHA
-    let reset = source.withReset(commit: commit.trimSpace, hard: false)
+    let before = source.snapshot
+    let previous = head(before).commitSHA
+    let matches = saved.keys.filter { sha =>
+      want.split("").length >= 4 and sha.hasPrefix(want)
+    }
+    if (matches.length > 1) {
+      raise `reset: ambiguous saved commit "${want}"; use a longer hash`
+    }
+    let remembered = saved[matches.takeFirst.join("")]
+    let target = if (remembered != null) {
+      remembered
+    } else {
+      before.withReset(commit: want, hard: false)
+    }
     # Force evaluation before returning the workspace, like commit: failures
     # should surface here, not while the agent is rebinding its workspace.
-    let sha = reset.git.head.commitSHA rescue {
+    let sha = target.git.head.commitSHA rescue {
       e: Error => raise `reset failed: ${plainError(e.message)}`
     }
-    print(`Reset HEAD from ${previous} to ${sha}. Working tree preserved; review status / diff before committing again.`)
-    reset
+    let note = if (remembered != null) {
+      "Restored the saved workspace, including its pending edits."
+    } else {
+      "Working tree preserved; review status / diff before committing again."
+    }
+    print(`Reset HEAD from ${previous} to ${sha}. ${note} `
+      + `To return to the workspace you left, reset to ${previous}.`)
+    # A self-call gives the updated toolset an engine identity. Rebind both
+    # it and the workspace through the continuation so the map persists.
+    let tools = currentNode.{{... on Dagger.Committer!}}
+      .withSavedWorkspace(workspace: before)
+    llm.withTools(tools, except: plumbing).withWorkspace(target)
+  }
+
+  """
+  Save a workspace for reset recovery. Internal bookkeeping, not an agent tool.
+  """
+  withSavedWorkspace(workspace: Workspace!): Committer! {
+    self.saved = saved.with(workspace.git.head.commitSHA, workspace)
+    self
   }
 
   """
@@ -888,12 +934,14 @@ type Committer {
     - `commit` — record pending changes as a commit and advance HEAD. Without
       `paths` it commits EVERYTHING `status` lists; with `paths`, only those
       changes, leaving the rest pending.
-    - `reset` — move HEAD to a chosen commit, keeping the working tree and
-      pending edits intact. Only use when asked to undo or rewrite commits.
-      Read `log` and record the old HEAD first; then reset, review `status` /
-      `diff`, and commit again. No hard reset, and no remote changes. Rewriting
-      published history needs explicit authorization, not an automatic force
-      push after a rejection.
+    - `reset` — move HEAD to a chosen commit, or restore a saved workspace.
+      Only use when asked to undo or rewrite commits.
+      Read `log`, choose the target, then reset, review `status` / `diff`, and
+      commit again. Each reset saves the workspace you leave and prints its
+      hash. Resetting to a saved hash restores that workspace's files and
+      pending edits; other targets keep your current working tree.
+      Rewriting published history needs explicit authorization, not an
+      automatic force push after a rejection.
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
