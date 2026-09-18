@@ -39,11 +39,17 @@ type Staff {
   # so they can never address a corpse.
   let tombstones: Map[Agent!]! = [:]
 
+  # Tool configuration belongs to the originating workspace, not necessarily
+  # the worktree the chief now edits (checkout preserves tools across switches).
+  # Keep the source, not the partially composed base LLM or live tool state.
+  let compositionSource: Workspace = null
+
   # Public for self-calls, not chief tools: roster bookkeeping and worker
   # plumbing. Prompt constants and regression checks are excluded too.
   # Workers bind only the dedicated PullTools object, never this full Staff.
   let plumbing = [
     "withWorker", "withDismissed", "chiefLine", "pullTools",
+    "withCompositionSource", "workerBase", "checkComposition",
     "workerPrompt", "workerPromptFor", "checkFiltering", "checkTools"
   ]
 
@@ -51,9 +57,39 @@ type Staff {
   Compose the staff-chief tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
+    let tools = currentNode.{{... on Dagger.Staff!}}
+      .withCompositionSource(base.workspace)
     base
-      .withTools(currentNode, except: plumbing)
+      .withTools(tools, except: plumbing)
       .withSystemPrompt(chiefPrompt)
+  }
+
+  """
+  Retain the workspace supplying worker capabilities, independently of the
+  workspace later passed to spawn. Internal composition plumbing only.
+  """
+  withCompositionSource(source: Workspace!): Staff! {
+    self.compositionSource = source
+    self
+  }
+
+  """
+  Build a fresh worker base without starting a turn. Internal spawn plumbing.
+  """
+  workerBase(source: Workspace!, model: String = null): LLM! {
+    # Direct API callers that never ran agent retain the old source-based
+    # behavior. A composed Staff always uses its recorded origin instead.
+    let origin = compositionSource ?? source
+    # Workers work; they don't orchestrate. Do not discover or run agent code
+    # from a checkout merely because the chief now operates on that worktree.
+    let base = origin.agents(exclude: ["staff"])
+      .compose(base: llm.withWorkspace(source))
+      .withWorkspace(source)
+    if (model == null) {
+      base
+    } else {
+      base.withModel(model ?? "")
+    }
   }
 
   """
@@ -64,10 +100,11 @@ type Staff {
   you are subscribed to its lifecycle: when it goes idle (with its final
   reply) or fails (with the error), the news arrives as an event message.
   Keep working; check on it with status/read, steer it with sendTo, harvest
-  it with the pull family, let it go with dismiss. The worker has your same
-  workspace tools, a pull-only view of the chief and workers already on
-  staff, and one extra: askChief, its line back to you. It cannot spawn or
-  steer workers.
+  it with the pull family, let it go with dismiss. The worker gets fresh tools
+  from the workspace where staff was composed, bound to your current worktree,
+  a pull-only view of the chief and workers already on staff, and askChief,
+  its line back to you. It cannot spawn or steer workers. Tools layered onto
+  the chief later are not automatically inherited.
 
   The chief is always available to that pull-only view under the reserved
   target name `chief`; existing workers keep their staff names. The roster is
@@ -94,8 +131,8 @@ type Staff {
     task: String!,
     """
     Model for the worker's conversation — e.g. a cheaper model for rote
-    work, or a stronger one for a hard problem. Defaults to the workspace
-    composition's own choice.
+    work, or a stronger one for a hard problem. Defaults to the originating
+    workspace composition's own choice.
     """
     model: String = null,
   ): Dagger.Staff! @cache(policy: FunctionCachePolicy.Never) {
@@ -107,16 +144,7 @@ type Staff {
     if (members.has(name)) {
       raise `staff member "${name}" already exists — dismiss it first or pick another name`
     }
-    # Workers work; they don't orchestrate. Compose the workspace's agents
-    # with staff itself excluded, so the chief's own orchestration toolset
-    # (and its system prompt) never reaches a worker (a no-op when the
-    # module isn't installed there).
-    let composed = source.agents(exclude: ["staff"])
-    let base = if (model == null) {
-      composed.compose
-    } else {
-      composed.compose.withModel(model ?? "")
-    }
+    let base = workerBase(source, model)
     # Snapshot the peers that exist BEFORE this spawn and add the chief under
     # a stable reserved alias. PullTools exposes only the five harvest methods,
     # so future Staff orchestration methods cannot leak into workers by accident.
@@ -776,12 +804,97 @@ type Staff {
   """
   Check that internal bookkeeping remains absent from the chief's tools.
   """
-  checkTools: String! @check {
-    let tools = agent(llm).tools
+  checkTools(source: Workspace!): String! @check {
+    let tools = agent(llm.withWorkspace(source)).tools
     assert { tools.contains("spawn") and tools.contains("dismiss") }
     assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
+    assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
+    assert { !tools.contains("checkComposition") }
     assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
     "Staff tool visibility checks passed."
+  }
+
+  """
+  Check retained-origin composition after checkout, without model calls.
+  """
+  checkComposition: String! @check {
+    let origin = directory
+      .withNewFile("dagger.toml", """
+        [env.dev.modules.probe]
+        source = "probe"
+        [modules.staff]
+        source = "staff"
+        """)
+      .withNewFile("probe/dagger-module.toml", """
+        name = "probe"
+        engineVersion = "v1.0.0-0"
+        [runtime]
+        source = "dang"
+        """)
+      .withNewFile("probe/main.dang", """
+        type Probe {
+          agent(base: LLM!): LLM! @agent {
+            base.withTools(currentNode)
+              .withModel("origin-model")
+              .withSystemPrompt(`origin capabilities for ${base.workspace.file("marker").contents}`)
+          }
+          originRead(source: Workspace!): String! {
+            source.file("marker").contents
+          }
+          originWrite(source: Workspace!): Changeset! {
+            source.directory("/").withNewFile("written", "worker")
+              .changes(from: source.directory("/"))
+          }
+        }
+        """)
+      .withNewFile("staff/dagger-module.toml", """
+        name = "staff"
+        engineVersion = "v1.0.0-0"
+        [runtime]
+        source = "dang"
+        """)
+      .withNewFile("staff/main.dang", """
+        type Staff {
+          agent(base: LLM!): LLM! @agent {
+            raise "staff orchestration must be excluded"
+          }
+        }
+        """)
+      .withNewFile("marker", "origin")
+      .asWorkspace.withConfigEnvironment("dev")
+    let target = directory.withNewFile("marker", "checkout with pending edits").asWorkspace
+    let fixture = Dagger.staff.withCompositionSource(origin)
+    let worker = fixture.workerBase(target).sync
+    assert { worker.tools.contains("originRead") and worker.tools.contains("originWrite") }
+    assert { worker.workspace.file("marker").contents == "checkout with pending edits" }
+    assert { worker.model == "origin-model" }
+    assert { worker.messages.{{role}}.all { m => m.role == LLMMessageRole.SYSTEM } }
+    assert { worker.messages.{{content.{{text}}}}.any { m =>
+      m.content.any { c => (c.text ?? "").contains("origin capabilities for checkout with pending edits") }
+    } }
+    assert { fixture.workerBase(target, model: "fixture-model").model == "fixture-model" }
+
+    # Roster mutations must preserve the saved origin; no turn is started.
+    let handle = worker.spawn(name: "composition-fixture")
+    let roster = fixture.withWorker("fixture", handle)
+    assert { roster.workerBase(target).tools.contains("originRead") }
+    let dismissed = roster.withDismissed("fixture", handle)
+    assert { dismissed.workerBase(target).tools.contains("originRead") }
+    handle.stop
+
+    # A destination with agent code is not implicitly trusted or composed.
+    let hostile = origin.withNewFile("probe/main.dang", """
+      type Probe {
+        agent(base: LLM!): LLM! @agent {
+          raise "destination agents must not execute"
+        }
+      }
+      """)
+    assert { fixture.workerBase(hostile).tools.contains("originRead") }
+    assert { origin.file("marker").contents == "origin" }
+    # Preserve direct API use when no chief composition has captured an origin.
+    assert { Dagger.staff.workerBase(origin).tools.contains("originRead") }
+    "Staff checkout composition checks passed."
   }
 
   # Address a member by name, with a helpful miss.
