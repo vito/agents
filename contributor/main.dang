@@ -25,6 +25,10 @@
 #   the code side of a PR changes by pushing more commits to its head
 #   branch (committer's push, or pushBranch for a fork).
 #
+# - `openIssue` files a GitHub issue — the one deliberately mutating
+#   counterpart to the GET-only `ghApi`, for when an agent is asked to
+#   report a bug or leave feedback rather than fix it.
+#
 # - `pushBranch` publishes the workspace's committed HEAD to a branch on a
 #   DIFFERENT repository — typically a fork, for when the agent cannot or
 #   should not push branches to the repository it checked out. Committer's
@@ -91,8 +95,8 @@ let head(s: String!, lines: Int! = patchLines): String! {
 
 """
 GitHub operations: read pull request reviews and the REST API, comment on
-pull requests, open pull requests for pushed branches, and switch the
-conversation to a checkout of another repository.
+pull requests, open pull requests for pushed branches, file issues, and
+switch the conversation to a checkout of another repository.
 """
 type Contributor {
   # Private so the secret is never exposed as a field/tool argument.
@@ -635,6 +639,70 @@ type Contributor {
   }
 
   """
+  Open a GitHub issue on a repository.
+
+  Write the body for a human reader: what happened, why it matters, and
+  what would fix it. Returns the URL of the new issue.
+  """
+  openIssue(
+    source: Workspace!,
+    """
+    Issue title.
+    """
+    title: String!,
+    """
+    Issue body (Markdown).
+    """
+    body: String!,
+    """
+    The GitHub repository to open the issue on, as "owner/name" (a
+    github.com URL works too). Empty targets the configured remote, or the
+    checkout's own origin remote when none is configured.
+    """
+    repo: String! = "",
+    """
+    Labels to apply, if any. Labels that do not exist on the repository make
+    GitHub reject the request, so only pass ones you know exist.
+    """
+    labels: [String!]! = [],
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): opening an issue is a side effect, not something to
+    # replay from the session cache.
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    let slug = if (repo == "") { remoteSlug } else { normalizeSlug(repo) }
+    # For messages only: slug may be empty, meaning "whatever the checkout's
+    # origin remote says" — the script resolves it.
+    let where = if (slug == "") { "the checkout's repository" } else { slug }
+
+    # The body travels as a file, never spliced into shell source.
+    let script = resolveRepoSh + "\n" + """
+      set -- issue create --repo "$OWNER_REPO" --title "$ISSUE_TITLE" --body-file /tmp/issue.md
+      if [ -n "$LABELS" ]; then set -- "$@" --label "$LABELS"; fi
+      gh "$@"
+    """
+
+    let ran = toolbox(source)
+      .withNewFile("/tmp/issue.md", body)
+      .withEnvVariable("OWNER_REPO", slug)
+      .withEnvVariable("ISSUE_TITLE", title)
+      .withEnvVariable("LABELS", labels.join(","))
+      # creation must actually happen every time, not be served from the
+      # exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+
+    if (ran.exitCode != 0) {
+      raise `opening an issue on ${where} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
+    }
+
+    `Opened issue: ${ran.stdout.trimSpace}`
+  }
+
+  """
   Publish the workspace's committed HEAD to a branch on ANOTHER repository —
   typically a fork, for when you cannot or should not push branches to the
   repository you checked out. The committer `push` tool only reaches the
@@ -996,8 +1064,8 @@ type Contributor {
   let systemPrompt: String! = """
     You have GitHub tools: `reviewComments` and `ghApi` for reading,
     `prComment` for review feedback, `submitPr` for opening pull requests,
-    `updatePr` for editing them afterwards, and `checkout` for switching
-    this conversation to another repository.
+    `updatePr` for editing them afterwards, `openIssue` for filing issues,
+    and `checkout` for switching this conversation to another repository.
 
     `ghApi` GETs any GitHub REST API path with authentication — code search
     ("search/code?q=repo:owner/name+needle"), PR/issue metadata, releases,
@@ -1033,6 +1101,12 @@ type Contributor {
     ready for review, or close and reopen it. Only the arguments you pass
     change. It edits metadata only — new code reaches a PR by pushing more
     commits to its head branch (`push`, or `pushBranch` for a fork).
+
+    `openIssue` opens an issue on a named repository — or the configured
+    remote, falling back to the checkout's own origin remote — and returns
+    its URL. Reach for it when asked to report a bug or leave feedback
+    rather than fix it. Write the body for a human reader: what happened,
+    why it matters, and what would fix it.
 
     `pushBranch` publishes the workspace's committed HEAD to a branch on
     ANOTHER repository — typically a fork, for when you cannot or should
