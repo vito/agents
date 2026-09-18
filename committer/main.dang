@@ -25,16 +25,44 @@
 #   * GitRef.push publishes HEAD to the checkout's remote, engine-side (no
 #     host checkout involved), with an optional lease in the style of
 #     `--force-with-lease`. An effect on the remote, so never cached.
+#   * Workspace.compareCommitsFrom / withCommitsFrom plan and replay another
+#     workspace's commits onto this one (cherry-pick with authorship kept, or
+#     a fast-forward when hashes can be preserved). `rebase` is built from
+#     them: rewind to the fork point, fast-forward onto the fetched upstream
+#     tip, replay our commits, and STOP at the first conflict — which is
+#     merged three-way into the working tree (Changeset.withChangeset with
+#     conflict markers) for the agent to resolve before `rebaseContinue`
+#     records it and carries on. The in-progress state rides on the module
+#     object, like `reset`'s saved workspaces, and reaches the next call
+#     through the returned LLM.
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, commit, reset, and push.
+history, commit, reset, rebase, and push.
 """
 type Committer {
   # Keep the workspace being left so reset can restore pruned history too.
   let saved: Map[Workspace!]! = [:]
 
+  # An in-progress rebase, between a stop at a conflict and the continue,
+  # skip, or abort that resumes it. `rebaseOrigin` is the frozen workspace
+  # the rebase started from: the source of the commits being replayed and
+  # what abort restores; null means no rebase is in progress.
+  let rebaseOrigin: Workspace = null
+  # Commits of the origin still to replay, oldest first, after the stopped one.
+  let rebaseRemaining: [String!]! = []
+  # The origin commit whose conflicted changes sit in the working tree.
+  let rebaseStopped: String! = ""
+  # HEAD at the stop, to tell a resolution committed by hand from a drop.
+  let rebaseStoppedHead: String! = ""
+  let rebaseOnto: String! = ""
+  let rebaseOntoSha: String! = ""
+  let rebaseOldHead: String! = ""
+  # The branch the rebase started on, "" when HEAD was detached. Rewinding
+  # detaches HEAD, so this is what the finished rebase names in its push hint.
+  let rebaseBranch: String! = ""
+
   let plumbing = [
-    "withSavedWorkspace", "checkMessages", "checkFiltering"
+    "withSavedWorkspace", "withRebaseState", "withoutRebaseState", "checkMessages", "checkRebaseHelpers", "checkRebaseReplay", "checkFiltering"
   ]
 
   """
@@ -70,9 +98,9 @@ type Committer {
     let scoped = pendingStats(source, paths)
     if (scoped.isEmpty) {
       if (paths.isEmpty) {
-        return "No pending changes."
+        return rebaseBanner + "No pending changes."
       }
-      return "No pending changes under the given paths."
+      return rebaseBanner + "No pending changes under the given paths."
     }
     let rows = scoped.map { s =>
       `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
@@ -80,7 +108,7 @@ type Committer {
     let added = scoped.reduce(0) { acc, s => acc + (s.addedLines ?? 0) }
     let removed = scoped.reduce(0) { acc, s => acc + (s.removedLines ?? 0) }
     let footer = `${toString(scoped.length)} files changed, +${toString(added)} -${toString(removed)}`
-    rows.join("\n") + "\n\n" + footer
+    rebaseBanner + rows.join("\n") + "\n\n" + footer
   }
 
   """
@@ -251,6 +279,238 @@ type Committer {
   """
   withSavedWorkspace(workspace: Workspace!): Committer! {
     self.saved = saved.with(workspace.git.head.commitSHA, workspace)
+    self
+  }
+
+  # ---------------------------------------------------------------- rebase
+  """
+  Rebase this branch's commits onto the current tip of a remote branch,
+  stopping at each conflict for you to resolve.
+
+  Fetches `onto` from the checkout's remote, rewinds to where this branch
+  forked from it, fast-forwards to the fetched tip, and replays your commits
+  on top — oldest first, authors and dates intact, merge commits left out,
+  commits already upstream dropped.
+
+  When a commit no longer applies cleanly the rebase STOPS: the commits
+  before it are on the new base, and its changes are merged into your
+  working tree three-way, with git-style conflict markers (<<<<<<<) where
+  the two sides disagree. Resolve the markers with your edit tools, then
+  `rebaseContinue` records the commit (original message and author kept,
+  unless you pass a new message) and carries on to the next conflict or the
+  end. `rebaseSkip` drops the stopped commit instead; `rebaseAbort` restores
+  the workspace you started from.
+
+  Requires a clean working tree: commit pending edits first. Rewrites local
+  history and does not push. The rewind leaves HEAD detached, so publishing
+  the result is `push` with the branch named and `expectedRemoteSHA` (a
+  lease) set — the finished rebase spells the call out.
+  """
+  rebase(
+    llm: LLM!,
+    source: Workspace!,
+    """
+    What to rebase onto, as it is now on the remote: a branch name such as
+    "main", a tag, or a commit sha.
+    """
+    onto: String!,
+    """
+    Git URL of the repository to fetch `onto` from. Empty uses the checkout's
+    origin remote; name the upstream here to rebase a fork's branch onto it.
+    """
+    repo: String! = "",
+  ): LLM! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): fetches a live remote tip and rewrites the workspace; a
+    # later identical call must do both again.
+    if (rebaseOrigin != null) {
+      raise `rebase: a rebase is already in progress, stopped at ${short(rebaseStopped)}; ` + "finish it with rebaseContinue, or rebaseAbort to return to where you started"
+    }
+    let branch = onto.trimSpace
+    if (branch == "") {
+      raise "rebase: name the branch to rebase onto, e.g. onto: \"main\""
+    }
+    if (!source.git.uncommitted.isEmpty) {
+      raise "rebase: the working tree has pending changes; commit them first (status shows them)"
+    }
+    # The branch name is read from the live workspace: the snapshot below is
+    # pinned to its commit and no longer knows it.
+    let branchName = branchOf(source)
+    # Frozen: the source of the replayed commits must be a stable value, and
+    # it doubles as what rebaseAbort restores.
+    let origin = source.snapshot
+    let oldHead = head(origin).commitSHA rescue {
+      e: Error => raise "rebase: " + noHistory(e.message)
+    }
+
+    let url = remoteUrl(origin, repo)
+    let upstream = git(url).ref(name: branch)
+    let ontoSha = upstream.commitSHA rescue {
+      e: Error => raise `rebase: cannot fetch ${branch} from ${url}: ${plainError(e.message)}`
+    }
+    let newBase = rebasedBase(origin, upstream, branch)
+    # Our side of the fork, linearized the way `git rebase` does: merge
+    # commits are not replayed, only the commits they brought in that
+    # upstream does not already have. Asking the engine for "all new
+    # commits" instead would select the merges too, and refuse them.
+    let ours = head(origin).log(limit: replayBound, base: upstream).{{sha, message, parentShas}} rescue {
+      e: Error => raise replayError(`listing this branch's commits since ${branch}`, branch, e.message)
+    }
+    let linear = ours.filter { c => c.parentShas.length <= 1 }.map { c => c.sha }
+    let merges = ours.filter { c => c.parentShas.length > 1 }
+    let note = if (merges.isEmpty) {
+      ""
+    } else {
+      `Left out ${toString(merges.length)} merge commit(s), whose merged-in commits are replayed individually: ` + merges.map { c => `${short(c.sha)} ${subject(c.message)}` }.join(", ") + "."
+    }
+    advance(llm, origin, newBase, linear, branch, ontoSha, oldHead, branchName, note)
+  }
+
+  """
+  Continue a stopped rebase: record the resolved commit and replay the rest.
+
+  Call it once the conflict markers left by `rebase` are resolved. The
+  pending edits are committed with the stopped commit's original message,
+  author, and date — pass `message` to amend the message instead. Then the
+  remaining commits are replayed, stopping again at the next conflict.
+
+  If you already committed the resolution yourself, that commit stands and
+  the replay simply continues. If nothing is left to commit (the change was
+  already upstream), the commit is dropped, as git's rebase would.
+  """
+  rebaseContinue(
+    llm: LLM!,
+    source: Workspace!,
+    """
+    Replacement commit message for the resolved commit. Omitted keeps the
+    original message.
+    """
+    message: String = null,
+  ): LLM! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): reads the live working tree and advances module state.
+    let origin = rebaseOrigin
+    if (origin == null) {
+      raise "rebaseContinue: no rebase is in progress; `rebase` starts one"
+    }
+    let pending = source.git.uncommitted
+    let marked = conflictedFiles(pending.asPatch.contents)
+    if (!marked.isEmpty) {
+      raise `rebaseContinue: conflict markers remain in ${marked.join(", ")}; resolve them first`
+    }
+    let headNow = head(source).commitSHA
+    let original = repository(origin).commit(id: rebaseStopped).{{
+      message,
+      authorName,
+      authorEmail,
+      authoredDate
+    }}
+
+    let current = source
+    let note = ""
+    if (headNow != rebaseStoppedHead) {
+      # The agent recorded the resolution with `commit` (or otherwise moved
+      # HEAD); its commit stands.
+      if (!pending.isEmpty) {
+        raise "rebaseContinue: HEAD moved past the stopped commit but edits are still pending; commit or revert them, then continue"
+      }
+      note = `Kept your own commit ${short(headNow)} in place of ${short(rebaseStopped)}.`
+    } else if (pending.isEmpty) {
+      note = `Dropped ${short(rebaseStopped)}: nothing was left to commit after resolution.`
+    } else {
+      # Preserving someone's history, not writing new: no style enforcement,
+      # no sign-off, the original author and date.
+      current = source.withCommit(
+        changes: pending,
+        message: message ?? original.message,
+        date: original.authoredDate,
+        authorName: original.authorName,
+        authorEmail: original.authorEmail,
+      )
+      let sha = head(current).commitSHA rescue {
+        e: Error => raise `rebaseContinue: recording the resolved commit failed: ${plainError(e.message)}`
+      }
+      note = `Recorded ${short(rebaseStopped)} as ${short(sha)}` + (if (message == null) { "." } else { " with the new message." })
+    }
+    advance(llm, origin, current, rebaseRemaining, rebaseOnto, rebaseOntoSha, rebaseOldHead, rebaseBranch, note)
+  }
+
+  """
+  Drop the commit a rebase stopped at and replay the rest.
+
+  Discards the pending edits (the stopped commit's conflicted changes) and
+  continues as if that commit never existed — `git rebase --skip`. Prefer
+  resolving with `rebaseContinue`; skip only when the commit is genuinely
+  obsolete.
+  """
+  rebaseSkip(
+    llm: LLM!,
+    source: Workspace!,
+  ): LLM! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): reads the live working tree and advances module state.
+    let origin = rebaseOrigin
+    if (origin == null) {
+      raise "rebaseSkip: no rebase is in progress; `rebase` starts one"
+    }
+    let clean = source.withReset(commit: head(source).commitSHA, hard: true)
+    head(clean).commitSHA rescue {
+      e: Error => raise `rebaseSkip: discarding the pending edits failed: ${plainError(e.message)}`
+    }
+    advance(llm, origin, clean, rebaseRemaining, rebaseOnto, rebaseOntoSha, rebaseOldHead, rebaseBranch, `Skipped ${short(rebaseStopped)}.`)
+  }
+
+  """
+  Abandon a stopped rebase and restore the workspace exactly as it was
+  before `rebase` — history, branch, and all. Nothing is kept from the
+  partial replay.
+  """
+  rebaseAbort(
+    llm: LLM!,
+  ): LLM! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): rebinds the workspace and clears module state.
+    let origin = rebaseOrigin
+    if (origin == null) {
+      raise "rebaseAbort: no rebase is in progress; there is nothing to undo"
+    }
+    let tools = currentNode.{{... on Dagger.Committer!}}.withoutRebaseState
+    print(`Rebase aborted. Workspace restored to ${short(rebaseOldHead)}, as it was before rebase.`)
+    llm.withTools(tools, except: plumbing).withWorkspace(origin)
+  }
+
+  """
+  Record an in-progress rebase. Internal bookkeeping, not an agent tool.
+  """
+  withRebaseState(
+    origin: Workspace!,
+    remaining: [String!]!,
+    stopped: String!,
+    stoppedHead: String!,
+    onto: String!,
+    ontoSha: String!,
+    oldHead: String!,
+    branch: String!,
+  ): Committer! {
+    self.rebaseOrigin = origin
+    self.rebaseRemaining = remaining
+    self.rebaseStopped = stopped
+    self.rebaseStoppedHead = stoppedHead
+    self.rebaseOnto = onto
+    self.rebaseOntoSha = ontoSha
+    self.rebaseOldHead = oldHead
+    self.rebaseBranch = branch
+    self
+  }
+
+  """
+  Forget a finished or abandoned rebase. Internal bookkeeping, not an agent tool.
+  """
+  withoutRebaseState: Committer! {
+    self.rebaseOrigin = null
+    self.rebaseRemaining = []
+    self.rebaseStopped = ""
+    self.rebaseStoppedHead = ""
+    self.rebaseOnto = ""
+    self.rebaseOntoSha = ""
+    self.rebaseOldHead = ""
+    self.rebaseBranch = ""
     self
   }
 
@@ -469,7 +729,7 @@ type Committer {
     }
     let want = resolveSpec(source, commit, headSha)
 
-    let repo = source.git.head.asRepository
+    let repo = repositoryHolding(source, want)
     let target = repo.commit(id: want).{{
       sha,
       shortSha,
@@ -542,7 +802,7 @@ type Committer {
       e: Error => return noHistory(e.message)
     }
     let want = resolveSpec(source, commit, headSha)
-    let repo = source.git.head.asRepository
+    let repo = repositoryHolding(source, want)
     let target = repo.commit(id: want).{{shortSha, message, authoredDate}}
     let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue {
       e: Error => raise `${path} does not exist at ${target.shortSha}: ${plainError(e.message)}` + ` — it may have been added later, deleted, or renamed; log(paths: ["${path}"]) shows the commits that touched it`
@@ -623,6 +883,160 @@ type Committer {
     let wrapped = formatMessage("scope: wrap prose\n\n" + long + "\n\n    " + long)
     assert { formatMessage(wrapped) == wrapped }
     "Commit-message checks passed."
+  }
+
+  """
+  Check rebase's pure helpers: origin-URL parsing and conflict-marker detection.
+  """
+  checkRebaseHelpers: String! @check {
+    let config = """
+      [core]
+      	repositoryformatversion = 0
+      [remote "upstream"]
+      	url = https://github.com/upstream/repo.git
+      	fetch = +refs/heads/*:refs/remotes/upstream/*
+      [remote "origin"]
+      	pushurl = git@github.com:me/push.git
+      	url = git@github.com:me/repo.git
+      	fetch = +refs/heads/*:refs/remotes/origin/*
+      [branch "main"]
+      	remote = origin
+    """
+    assert { originUrl(config) == "git@github.com:me/repo.git" }
+    assert { originUrl("[core]\n\tbare = false\n") == null }
+    assert { originUrl("") == null }
+
+    let patch = [
+      "diff --git a/clean.go b/clean.go",
+      "--- a/clean.go",
+      "+++ b/clean.go",
+      "@@ -1 +1 @@",
+      "-old",
+      "+=======",
+      "diff --git a/conflicted.go b/conflicted.go",
+      "--- a/conflicted.go",
+      "+++ b/conflicted.go",
+      "@@ -1 +1,5 @@",
+      "+<<<<<<< ours",
+      " keep",
+      "+=======",
+      "+theirs",
+      "+>>>>>>> theirs",
+      "diff --git a/quoted.md b/quoted.md",
+      "--- a/quoted.md",
+      "+++ b/quoted.md",
+      "@@ -1 +1 @@",
+      "+  <<<<<<< not a marker: indented",
+    ].join("\n")
+    assert { conflictedFiles(patch) == ["conflicted.go"] }
+    assert { conflictedFiles("").isEmpty }
+    "Rebase helper checks passed."
+  }
+
+  """
+  Check the rebase pipeline on private fixtures: fork point, fast-forward,
+  replay, conflict landing, and recording the resolution.
+  """
+  checkRebaseReplay(source: Workspace!): String! @check {
+    # Returning a String keeps fixture commits local to this check; the
+    # caller's workspace and host checkout are never rebound or exported.
+    let root = "rebase-check-" + Random.string
+    let shared = root + "/shared.txt"
+    let seeded = source.git.head.asWorkspace.withNewFile(shared, "base\n")
+    let fork = seeded.withCommit(
+      changes: seeded.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture: fork point",
+      date: "2026-09-15T12:00:00Z",
+    )
+    # Upstream moves on: rewrites the shared file and adds one of its own.
+    let upstreamEdit = fork
+      .withNewFile(shared, "upstream\n")
+      .withNewFile(root + "/upstream.txt", "u\n")
+    let upstream = upstreamEdit.withCommit(
+      changes: upstreamEdit.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture: upstream change",
+      date: "2026-09-15T12:01:00Z",
+    )
+    # Our branch: one clean commit, then one that collides with upstream.
+    let cleanEdit = fork.withNewFile(root + "/ours.txt", "o\n")
+    let clean = cleanEdit.withCommit(
+      changes: cleanEdit.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture: ours, clean",
+      date: "2026-09-15T12:02:00Z",
+    )
+    let collidingEdit = clean.withNewFile(shared, "ours\n")
+    let origin = collidingEdit.withCommit(
+      changes: collidingEdit.git.uncommitted.filter(include: [root + "/**"]),
+      message: "fixture: ours, colliding\n\nKeeps its body.",
+      date: "2026-09-15T12:03:00Z",
+      authorName: "Rebase Fixture",
+      authorEmail: "fixture@example.com",
+    )
+
+    # The base keeps upstream's tip hash and is otherwise clean.
+    let newBase = rebasedBase(origin, head(upstream), "fixture-main")
+    assert { head(newBase).commitSHA == head(upstream).commitSHA }
+    assert { newBase.git.uncommitted.isEmpty }
+
+    # Our commits are listed from our side of the fork, as rebase does, then
+    # planned explicitly — oldest first, with the collision reported.
+    let ours = head(origin).log(limit: 10, base: head(upstream)).{{sha, parentShas}}
+    assert { ours.length == 2 }
+    assert { ours.all { c => c.parentShas.length == 1 } }
+    let plan = newBase.compareCommitsFrom(source: origin, commits: ours.map { c => c.sha }).{{
+      commit.{{sha, message}},
+      status,
+      conflictPaths
+    }}
+    assert { plan.map { p => p.status } == [WorkspaceCommitPickStatus.PICKABLE, WorkspaceCommitPickStatus.CONFLICT] }
+    assert { plan.map { p => p.conflictPaths } == [[], [shared]] }
+    let shas = plan.map { p => p.commit.sha }
+    let applied = newBase.withCommitsFrom(source: origin, commits: shas.takeFirst)
+    assert { head(applied).log(limit: 10, base: head(upstream)).{{sha}}.length == 1 }
+
+    # The colliding commit lands as a real three-way merge: markers carry both
+    # sides of the shared file, and nothing else in the tree is disturbed.
+    let colliding = shas.dropFirst.join("")
+    let landed = landConflict(origin, applied, colliding)
+    if (landed == null) {
+      raise "landing the colliding commit produced no pending edits"
+    }
+    let pendingPatch = landed.git.uncommitted.asPatch.contents
+    assert { conflictedFiles(pendingPatch) == [shared] }
+    let merged = landed.directory("/").file(shared).contents
+    assert { merged.contains("<<<<<<<") }
+    # A merge, not the git-apply fallback (whose markers say so).
+    assert { !merged.contains("rejected hunk") }
+    assert { merged.contains("upstream\n") }
+    assert { merged.contains("ours\n") }
+    assert { landed.git.uncommitted.diffStats.{{path}}.map { s => s.path } == [shared] }
+    assert { landed.directory("/").file(root + "/upstream.txt").contents == "u\n" }
+
+    # Resolve, then record with the original identity, as rebaseContinue does.
+    let resolved = landed.withNewFile(shared, "upstream+ours\n")
+    let original = repository(origin).commit(id: colliding).{{
+      message,
+      authorName,
+      authorEmail,
+      authoredDate
+    }}
+    let done = resolved.withCommit(
+      changes: resolved.git.uncommitted,
+      message: original.message,
+      date: original.authoredDate,
+      authorName: original.authorName,
+      authorEmail: original.authorEmail,
+    )
+    let top = head(done).targetCommit.{{message, authorName, authorEmail}}
+    assert { top.authorName == "Rebase Fixture" }
+    assert { top.authorEmail == "fixture@example.com" }
+    assert { top.message.trimSpace == original.message.trimSpace }
+    assert { done.git.uncommitted.isEmpty }
+    assert { done.directory("/").file(shared).contents == "upstream+ours\n" }
+    assert { head(done).log(limit: 10, base: head(upstream)).{{sha}}.length == 2 }
+    # Nothing of the origin is left to replay.
+    assert { done.compareCommitsFrom(source: origin).{{status}}.all { p => p.status != WorkspaceCommitPickStatus.PICKABLE } }
+    "Rebase replay checks passed."
   }
 
   """
@@ -736,6 +1150,268 @@ type Committer {
     `This workspace has no readable git history (${plainError(reason)}). ` + "Your pending edits are still visible with status / diff."
   }
 
+  let repository(source: Workspace!): GitRepository! {
+    source.git.head.asRepository
+  }
+
+  # The engine bounds a replay by the commits on EITHER side of the fork
+  # point — upstream's new commits count, not just ours — and 1000 is the
+  # most it accepts. A busy upstream can outrun that in weeks.
+  let replayBound: Int! = 1000
+
+  # Engine replay failures in rebase vocabulary. The bound is the one
+  # failure with a workaround worth spelling out; everything else passes
+  # through cleaned.
+  let replayError(doing: String!, onto: String!, reason: String!): String! {
+    if (reason.contains("maxCommits")) {
+      return `rebase: ${doing} failed: ${onto} has moved more than ${toString(replayBound)} commits past this branch's fork point, ` + "which is more than the engine can replay across at once. Rebase onto an older commit of it first " + `(onto: "<sha>"), then onto ${onto}.`
+    }
+    `rebase: ${doing} failed: ${plainError(reason)}`
+  }
+
+  # The new base for a rebase: `origin` rewound to where it forked from
+  # `upstream`, then fast-forwarded to upstream's tip. Built from the
+  # workspace itself rather than from a checkout of the upstream branch, so
+  # the result stays this workspace — its remote routing, its config — with
+  # only HEAD moved. (The rewind does detach HEAD; the finished rebase says
+  # so and names the branch in its push hint.)
+  let rebasedBase(origin: Workspace!, upstream: GitRef!, label: String!): Workspace! {
+    let ontoSha = upstream.commitSHA
+    let baseSha = head(origin).commonAncestor(other: upstream).commitSHA rescue {
+      e: Error => raise `rebase: this branch and ${label} share no history: ${plainError(e.message)}`
+    }
+    let rewound = origin.withReset(commit: baseSha, hard: true)
+    let newBase = if (baseSha == ontoSha) {
+      rewound
+    } else {
+      rewound.withCommitsFrom(source: upstream.asWorkspace, maxCommits: replayBound)
+    }
+    let newBaseSha = head(newBase).commitSHA rescue {
+      e: Error => raise replayError(`fast-forwarding to ${label} (${short(ontoSha)})`, label, e.message)
+    }
+    # Fast-forwards keep hashes; anything else would mean upstream's commits
+    # were copied instead of adopted, and the "rebased" branch would then
+    # diverge from the branch it claims to sit on.
+    if (newBaseSha != ontoSha) {
+      raise `rebase: adopting ${label} produced ${short(newBaseSha)} instead of its tip ${short(ontoSha)}; refusing to rebase onto rewritten history`
+    }
+    newBase
+  }
+
+  # Land origin's commit `sha` on `applied` as pending edits, with conflict
+  # markers where the two sides disagree.
+  #
+  # A three-way merge, as `git cherry-pick` does it: the commit's parent tree
+  # is the base, the rebased tree is ours (expressed as a changeset from that
+  # parent), and the commit's own changeset is theirs. Hunks land where the
+  # code has moved to, and markers show both sides. When git cannot merge
+  # (binary conflicts), fall back to a plain `git apply` that inlines the
+  # rejected hunks at their original lines; when even that refuses (a file
+  # the patch creates already exists), return null and leave the tree clean.
+  let landConflict(origin: Workspace!, applied: Workspace!, sha: String!): Workspace {
+    let commit = repository(origin).commit(id: sha)
+    let parent = commit.parentShas.takeFirst.join("")
+    let tree = applied.directory("/")
+    let merged = if (parent == "") {
+      null
+    } else {
+      let base = repository(origin).commit(id: parent).tree(discardGitDir: true)
+      let ours = tree.changes(from: base)
+      let theirs = commit.changes
+      let result = ours.withChangeset(theirs, onConflict: ChangesetMergeConflict.LEAVE_CONFLICT_MARKERS).after
+      applied.withChanges(result.changes(from: tree))
+    }
+    if (merged != null) {
+      let ok = merged.git.uncommitted.isEmpty rescue {
+        e: Error => null
+      }
+      if (ok != null) {
+        return merged
+      }
+    }
+    let patched = applied.withChanges(
+      tree.withPatch(commit.changes.asPatch.contents, onConflict: PatchConflict.LEAVE_CONFLICT_MARKERS).changes(from: tree),
+    )
+    # Force the apply here; the failure decides which workspace to hand back.
+    patched.git.uncommitted.isEmpty rescue {
+      e: Error => return null
+    }
+    patched
+  }
+
+  # One round of the rebase: replay `remaining` (origin commits, oldest first)
+  # onto `current` up to the first conflict. Everything before it is applied
+  # with authorship intact; the conflicting commit lands in the working tree
+  # with conflict markers and the rest is remembered for rebaseContinue. With
+  # nothing left to replay, the rebase is finished.
+  #
+  # The plan is recomputed every round rather than once up front: whether a
+  # later commit conflicts depends on how the earlier one was resolved.
+  let advance(
+    llm: LLM!,
+    origin: Workspace!,
+    current: Workspace!,
+    remaining: [String!]!,
+    onto: String!,
+    ontoSha: String!,
+    oldHead: String!,
+    branch: String!,
+    note: String!,
+  ): LLM! {
+    let plan = if (remaining.isEmpty) {
+      []
+    } else {
+      current.compareCommitsFrom(source: origin, commits: remaining, maxCommits: replayBound).{{
+        commit.{{sha, message}},
+        status,
+        conflictPaths
+      }}
+    }
+    let ahead = plan.takeWhile { p => p.status != WorkspaceCommitPickStatus.CONFLICT }
+    let pickable = ahead
+      .filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
+      .map { p => p.commit.sha }
+    let applied = if (pickable.isEmpty) {
+      current
+    } else {
+      current.withCommitsFrom(source: origin, commits: pickable, maxCommits: replayBound)
+    }
+    # Force the replay HERE, with the commits involved in hand.
+    let appliedHead = head(applied).commitSHA rescue {
+      e: Error => raise replayError(`replaying ${toString(pickable.length)} commit(s) onto ${onto}`, onto, e.message)
+    }
+    let dropped = ahead.filter { p => p.status != WorkspaceCommitPickStatus.PICKABLE }
+    let progress = [note].filter { n => n != "" }
+      + (if (pickable.isEmpty) { [] } else { [`Replayed ${toString(pickable.length)} commit(s): ${pickable.map { s => short(s) }.join(", ")}.`] })
+      + (if (dropped.isEmpty) { [] } else { [`Dropped ${toString(dropped.length)} already upstream: ` + dropped.map { p => `${short(p.commit.sha)} ${subject(p.commit.message)}` }.join(", ") + "."] })
+
+    let rest = plan.dropFirst(ahead.length)
+    let conflict = rest[0]
+    if (conflict == null) {
+      return finished(llm, applied, onto, ontoSha, oldHead, branch, progress)
+    }
+
+    # Land the conflicting commit as pending edits with markers; when even
+    # that is impossible the tree stays clean and the change is the agent's
+    # to make by hand from `show`.
+    let sha = conflict.commit.sha
+    let landed = landConflict(origin, applied, sha)
+    let stopped = landed ?? applied
+    let how = if (landed == null) {
+      `Its changes could not be merged in; the tree is clean. Recreate the change by hand (show(commit: "${short(sha)}") has the patch), then rebaseContinue.`
+    } else {
+      let marked = conflictedFiles(landed.git.uncommitted.asPatch.contents)
+      let where = if (marked.isEmpty) { conflict.conflictPaths } else { marked }
+      `Its changes are in your working tree, with conflict markers in ${where.join(", ")}: ` + "between <<<<<<< and ======= is the rebased tree's side, between ======= and >>>>>>> is the commit's. " + `Resolve them (show(commit: "${short(sha)}") shows the original change), then rebaseContinue to record the commit and carry on.`
+    }
+
+    let tools = currentNode.{{... on Dagger.Committer!}}.withRebaseState(
+      origin: origin,
+      remaining: rest.dropFirst.map { p => p.commit.sha },
+      stopped: sha,
+      stoppedHead: appliedHead,
+      onto: onto,
+      ontoSha: ontoSha,
+      oldHead: oldHead,
+      branch: branch,
+    )
+    print((progress + [
+      `Rebase onto ${onto} (${short(ontoSha)}) STOPPED at ${short(sha)} "${subject(conflict.commit.message)}"; ` + `${toString(rest.length - 1)} commit(s) still to replay after it.`,
+      how,
+      "rebaseSkip drops this commit instead; rebaseAbort restores " + `${short(oldHead)}.`,
+    ]).join("\n"))
+    llm.withTools(tools, except: plumbing).withWorkspace(stopped)
+  }
+
+  let finished(
+    llm: LLM!,
+    result: Workspace!,
+    onto: String!,
+    ontoSha: String!,
+    oldHead: String!,
+    branch: String!,
+    progress: [String!]!,
+  ): LLM! {
+    let newHead = head(result).commitSHA
+    let onTop = head(result).log(limit: 1000, base: repository(result).ref(name: ontoSha)).{{sha}}.length
+    let summary = if (newHead == oldHead) {
+      `Already up to date with ${onto} (${short(ontoSha)}); nothing to rebase.`
+    } else {
+      # Rewinding detached HEAD, so a bare `push` has no branch to go to:
+      # spell out the call, branch included.
+      let target = if (branch == "") { "<branch>" } else { branch }
+      `Rebased onto ${onto} (${short(ontoSha)}): HEAD ${short(oldHead)} -> ${short(newHead)}, ` + `${toString(onTop)} commit(s) on top. ` + (if (branch == "") { "HEAD is detached; " } else { `HEAD is detached from ${branch}; ` }) + `to publish, push(branch: "${target}", expectedRemoteSHA: "<the sha the remote branch has now>") — ` + `the lease is required because the branch's history was rewritten (${short(oldHead)} if nothing was pushed since).`
+    }
+    let tools = currentNode.{{... on Dagger.Committer!}}.withoutRebaseState
+    print((progress + [summary]).join("\n"))
+    llm.withTools(tools, except: plumbing).withWorkspace(result)
+  }
+
+  # The branch a workspace's HEAD is on, or "" when detached (the ref name
+  # is then the commit itself).
+  let branchOf(source: Workspace!): String! {
+    let name = head(source).name rescue {
+      e: Error => ""
+    }
+    if (name.hasPrefix("refs/heads/")) {
+      return name.trimPrefix("refs/heads/")
+    }
+    if (name.containsMatch(`^[0-9a-f]{40}$`) or name == "HEAD") {
+      return ""
+    }
+    name
+  }
+
+  # Where `rebase` fetches from: an explicit repo, else the origin remote
+  # recorded in the checkout's git config, else the repository's logical URL.
+  let remoteUrl(source: Workspace!, repo: String!): String! {
+    if (repo.trimSpace != "") {
+      return repo.trimSpace
+    }
+    let config = source.git.directory.file("config").contents rescue {
+      e: Error => ""
+    }
+    let fromConfig = originUrl(config)
+    if (fromConfig != null) {
+      return fromConfig
+    }
+    let logical = repository(source).url rescue {
+      e: Error => null
+    }
+    if (logical != null and logical != "") {
+      return logical
+    }
+    raise "rebase: cannot tell where to fetch from — the checkout has no origin remote; pass repo: with the repository's git URL"
+  }
+
+  # The origin remote's fetch URL in a git config, or null when it has none.
+  let originUrl(config: String!): String {
+    # `\n\s*url` keeps a `pushurl` line from matching.
+    let m = config.match(`\[remote "origin"\][^\[]*?\n\s*url\s*=\s*(\S+)`)
+    if (m == null) {
+      return null
+    }
+    m.captures[0]
+  }
+
+  # Files in a patch that still carry conflict markers. Only the opening and
+  # closing markers count: a line of seven `=` is legitimate content (a
+  # setext heading, a comment rule).
+  let conflictedFiles(patch: String!): [String!]! {
+    let files: [String!]! = []
+    let current = ""
+    patch.split("\n").each { line =>
+      let header = line.match(`^diff --git a/.* b/(.*)$`)
+      if (header != null) {
+        current = header.captures[0] ?? ""
+      }
+      if (line.containsMatch(`^\+(<{7}|>{7})( |$)`) and !files.contains(current)) {
+        files += [current]
+      }
+    }
+    files
+  }
+
   # Resolve full or abbreviated hashes and named refs through the engine.
   # HEAD/empty uses the tip already resolved by the caller's first read.
   let resolveSpec(source: Workspace!, spec: String!, headSha: String!): String! {
@@ -743,9 +1419,33 @@ type Committer {
     if (want == "" or want == "HEAD") {
       return headSha
     }
-    source.git.head.asRepository.ref(name: want).commitSHA rescue {
-      e: Error => raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
+    repository(source).ref(name: want).commitSHA rescue {
+      e: Error => {
+        # Mid-rebase, the commits being replayed are only reachable from the
+        # workspace the rebase started from: the rewind orphaned them here.
+        let origin = rebaseOrigin
+        if (origin != null) {
+          repository(origin).ref(name: want).commitSHA rescue {
+            e2: Error => raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
+          }
+        } else {
+          raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
+        }
+      }
     }
+  }
+
+  # The repository holding `sha`: the workspace's own, or — mid-rebase — the
+  # origin workspace's, for the commits the rewind orphaned.
+  let repositoryHolding(source: Workspace!, sha: String!): GitRepository! {
+    let origin = rebaseOrigin
+    if (origin == null) {
+      return repository(source)
+    }
+    repository(source).commit(id: sha).sha rescue {
+      e: Error => return repository(origin)
+    }
+    repository(source)
   }
 
   let statBlock(
@@ -800,10 +1500,19 @@ type Committer {
   }
 
   let banner(source: Workspace!): String! {
-    let branch = head(source).name.trimPrefix("refs/heads/") rescue {
-      e: Error => "?"
+    let branch = branchOf(source)
+    let sha = short(head(source).commitSHA)
+    let where = if (branch == "") { `HEAD detached at ${sha}` } else { `On ${branch}, HEAD ${sha}` }
+    rebaseBanner + where + "."
+  }
+
+  # A line for status and log while a rebase is stopped, so its state is
+  # visible without re-reading the rebase tool's own output. Empty otherwise.
+  let rebaseBanner: String! {
+    if (rebaseOrigin == null) {
+      return ""
     }
-    `On ${branch}, HEAD ${short(head(source).commitSHA)}.`
+    `REBASE onto ${rebaseOnto} in progress, stopped at ${short(rebaseStopped)}: resolve the conflict markers, then rebaseContinue (or rebaseSkip / rebaseAbort).` + "\n\n"
   }
 
   let emptyLog(paths: [String!]!, grep: String): String! {
@@ -942,6 +1651,17 @@ type Committer {
       pending edits; other targets keep your current working tree.
       Rewriting published history needs explicit authorization, not an
       automatic force push after a rejection.
+    - `rebase` — replay this branch's commits onto the current tip of a
+      remote branch (`onto: "main"`), keeping authors and dates. It stops at
+      the first commit that conflicts: the earlier ones are already on the
+      new base, and the conflicting one is merged three-way into your
+      working tree with <<<<<<< markers. Resolve them with your edit tools —
+      do not give up on the commit — then `rebaseContinue` records it
+      (original message and author kept; pass `message` to amend) and
+      replays the rest, stopping again if needed. `rebaseSkip` drops the
+      stopped commit, `rebaseAbort` restores the pre-rebase workspace. Needs
+      a clean tree; it does not push, and leaves HEAD detached — the finished
+      rebase prints the `push(branch:, expectedRemoteSHA:)` call to publish.
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
