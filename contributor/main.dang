@@ -40,7 +40,10 @@
 #   simply auto-fill from the new binding — and the target workspace's agents,
 #   if it has any, are composed ON TOP (minus modules the originating
 #   workspace already provides). A checked-out workspace refuses export by
-#   construction, so the only way its changes leave is commit + push.
+#   construction, so the only way its changes leave is commit + push. The
+#   old workspace's pending edits stay behind unless named in `keep`, which
+#   overlays them onto the fresh checkout as uncommitted edits — the escape
+#   hatch for scratch work, or a task begun on the wrong branch.
 #
 # These replace the old monolithic `contribute` tool, which predated
 # committer's push and the staff module: it fetched the repo, ran a
@@ -717,10 +720,13 @@ type Contributor {
   defines agents of its own, they are composed on top of your toolset,
   except modules your originating workspace already provides.
 
-  The switch is one-way for this conversation: your previous workspace —
-  pending changes included — is left behind, and there is no tool to switch
-  back. So when the errand is a side quest, hand it to a staff worker (its
-  workspace is a disposable copy) instead of switching yourself.
+  The switch is one-way for this conversation: your previous workspace is
+  left behind, and there is no tool to switch back. Pending changes go with
+  it unless you name them in `keep`: those files are carried into the new
+  checkout as uncommitted edits, exactly as they are now — for scratch work
+  you never meant to commit, or a task you began on the wrong branch. So
+  when the errand is a side quest, hand it to a staff worker (its workspace
+  is a disposable copy) instead of switching yourself.
 
   A checked-out workspace cannot export back to the host: the only way work
   leaves it is commit + push (then submitPr). Git authentication is handled
@@ -738,6 +744,16 @@ type Contributor {
     Branch to check out. Empty checks out the repository's default branch.
     """
     branch: String! = "",
+    """
+    Glob patterns of pending changes to carry into the new checkout, relative
+    to the workspace root (e.g. "notes/**" or "scratch.md") — the same
+    patterns `status` and `commit` take. Matching files land in the target
+    as uncommitted edits with the content they have here, replacing whatever
+    the target has at those paths; a pending deletion removes the path
+    there too. Everything else pending is left behind. Fails when nothing
+    pending matches, rather than switching and losing it.
+    """
+    keep: [String!]! = [],
     """
     Also compose the target workspace's own agents onto your toolset. Their
     modules' code and prompts come from the target repository — disable this
@@ -760,9 +776,42 @@ type Contributor {
     let label = ref.name.trimPrefix("refs/heads/") rescue {
       e: Error => "HEAD"
     }
-    let where = `${repo}@${label} (${short(sha)})`
 
-    let target = ref.asWorkspace
+    # Pending changes selected by `keep`, resolved against the OLD workspace
+    # before anything switches. An explicit selection that matches nothing
+    # is refused: silently dropping the very files the agent asked to keep is
+    # the loss this argument exists to prevent.
+    let kept = source.git.uncommitted.filter(include: keep)
+    let keptPaths = if (keep.isEmpty) {
+      []
+    } else {
+      kept.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") }
+    }
+    if (!keep.isEmpty and keptPaths.isEmpty) {
+      raise `nothing pending matches keep: ${keep.join(", ")} (status shows what is pending)`
+    }
+
+    # A changeset applies as an overlay — files replaced wholesale, deletions
+    # removed — so pending edits from one repository land in an unrelated
+    # tree without needing a common baseline: the file arrives as it is here.
+    let target = if (keptPaths.isEmpty) {
+      ref.asWorkspace
+    } else {
+      let carried = ref.asWorkspace.withChanges(kept)
+      # Force the overlay HERE too, for the same reason as the resolution:
+      # reading the target's pending changes back evaluates the apply.
+      carried.git.uncommitted.diffStats.{{path}}.length rescue {
+        e: Error => raise `cannot carry pending changes into ${repo}: ${plainError(e.message)}`
+      }
+      carried
+    }
+    let keptNote = if (keptPaths.isEmpty) {
+      ""
+    } else {
+      ` with ${toString(keptPaths.length)} pending file(s) kept: ${keptPaths.join(", ")}`
+    }
+    let where = `${repo}@${label} (${short(sha)})` + keptNote
+
     let switched = llm.withWorkspace(target)
     if (!composeAgents) {
       print(`Checked out ${where}. Your tools now operate on this checkout.`)
@@ -998,10 +1047,14 @@ type Contributor {
     an upstream bug in a dependency. Your tools come along and simply
     operate on the new checkout, and any agents the target workspace itself
     defines are composed on top of them. The switch is one-way: your
-    previous workspace, pending changes included, is left behind. A checked
-    out workspace cannot export back to the host — its work leaves only by
-    commit + push — so the full errand is checkout → edit → commit → push
-    (or pushBranch, to a fork) → submitPr.
+    previous workspace is left behind, pending changes included — unless
+    you name them in `keep` (glob patterns, like `commit`'s paths), which
+    carries those files into the new checkout as uncommitted edits. That is
+    the way out when you have scratch edits you never meant to commit, or
+    realize you started from the wrong branch. A checked-out workspace
+    cannot export back to the host — its work leaves only by commit + push
+    — so the full errand is checkout → edit → commit → push (or pushBranch,
+    to a fork) → submitPr.
 
     Because checkout is one-way, prefer delegating the whole errand when you
     have the means to (e.g. a staff worker or sub-agent whose workspace is a
