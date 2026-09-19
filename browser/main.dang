@@ -1,0 +1,234 @@
+# Optional: dagger install github.com/vito/agents/browser
+# Deliberately not installed in this repository's default agent composition.
+"""
+Real-browser QA of pending workspace edits, with fixtures and retained evidence.
+Each run owns a fresh browser; page state persists within a script, not across runs.
+"""
+type Browser {
+  let runs: Map[Container!]! = [:]
+  let playwrightVersion = "1.58.2"
+  let plumbing = ["prepared", "checkRunner", "checkTools", "checkWorkspace", "checkBrowsers"]
+  let source: Directory!
+
+  new(source: Directory! @defaultPath(path: ".")) {
+    self.source = source
+    self
+  }
+
+  agent(base: LLM!): LLM! @agent {
+    base.withTools(currentNode, except: plumbing).withSystemPrompt(systemPrompt)
+  }
+
+  """
+  Pinned Playwright runtime for custom harnesses (e.g. sandbox.exec). Includes
+  Chromium, Firefox, WebKit and @playwright/test at the matching version, without
+  installing or changing project dependencies. Node can resolve the prepared
+  package through NODE_PATH; the CLI is on PATH. Project-specific dependencies
+  and Playwright configuration remain the caller's responsibility.
+  """
+  prepared: Container! {
+    container.from("mcr.microsoft.com/playwright:v" + playwrightVersion + "-noble")
+      .withWorkdir("/opt/browser")
+      .withExec(["npm", "install", "--no-audit", "--no-fund", "--save-exact", "@playwright/test@" + playwrightVersion])
+      .withEnvVariable("NODE_PATH", "/opt/browser/node_modules")
+      .withEnvVariable("PATH", "/opt/browser/node_modules/.bin:$PATH", expand: true)
+      .withEnvVariable("CI", "true")
+      .withFile("/opt/browser/runner.cjs", source.file("runner.cjs"))
+  }
+
+  """
+  Run async Playwright code against a snapshot of CURRENT workspace files,
+  including pending edits. Exactly one of root/url and script/scriptPath is
+  required. root is a workspace directory to serve; url connects to an app.
+  No navigation occurs until your script calls page.goto(baseURL).
+
+  Bindings: page, context, browser, baseURL, expect (@playwright/test), assert
+  (node:assert/strict), require (Node), console (captured), check(name, async fn),
+  mock(pattern, response|null), screenshot(name). Await check/mock/screenshot.
+  check records assertion failures and continues; an uncaught script error is
+  also a failed check, not a tool error.
+  mock uses Playwright URL globs; the latest matching fixture wins, reusing a
+  pattern replaces it, null removes it. Responses have optional status/headers
+  and exactly one of json/body/file. Files are relative to the source snapshot.
+  Updating mocks affects future requests without reloading the page.
+
+  Example: await mock('**/snapshot.json', {json: {tools: []}});
+  await page.goto(baseURL); await check('empty', async () => {
+    await expect(page.locator('#tools')).toBeEmpty();
+  }); await screenshot('empty.png');
+
+  Returns a run handle and bounded summary. Retrieve full results.json, console
+  and network evidence, screenshot and trace.zip with artifacts/readArtifact/
+  artifact. Browser reports never become pending workspace edits. A fresh browser
+  and profile are closed after every run, including failures and timeouts.
+  """
+  run(
+    ws: Workspace!,
+    root: String = null,
+    url: String = null,
+    script: String = null,
+    scriptPath: String = null,
+    browser: String! = "chromium",
+    width: Int! = 1280,
+    height: Int! = 720,
+    timeoutMs: Int! = 30000,
+    """Optional Dagger service, explicitly bound under serviceHostname."""
+    service: Service = null,
+    serviceHostname: String! = "app",
+  ): Browser! @cache(policy: FunctionCachePolicy.Never) {
+    if ((root == null) == (url == null)) { raise "provide exactly one of root or url" }
+    if ((script == null) == (scriptPath == null)) { raise "provide exactly one of script or scriptPath" }
+    if (!["chromium", "firefox", "webkit"].contains(browser)) { raise "browser must be chromium, firefox, or webkit" }
+    if (width < 1 or height < 1 or width > 8192 or height > 8192) { raise "viewport dimensions must be between 1 and 8192" }
+    if (timeoutMs < 1 or timeoutMs > 300000) { raise "timeoutMs must be between 1 and 300000" }
+    let source = if (root == null) { ws.directory("/") } else { ws.directory(root) }
+    let code = if (scriptPath == null) { script } else { ws.file(scriptPath).contents }
+    let fingerprint = source.digest
+    let input = JSON.encode({{
+      root: root != null,
+      url: if (url == null) { "" } else { url },
+      script: code,
+      browser: browser,
+      width: width,
+      height: height,
+      timeoutMs: timeoutMs,
+      fingerprint: fingerprint,
+    }})
+    let id = Random.string
+    let ctr = prepared.withDirectory("/workspace", source)
+      .withNewFile("/input.json", input)
+      .withEnvVariable("BROWSER_RUN_NONCE", id)
+    if (service != null) { ctr = ctr.withServiceBinding(serviceHostname, service) }
+    let result = ctr.withExec(["node", "/opt/browser/runner.cjs", "/input.json"])
+    print(result.stdout)
+    self.runs = self.runs.with(id, result)
+    print("Run: " + id + "\nUse artifacts/readArtifact/artifact with this handle for the full evidence.")
+    self
+  }
+
+  let result(run: String!): Container! {
+    let value = runs[run]
+    if (value == null) { raise "unknown run: " + run }
+    value
+  }
+
+  """List retained artifact paths for a run. These are not workspace files."""
+  artifacts(run: String!): String! {
+    result(run).directory("/artifacts").glob("**/*").join("\n")
+  }
+
+  """
+  Return an actual Dagger File handle for a screenshot, trace.zip, or full log.
+  Export/view it explicitly; this never copies artifacts into the workspace.
+  """
+  artifact(run: String!, path: String!): File! {
+    if (path == "" or path.hasPrefix("/") or path.split("/").contains("..")) { raise "artifact path must be relative, without .." }
+    result(run).directory("/artifacts").file(path)
+  }
+
+  """Read a text artifact with line offsets; use artifact for binary files."""
+  readArtifact(run: String!, path: String! = "results.json", offset: Int! = 0, limit: Int! = 100): String! {
+    if (offset < 0 or limit < 1 or limit > 1000) { raise "offset must be nonnegative; limit must be 1..1000" }
+    let lines = artifact(run, path).contents.split("\n")
+    lines.dropFirst(offset).takeFirst(limit).join("\n")
+  }
+
+  """Exercise the runner in real Chromium, including failure artifacts and polling."""
+  checkRunner: Void @check {
+    prepared
+      .withFile("/opt/browser/tests/runner.cjs", source.file("tests/runner.cjs"))
+      .withExec(["node", "--test", "/opt/browser/tests/runner.cjs"])
+      .sync
+    null
+  }
+
+  """Verify pending snapshots, script files, retained evidence, and service binding."""
+  checkWorkspace(ws: Workspace!): Void @check {
+    # Private workspace forks: the check never returns workspace changes.
+    let root = "/browser-check-" + Random.string
+    let testScript = """
+      await check('starts blank', async () => assert.equal(page.url(), 'about:blank'));
+      await page.goto(baseURL);
+      await check('pending title', async () => await expect(page).toHaveTitle('pending-first'));
+    """
+    let first = ws.withNewFile(root + "/index.html", "<title>pending-first</title>")
+      .withNewFile(root + "/test.cjs", testScript)
+    let a = run(first, root: root, scriptPath: root + "/test.cjs")
+    let aID = a.runs.keys[0] ?? ""
+    let firstReport = a.artifact(aID, "results.json").contents
+    assert { firstReport.contains("\"ok\": true") }
+    assert { firstReport.contains(first.directory(root).digest) }
+    assert { a.artifacts(aID).contains("trace.zip") }
+    assert { a.artifact(aID, "screenshot.png").size > 0 }
+    assert { a.readArtifact(aID, offset: 1, limit: 2).split("\n").length == 2 }
+
+    let second = first.withNewFile(root + "/index.html", "<title>pending-second</title>")
+    let b = a.run(second, root: root, script: testScript, timeoutMs: 1500)
+    let bID = b.runs.keys.filter { id => id != aID }[0] ?? ""
+    let secondReport = b.artifact(bID, "results.json").contents
+    assert { secondReport.contains("\"ok\": false") }
+    assert { secondReport.contains(second.directory(root).digest) }
+    assert { first.directory(root).digest != second.directory(root).digest }
+    assert { b.artifact(aID, "results.json").contents == firstReport }
+
+    let service = container.from("node:22-bookworm-slim")
+      .withDefaultArgs(["node", "-e", "require('http').createServer((q,r)=>r.end('<title>service</title>')).listen(8080,'0.0.0.0')"])
+      .withExposedPort(8080).asService
+    let c = run(ws, url: "http://app:8080", service: service, script: "await page.goto(baseURL); await check('bound service', async () => await expect(page).toHaveTitle('service'));")
+    let cID = c.runs.keys[0] ?? ""
+    assert { c.artifact(cID, "results.json").contents.contains("\"ok\": true") }
+    null
+  }
+
+  """Smoke-test every bundled browser, reporting the actual installed versions."""
+  checkBrowsers: Void @check {
+    prepared.withExec(["node", "-e", """
+      (async () => {
+        for (const name of ['chromium', 'firefox', 'webkit']) {
+          const browser = await require('@playwright/test')[name].launch();
+          const page = await browser.newPage();
+          await page.setContent('<title>ready</title>');
+          require('node:assert/strict').equal(await page.title(), 'ready');
+          console.log(name + ': ' + browser.version());
+          await browser.close();
+        }
+      })().catch(error => { console.error(error); process.exit(1); });
+    """]).sync
+    null
+  }
+
+  """Keep prepared containers and checks out of the agent's browser toolbox."""
+  checkTools: Void @check {
+    let tools = agent(llm).tools
+    assert { plumbing.all { tool => !tools.contains(tool) } }
+    null
+  }
+
+  let systemPrompt = """
+You have optional browser QA tools. browser.run tests CURRENT workspace edits
+in a prepared Playwright container, without adding project dependencies or scratch
+runner files. Give exactly one of root (serve that workspace directory) or url
+(existing app), and one of script (async JS body) or scriptPath (workspace file).
+
+Every run is isolated: no persistent browser session between tool calls. Put a
+whole state-retention/polling scenario in one script. Register mocks BEFORE
+page.goto(baseURL); await check(name, async () => {...}) for named assertions.
+Use page/context for interaction, page.locator(...).ariaSnapshot() for accessibility,
+page.content() for DOM, and screenshot(name) for retained screenshots. You may use
+Node require to write extra evidence under /artifacts, never under /workspace.
+
+Read the summary and actual failures, not merely tool success: failed assertions
+are results. Full results and logs remain readable with readArtifact; artifact
+returns a File for screenshots/traces. Report the browser/version and source
+fingerprint tested. Do not claim live-backend integration from synthetic fixtures.
+
+This is arbitrary test code in a Dagger container, NOT a security sandbox for
+untrusted scripts. No host credentials, browser profile, sockets, host-network
+mapping or Dagger API are mounted. Ordinary container network access is available;
+only test authorized URLs. Bind Dagger services explicitly. Do not import ambient
+credentials or perform authenticated testing without the user's authorization.
+Artifacts stay in module state for this conversation (not across recomposition).
+For an existing project harness, browser:prepared is a Container address usable
+with sandbox; it supplies the pinned runtime, not project dependency installation.
+"""
+}
