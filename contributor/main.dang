@@ -44,6 +44,19 @@
 #   commit → pushBranch(repo: "you/fork", branch: "fix-x") →
 #   `gh pr create --head you:fix-x`.
 #
+# - `mount` attaches ANOTHER repository's checkout to the workspace,
+#   read-only, under mnt/<name> (Workspace.withMountedDirectory): the
+#   agent's own read/grep/find then work on it, with their line offsets and
+#   limits, while the mount stays outside the pending changeset — never in
+#   status/diff, never committed or exported. Without it, agents reach for
+#   `gh api repos/../contents/..`, which hands back base64 they cannot
+#   read; that endpoint is denied so the cheap mistake has no path. The
+#   mount root is fixed at mnt/ so the gh toolbox can exclude it (a
+#   mounted checkout can be large, and Workspace.directory includes
+#   mounts). This is the first leg of the journey this module is shaped
+#   around: study a dependency with full tool capabilities → find the fix
+#   belongs upstream → hand a worker the checkout + push + PR.
+#
 # - `checkout` re-points the agent at a DIFFERENT repository: it fetches a
 #   git repo as a Workspace (GitRef.asWorkspace) and returns a continuation
 #   of the current conversation bound to that checkout. The agent keeps its
@@ -96,8 +109,9 @@ let head(s: String!, lines: Int! = patchLines): String! {
 """
 GitHub operations: run the `gh` CLI against the workspace's checkout, post
 agent-marked comments on issues and pull requests and edit them
-surgically, read pull request review threads with their diff context, push
-to a fork, and switch the conversation to a checkout of another repository.
+surgically, read pull request review threads with their diff context,
+mount other repositories into the workspace read-only, push to a fork, and
+switch the conversation to a checkout of another repository.
 """
 type Contributor {
   # Private so the secret is never exposed as a field/tool argument.
@@ -144,7 +158,7 @@ type Contributor {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: ["checkMountsOutsideToolbox"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -167,10 +181,11 @@ type Contributor {
 
   Not available here: account, config, secret, key, extension, alias and
   codespace management; `repo delete/archive/rename/edit`; `api` with a
-  DELETE method; `pr comment`, `issue comment` and `pr review` (use
-  `comment`, which marks the comment as agent-authored); and `pr edit`/
-  `issue edit` with `--body`/`--body-file` (use `updateComment`, which
-  edits text surgically instead of rewriting it).
+  DELETE method; `api` on the contents/blobs endpoints (use `mount`, then
+  read the files with your file tools); `pr comment`, `issue comment` and
+  `pr review` (use `comment`, which marks the comment as agent-authored);
+  and `pr edit`/`issue edit` with `--body`/`--body-file` (use
+  `updateComment`, which edits text surgically instead of rewriting it).
   """
   gh(
     source: Workspace!,
@@ -229,6 +244,9 @@ type Contributor {
     }
     if (cmd == "api" and hasMethod(args, "DELETE")) {
       raise "gh api with a DELETE method is not available from this tool: deleting things on GitHub is for the human operator to do."
+    }
+    if (cmd == "api" and args.any { a => a.containsMatch(contentsApi) }) {
+      raise "reading files through gh api is not available from this tool: the contents and blobs endpoints return base64, truncated and unreadable. " + "Use `mount` to mount the repository into the workspace, then read, grep and find under mnt/<name> like any other files."
     }
     if ((cmd == "pr" and (sub == "comment" or sub == "review")) or (cmd == "issue" and sub == "comment")) {
       raise `gh ${cmd} ${sub} is not available from this tool: ` + "use the `comment` tool instead, which marks the comment as agent-authored (\":robot:\") so readers can tell a machine wrote it."
@@ -647,6 +665,91 @@ type Contributor {
   }
 
   """
+  Mount another git repository's checkout into the workspace, read-only, to
+  study it with your regular file tools.
+
+  The tree appears under mnt/<name> and read, grep and find work on it like
+  on any other directory — with their usual line offsets and limits — but
+  it stays out of the pending changeset: never in status or diff, cannot be
+  edited, never committed or exported. This is how to read code that lives
+  in another repository (an upstream dependency, a project you were asked
+  about): NOT `gh api repos/.../contents/...`, which returns base64 and is
+  refused. The engine fetches each (repo, ref) once and caches it, so
+  mounting is cheap.
+
+  Mounting only reads. To work IN the other repository — edit, commit,
+  push — use `checkout` (one-way) or hand the errand to a worker. Mounts
+  belong to this workspace and do not follow a `checkout`.
+  """
+  mount(
+    source: Workspace!,
+    """
+    The repository: "owner/name" GitHub shorthand or a full git URL, e.g.
+    "dagger/dagger" or "https://github.com/dagger/dagger".
+    """
+    repo: String!,
+    """
+    Branch, tag, or commit to mount. Empty means the default branch.
+    """
+    ref: String! = "",
+    """
+    Directory name under mnt/ to mount at. Empty uses the repository's name
+    (mnt/dagger for dagger/dagger). Mounting at a name already in use
+    replaces that mount.
+    """
+    name: String! = "",
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): a branch ref resolves live; a later identical call
+    # must mount the repository as it is then.
+    let url = repoUrl(repo)
+    let repository = git(url)
+    let target = if (ref == "") {
+      repository.head
+    } else {
+      # ref() accepts a commit id, tag, branch, or fully-qualified ref.
+      repository.ref(ref)
+    }
+    # Force the resolution HERE, so a typo'd repo or ref fails as this call
+    # instead of poisoning every later read under the mount.
+    let sha = target.commitSHA rescue {
+      e: Error => raise `cannot mount ${repo}: ${plainError(e.message)}`
+    }
+    let dir = mountPath(if (name == "") { repoName(url) } else { name })
+
+    let at = if (ref == "") { "" } else { `@${ref}` }
+    print(`Mounted ${repo}${at} (${short(sha)}) read-only at ${dir}/ — read, grep and find work on it; unmount with unmount("${Path(dir).name}") when done.`)
+
+    source.withMountedDirectory(dir, target.tree(discardGitDir: true))
+  }
+
+  """
+  Remove a mount created with `mount`, restoring whatever the workspace had
+  at that path.
+  """
+  unmount(
+    source: Workspace!,
+    """
+    The mount's directory name under mnt/, e.g. "dagger" (or "mnt/dagger").
+    """
+    name: String!,
+  ): Workspace! {
+    source.withoutMount(mountPath(name.trimPrefix(mountRoot + "/")))
+  }
+
+  # Mounts stay out of the gh toolbox's snapshot: a mounted checkout can be
+  # large, and gh never needs it.
+  checkMountsOutsideToolbox: String! @check {
+    let ws = directory
+      .withNewFile("tmp/body.md", "draft\n")
+      .asWorkspace
+      .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
+    assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
+    let seen = toolboxTree(ws).entries
+    assert { seen.contains("tmp/") and !seen.contains("mnt/") }
+    "mounts are excluded from the toolbox snapshot"
+  }
+
+  """
   Switch this conversation to a checkout of a DIFFERENT git repository.
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
@@ -806,8 +909,51 @@ type Contributor {
       # else's.
       .withExec(["git", "config", "--global", "--add", "safe.directory", "*"])
       .withWorkdir("/workspace")
-      .withMountedDirectory("/workspace", source.directory("/"))
+      .withMountedDirectory("/workspace", toolboxTree(source))
       .withMountedDirectory("/workspace/.git", source.git.directory)
+  }
+
+  # The workspace files the toolbox sees. Workspace.directory includes
+  # mounted content (a mount shadows the tree at its path), so the mount
+  # root is excluded: a mounted checkout can be large, and gh never needs
+  # it.
+  let toolboxTree(source: Workspace!): Directory! {
+    source.directory("/", exclude: [mountRoot])
+  }
+
+  # Every `mount` lands under this workspace-relative directory, so the
+  # toolbox can exclude mounts without tracking them.
+  let mountRoot: String! = "mnt"
+
+  # REST paths that serve file contents base64-encoded: the repository
+  # contents endpoint (a directory listing is fine from `find` on a mount
+  # too) and git blobs. Matched against every `gh api` argument, path or
+  # full URL.
+  let contentsApi: Regexp! = `repos/[^/\s]+/[^/\s]+/(contents(/|\?|$)|git/blobs/)`
+
+  # The workspace-relative mount path for a mount name; rejects names that
+  # would escape the mount root.
+  let mountPath(name: String!): String! {
+    if (!name.containsMatch(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)) {
+      raise `invalid mount name ${JSON.encode(name)}: use a single directory name such as "dagger"`
+    }
+    mountRoot + "/" + name
+  }
+
+  # Expand GitHub "owner/name" shorthand into a clone URL; anything that
+  # already looks like a URL passes through.
+  let repoUrl(repo: String!): String! {
+    let r = repo.trimSpace
+    if (r.containsMatch(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)) {
+      "https://github.com/" + r
+    } else {
+      r
+    }
+  }
+
+  # The repository's name from its URL: the last path element, minus .git.
+  let repoName(url: String!): String! {
+    Path(url.trimSuffix("/").trimSuffix(".git")).name
   }
 
   let ghVersion: String! = "2.101.0"
@@ -1056,8 +1202,9 @@ type Contributor {
   let systemPrompt: String! = """
     You have GitHub tools: `gh` runs the GitHub CLI; `comment` and
     `updateComment` post and edit agent-marked comments; `reviewComments`
-    reads a pull request's review threads; `pushBranch` pushes to a fork;
-    `checkout` switches this conversation to another repository.
+    reads a pull request's review threads; `mount` attaches another
+    repository's checkout to your workspace, read-only; `pushBranch` pushes
+    to a fork; `checkout` switches this conversation to another repository.
 
     Use `gh` the way a human at a terminal would, and read its output as
     they would: `gh pr view 14174`, `gh pr view 14174 --comments`, `gh pr
@@ -1070,6 +1217,18 @@ type Contributor {
     github.com pages, which render as navigation noise. Bare numbers
     resolve against the configured remote (else the checkout's origin);
     pass `--repo owner/name` for another repository.
+
+    To READ code that lives in another repository — an upstream
+    dependency, a project you were asked about — `mount` it:
+    mount(repo: "dagger/dagger") attaches its checkout under mnt/dagger,
+    and your regular read, grep and find work on it like on any other
+    files, offsets and limits included. Pass `ref` to pin a branch, tag or
+    commit. Never read files through `gh api .../contents/...` or blobs:
+    they come back base64-encoded, and the tool refuses them. A mount is
+    read-only and stays out of status, diff and commits, so exploring is
+    side-effect-free; `unmount` when done. Three tiers for another
+    repository: `mount` to read it, `checkout` to work in it, a worker to
+    hand off the whole errand.
 
     To file an issue or open a pull request, write the body with your
     editor to a scratch file (e.g. tmp/body.md; the workspace is mounted,
@@ -1120,15 +1279,19 @@ type Contributor {
     you name them in `keep` (glob patterns, like `commit`'s paths), which
     carries those files into the new checkout as uncommitted edits. That is
     the way out when you have scratch edits you never meant to commit, or
-    realize you started from the wrong branch. A checked-out workspace
-    cannot export back to the host — its work leaves only by commit + push
-    — so the full errand is checkout → edit → commit → push (or pushBranch,
-    to a fork) → `gh pr create`.
+    realize you started from the wrong branch. Mounts do not follow: they
+    belong to the workspace being left. A checked-out workspace cannot
+    export back to the host — its work leaves only by commit + push — so
+    the full errand is checkout → edit → commit → push (or pushBranch, to
+    a fork) → `gh pr create`.
 
     Because checkout is one-way, prefer delegating the whole errand when you
     have the means to (e.g. a staff worker or sub-agent whose workspace is a
     disposable copy): tell it to checkout the repository, make the change,
-    commit, push, and open the PR, and your own workspace stays bound.
-    Only checkout yourself when switching repositories IS the task at hand.
+    commit, push, and open the PR, and your own workspace stays bound. The
+    natural shape: `mount` the dependency and investigate it with your full
+    toolset here; once you know the fix belongs upstream, hand a worker the
+    checkout, the change, and the push. Only checkout yourself when
+    switching repositories IS the task at hand.
   """
 }
