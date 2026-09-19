@@ -246,7 +246,7 @@ type Contributor {
       raise "gh api with a DELETE method is not available from this tool: deleting things on GitHub is for the human operator to do."
     }
     if (cmd == "api" and args.any { a => a.containsMatch(contentsApi) }) {
-      raise "reading files through gh api is not available from this tool: the contents and blobs endpoints return base64, truncated and unreadable. " + "Use `mount` to mount the repository into the workspace, then read, grep and find under mnt/<name> like any other files."
+      raise "reading files through gh api is not available from this tool: the contents and blobs endpoints return base64, truncated and unreadable. " + "For the primary product, use `checkout` (in a subagent if preserving ongoing work), then read, grep and find. Reserve `mount` for exploring more distant dependencies under mnt/<name>."
     }
     if ((cmd == "pr" and (sub == "comment" or sub == "review")) or (cmd == "issue" and sub == "comment")) {
       raise `gh ${cmd} ${sub} is not available from this tool: ` + "use the `comment` tool instead, which marks the comment as agent-authored (\":robot:\") so readers can tell a machine wrote it."
@@ -671,11 +671,13 @@ type Contributor {
   The tree appears under mnt/<name> and read, grep and find work on it like
   on any other directory — with their usual line offsets and limits — but
   it stays out of the pending changeset: never in status or diff, cannot be
-  edited, never committed or exported. This is how to read code that lives
-  in another repository (an upstream dependency, a project you were asked
-  about): NOT `gh api repos/.../contents/...`, which returns base64 and is
-  refused. The engine fetches each (repo, ref) once and caches it, so
-  mounting is cheap.
+  edited, never committed or exported. Use this to explore more distant
+  dependencies, NOT the primary product being developed or reviewed.
+  For that, use `checkout` directly if fresh, or hire a subagent to checkout
+  if you have ongoing work to preserve, even when starting with PR review
+  or feedback. Do not read files through `gh api repos/.../contents/...`,
+  which returns base64 and is refused. The engine fetches each (repo, ref)
+  once and caches it, so mounting is cheap.
 
   Mounting only reads. To work IN the other repository — edit, commit,
   push — use `checkout` (one-way) or hand the errand to a worker. Mounts
@@ -751,6 +753,13 @@ type Contributor {
 
   """
   Switch this conversation to a checkout of a DIFFERENT git repository.
+
+  Use this rather than `mount` for the primary repository being developed
+  or reviewed, including PR reviews and addressing review feedback, so you
+  can proceed from investigation to fixes in the same session. A fresh
+  agent should checkout directly; an agent with ongoing work to preserve
+  should hire a subagent to checkout and handle the task there. Reserve
+  `mount` for exploring more distant dependencies.
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
   tool you already hold (read, edit, status, diff, commit, push, ...) simply
@@ -1206,6 +1215,19 @@ type Contributor {
     repository's checkout to your workspace, read-only; `pushBranch` pushes
     to a fork; `checkout` switches this conversation to another repository.
 
+    Work on the primary product in a writable workspace, not a `mount` —
+    this includes reviewing PRs and addressing review feedback, even when
+    the task starts as investigation. If the current workspace already
+    holds the target repository and branch, use it. Otherwise, a fresh
+    agent should `checkout` directly; if you have ongoing work or a
+    workspace to preserve, hire a staff worker or subagent to `checkout`
+    the target and handle the whole task there. For a PR, use `gh pr view`
+    to identify its head repository and branch (which may belong to a fork)
+    and checkout that branch, not the default branch. This keeps the path
+    from review to fixes open within the same session. Reserve `mount`
+    for exploring more distant dependencies, never the primary product
+    being developed or reviewed.
+
     Use `gh` the way a human at a terminal would, and read its output as
     they would: `gh pr view 14174`, `gh pr view 14174 --comments`, `gh pr
     diff 14174`, `gh pr checks 14174`, `gh issue list --label bug`, `gh
@@ -1218,17 +1240,16 @@ type Contributor {
     resolve against the configured remote (else the checkout's origin);
     pass `--repo owner/name` for another repository.
 
-    To READ code that lives in another repository — an upstream
-    dependency, a project you were asked about — `mount` it:
+    To explore a more distant dependency without working on it, `mount` it:
     mount(repo: "dagger/dagger") attaches its checkout under mnt/dagger,
     and your regular read, grep and find work on it like on any other
     files, offsets and limits included. Pass `ref` to pin a branch, tag or
     commit. Never read files through `gh api .../contents/...` or blobs:
     they come back base64-encoded, and the tool refuses them. A mount is
     read-only and stays out of status, diff and commits, so exploring is
-    side-effect-free; `unmount` when done. Three tiers for another
-    repository: `mount` to read it, `checkout` to work in it, a worker to
-    hand off the whole errand.
+    side-effect-free; `unmount` when done. Do not mount the primary product
+    just because the task begins with reading: use a writable checkout,
+    directly or in a worker, so review can lead to fixes.
 
     To file an issue or open a pull request, write the body with your
     editor to a scratch file (e.g. tmp/body.md; the workspace is mounted,
@@ -1271,27 +1292,27 @@ type Contributor {
     are not pushed: commit first.
 
     `checkout` replaces this conversation's workspace with a fresh checkout
-    of another git repository — for when work belongs somewhere else, e.g.
-    an upstream bug in a dependency. Your tools come along and simply
-    operate on the new checkout, and any agents the target workspace itself
-    defines are composed on top of them. The switch is one-way: your
-    previous workspace is left behind, pending changes included — unless
-    you name them in `keep` (glob patterns, like `commit`'s paths), which
-    carries those files into the new checkout as uncommitted edits. That is
-    the way out when you have scratch edits you never meant to commit, or
-    realize you started from the wrong branch. Mounts do not follow: they
-    belong to the workspace being left. A checked-out workspace cannot
-    export back to the host — its work leaves only by commit + push — so
-    the full errand is checkout → edit → commit → push (or pushBranch, to
-    a fork) → `gh pr create`.
+    of a git repository — the writable starting point for development,
+    PR review, or addressing feedback outside the current workspace. Your
+    tools come along and operate on the new checkout, and any agents the
+    target workspace itself defines are composed on top of them. The switch
+    is one-way: your previous workspace is left behind, pending changes
+    included — unless you name them in `keep` (glob patterns, like `commit`'s
+    paths), which carries those files into the new checkout as uncommitted
+    edits. That is the way out when you have scratch edits you never meant
+    to commit, or realize you started from the wrong branch. Mounts do not
+    follow: they belong to the workspace being left. A checked-out workspace
+    cannot export back to the host — its work leaves only by commit + push
+    — so the full errand is checkout → edit → commit → push (or pushBranch,
+    to a fork) → `gh pr create`.
 
-    Because checkout is one-way, prefer delegating the whole errand when you
-    have the means to (e.g. a staff worker or sub-agent whose workspace is a
-    disposable copy): tell it to checkout the repository, make the change,
-    commit, push, and open the PR, and your own workspace stays bound. The
-    natural shape: `mount` the dependency and investigate it with your full
-    toolset here; once you know the fix belongs upstream, hand a worker the
-    checkout, the change, and the push. Only checkout yourself when
-    switching repositories IS the task at hand.
+    Because checkout is one-way, delegate the whole errand when you have
+    ongoing work to preserve: tell a staff worker or subagent to checkout
+    the target repository and branch, review it, and address feedback as
+    requested, while your own workspace stays bound. A fresh agent whose
+    task is that repository's development or review should checkout itself
+    rather than delegate just to avoid switching. A writable checkout
+    enables fixes; it does not expand the user's request or authorize
+    publishing changes.
   """
 }
