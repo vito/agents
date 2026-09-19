@@ -8,6 +8,19 @@ const http = require('node:http');
 const assert = require('node:assert/strict');
 const { fork } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
+const { Console } = require('node:console');
+const { Writable } = require('node:stream');
+
+// Inventory regular files recursively, without following user-created symlinks.
+async function artifactFiles(root, prefix = '') {
+  const files = [];
+  for (const entry of await fs.readdir(path.join(root, prefix), { withFileTypes: true })) {
+    const name = path.posix.join(prefix, entry.name);
+    if (entry.isDirectory()) files.push(...await artifactFiles(root, name));
+    else if (entry.isFile()) files.push(name);
+  }
+  return files.sort();
+}
 
 const inside = (root, target) => {
   const relative = path.relative(root, target);
@@ -66,6 +79,8 @@ function summarize(result) {
     checks: result.checks.slice(0, 20).map(({ name, status, error }) => ({ name: clip(name, 120), status, ...(error ? { error: clip(error, 500) } : {}) })),
     omittedChecks: Math.max(0, result.checks.length - 20),
     consoleMessages: result.console.length, pageErrors: result.pageErrors.length,
+    console: result.console.slice(0, 20).map(({ source, type, text }) => ({ source, type, text: clip(text, 500) })),
+    omittedConsoleMessages: Math.max(0, result.console.length - 20),
     networkFailures: result.network.filter(event => event.type === 'failed').length,
     artifacts: result.artifacts.slice(0, 30), omittedArtifacts: Math.max(0, result.artifacts.length - 30),
     ...(result.infrastructureError ? { infrastructureError: clip(result.infrastructureError) } : {}),
@@ -96,6 +111,8 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
   const persist = async () => {
     updateCounts();
     await fs.writeFile(path.join(artifacts, 'results.json'), JSON.stringify(result, null, 2));
+    result.artifacts = await artifactFiles(artifacts);
+    await fs.writeFile(path.join(artifacts, 'results.json'), JSON.stringify(result, null, 2));
   };
   const failure = (name, error) => result.checks.push({ name, status: 'failed', error: errorText(error), durationMs: Math.round(performance.now() - started) });
   // A rejection shared by the script and checks makes a hanging check report a
@@ -115,7 +132,7 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
     context.setDefaultNavigationTimeout(input.timeoutMs);
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
     const observe = p => {
-      p.on('console', message => result.console.push({ type: message.type(), text: message.text(), location: message.location() }));
+      p.on('console', message => result.console.push({ source: 'page', type: message.type(), text: message.text(), location: message.location() }));
       p.on('pageerror', error => result.pageErrors.push(errorText(error)));
     };
     context.on('page', observe);
@@ -127,7 +144,6 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
       if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(name)) throw new Error('Unsafe screenshot name');
       const filename = name.endsWith('.png') ? name : `${name}.png`;
       await page.screenshot({ path: path.join(artifacts, filename), fullPage: true, timeout: Math.min(5000, input.timeoutMs) });
-      if (!result.artifacts.includes(filename)) result.artifacts.push(filename);
       return filename;
     };
     const routes = new Map();
@@ -141,10 +157,13 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
         if (!response || typeof response !== 'object') throw new Error('mock response must be an object or null');
         const kinds = ['json', 'body', 'file'].filter(key => Object.hasOwn(response, key));
         if (kinds.length !== 1) throw new Error('mock requires exactly one of json, body, file');
-        fulfillment = { status: response.status ?? 200, headers: response.headers };
+        const status = response.status ?? 200;
+        if (!Number.isInteger(status) || status < 100 || status > 599) throw new Error('mock status must be an integer between 100 and 599');
+        if (response.headers !== undefined && (!response.headers || typeof response.headers !== 'object' || Array.isArray(response.headers) || Object.values(response.headers).some(value => typeof value !== 'string'))) throw new Error('mock headers must be an object with string values');
+        fulfillment = { status, headers: response.headers ? { ...response.headers } : undefined };
         if (kinds[0] === 'file') fulfillment.body = await fs.readFile(await workspaceFile(workspace, response.file));
         else if (kinds[0] === 'json') { fulfillment.body = JSON.stringify(response.json); fulfillment.contentType = 'application/json'; if (fulfillment.body === undefined) throw new Error('Invalid JSON fixture'); }
-        else { if (typeof response.body !== 'string' && !Buffer.isBuffer(response.body)) throw new Error('mock body must be a string or Buffer'); fulfillment.body = response.body; }
+        else { if (typeof response.body !== 'string' && !Buffer.isBuffer(response.body)) throw new Error('mock body must be a string or Buffer'); fulfillment.body = Buffer.isBuffer(response.body) ? Buffer.from(response.body) : response.body; }
       }
       if (routes.has(pattern)) { await context.unroute(pattern, routes.get(pattern)); routes.delete(pattern); }
       if (response === null) return;
@@ -172,9 +191,14 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
     await persist();
     timer = setTimeout(() => { timedOut = true; rejectDeadline(new Error(`Run timed out after ${input.timeoutMs}ms`)); }, input.timeoutMs);
     try {
+      const output = type => new Writable({ write(chunk, encoding, callback) {
+        result.console.push({ source: 'script', type, text: chunk.toString().replace(/\n$/, '') });
+        callback();
+      } });
+      const scriptConsole = new Console({ stdout: output('log'), stderr: output('error'), colorMode: false });
       const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-      const execute = new AsyncFunction('page', 'context', 'browser', 'baseURL', 'expect', 'assert', 'check', 'mock', 'screenshot', input.script);
-      await Promise.race([execute(page, context, browser, baseURL, expect, assert, check, mock, screenshot), deadline]);
+      const execute = new AsyncFunction('page', 'context', 'browser', 'baseURL', 'expect', 'assert', 'check', 'mock', 'screenshot', 'require', 'console', input.script);
+      await Promise.race([execute(page, context, browser, baseURL, expect, assert, check, mock, screenshot, require, scriptConsole), deadline]);
       await Promise.race([Promise.all([...pending]), deadline]);
     } catch (error) { failure('script', error); }
     await Promise.all([...pending]);
@@ -186,16 +210,14 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
   finally {
     clearTimeout(timer);
     if (context) {
-      try { await context.tracing.stop({ path: path.join(artifacts, 'trace.zip') }); result.artifacts.push('trace.zip'); }
+      try { await context.tracing.stop({ path: path.join(artifacts, 'trace.zip') }); }
       catch (error) { (result.captureErrors ||= []).push(errorText(error)); }
     }
     if (browser) await browser.close().catch(error => { (result.captureErrors ||= []).push(errorText(error)); });
     if (server) await server.close();
     for (const [filename, data] of [['console.json', result.console], ['network.json', result.network], ['pageerrors.json', result.pageErrors]]) {
       await fs.writeFile(path.join(artifacts, filename), JSON.stringify(data, null, 2));
-      result.artifacts.push(filename);
     }
-    result.artifacts.push('results.json');
     await persist();
   }
   return summarize(result);
@@ -229,6 +251,8 @@ async function cli() {
     partial.durationMs = input.timeoutMs + 15000;
     partial.captureErrors = ['Forced termination: final screenshot and trace may be unavailable'];
     await fs.mkdir(artifacts, { recursive: true });
+    await fs.writeFile(path.join(artifacts, 'results.json'), JSON.stringify(partial, null, 2));
+    partial.artifacts = await artifactFiles(artifacts);
     await fs.writeFile(path.join(artifacts, 'results.json'), JSON.stringify(partial, null, 2));
     summary = summarize(partial);
   }

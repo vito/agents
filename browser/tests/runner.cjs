@@ -66,12 +66,50 @@ test('no automatic navigation; named checks, version, logs and artifacts', async
   assert.equal(summary.fingerprint, 'test-fingerprint');
   assert.equal(summary.playwrightVersion, '1.58.2');
   assert.ok(summary.browser.version);
-  assert.ok(result.console.some(event => event.text === 'hello from page'));
+  t.diagnostic(`Browser: ${summary.browser.name} ${summary.browser.version}; Playwright: ${summary.playwrightVersion}; fixture fingerprint: ${summary.fingerprint}`);
+  assert.ok(result.console.some(event => event.source === 'page' && event.text === 'hello from page'));
+  assert.ok(result.console.some(event => event.source === 'script' && event.text === 'script logs must not pollute summary stdout'));
   assert.ok(result.pageErrors.some(error => error.includes('page error example')));
   assert.ok(result.network.some(event => event.type === 'failed' && event.url.endsWith('/broken')));
   assert.ok(summary.artifacts.includes('named-evidence.png'));
   await evidence(f.artifacts);
   assert.deepEqual(await fs.readdir(f.workspace), ['index.html'], 'harness does not write into workspace');
+});
+
+test('CommonJS evidence and script console are retained with bounded summaries', async t => {
+  const f = await fixture(t);
+  const { summary, result } = await f.run(`
+    const fs = require('node:fs/promises');
+    const artifacts = ${JSON.stringify(f.artifacts)};
+    await page.goto(baseURL);
+    await fs.mkdir(artifacts + '/extra');
+    await fs.writeFile(artifacts + '/extra/dom.html', await page.content());
+    await fs.writeFile(artifacts + '/extra/accessibility.txt', await page.locator('body').ariaSnapshot());
+    await fs.symlink(${JSON.stringify(f.workspace)}, artifacts + '/workspace-link');
+    await screenshot('removed');
+    await fs.unlink(artifacts + '/removed.png');
+    console.log('formatted %s %d', 'message', 42);
+    console.error('diagnostic', {detail: true});
+    for (let i = 0; i < 25; i++) console.log('x'.repeat(1000));
+  `);
+  assert.equal(summary.ok, true, JSON.stringify(summary));
+  assert.equal(summary.consoleMessages, 27);
+  assert.equal(summary.console.length, 20);
+  assert.equal(summary.omittedConsoleMessages, 7);
+  assert.ok(summary.console.every(entry => entry.text.length <= 500));
+  assert.equal(summary.console[0].text, 'formatted message 42');
+  const consoleLog = JSON.parse(await fs.readFile(path.join(f.artifacts, 'console.json'), 'utf8'));
+  assert.deepEqual(consoleLog, result.console);
+  assert.ok(consoleLog.every(entry => entry.source === 'script'));
+  assert.equal(consoleLog[1].type, 'error');
+  assert.equal(consoleLog[1].text, 'diagnostic { detail: true }');
+  assert.equal(consoleLog.at(-1).text.length, 1000);
+  const expected = ['console.json', 'extra/accessibility.txt', 'extra/dom.html', 'network.json', 'pageerrors.json', 'results.json', 'screenshot.png', 'trace.zip'];
+  assert.deepEqual(result.artifacts, expected);
+  assert.deepEqual(summary.artifacts, expected);
+  assert.match(await fs.readFile(path.join(f.artifacts, 'extra/dom.html'), 'utf8'), /<h1>Ready<\/h1>/);
+  assert.match(await fs.readFile(path.join(f.artifacts, 'extra/accessibility.txt'), 'utf8'), /heading "Ready"/);
+  assert.deepEqual(await fs.readdir(f.workspace), ['index.html']);
 });
 
 test('polling mock replacement updates data without losing DOM state; JSON stays text', async t => {
@@ -131,6 +169,34 @@ test('last mock wins, identical patterns replace, removal restores underlying ro
   assert.equal(summary.counts.passed, 4);
 });
 
+test('invalid replacements preserve mocks; registered headers and buffers are snapshots', async t => {
+  const f = await fixture(t);
+  const { summary } = await f.run(`
+    const headers = {'x-fixture': 'original'};
+    const body = Buffer.from('original');
+    await mock('**/value', {body, headers});
+    body.fill('x');
+    headers['x-fixture'] = 'mutated';
+    await page.goto(baseURL);
+    await check('reject invalid status before replacing', async () => {
+      for (const status of [0, 600, 200.5, '200']) await assert.rejects(mock('**/value', {body: 'bad', status}), /mock status/);
+    });
+    await check('reject invalid headers before replacing', async () => {
+      for (const headers of [null, [], 'bad', {'x-fixture': 1}]) await assert.rejects(mock('**/value', {body: 'bad', headers}), /mock headers/);
+    });
+    await check('reject invalid payload before replacing', async () => {
+      await assert.rejects(mock('**/value', {json: undefined}), /Invalid JSON/);
+      await assert.rejects(mock('**/value', {file: 'missing.txt'}), /ENOENT/);
+    });
+    await check('original fixture survives', async () => {
+      const value = await page.evaluate(async () => { const r = await fetch('/value'); return {body: await r.text(), header: r.headers.get('x-fixture')}; });
+      assert.deepEqual(value, {body: 'original', header: 'original'});
+    });
+  `);
+  assert.equal(summary.ok, true, JSON.stringify(summary));
+  assert.equal(summary.counts.passed, 4);
+});
+
 test('assertion failures are results, continue execution, and retain evidence', async t => {
   const f = await fixture(t);
   const { summary } = await f.run(`
@@ -172,10 +238,18 @@ test('hanging checks fail on deadline and close the browser', async t => {
 
 test('synchronous runaway is stopped by the process watchdog', async t => {
   const f = await fixture(t);
-  const { summary, result } = await f.run('while (true) {}', { timeoutMs: 100 });
+  const { summary, result } = await f.run(`
+    await require('node:fs/promises').writeFile(${JSON.stringify(path.join(f.artifacts, 'before-timeout.txt'))}, 'saved');
+    await screenshot('before-timeout');
+    while (true) {}
+  `, { timeoutMs: 1000 });
   assert.equal(summary.ok, false);
   assert.match(summary.checks.at(-1).error, /worker terminated/);
   assert.ok(result.captureErrors.some(error => error.includes('Forced termination')));
+  assert.deepEqual(result.artifacts, (await fs.readdir(f.artifacts)).sort());
+  assert.deepEqual(summary.artifacts, result.artifacts);
+  assert.ok(result.artifacts.includes('before-timeout.txt'));
+  assert.ok(result.artifacts.includes('before-timeout.png'));
 });
 
 test('static serving rejects traversal and symlink escapes, disables caching', async t => {
