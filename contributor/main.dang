@@ -1,29 +1,40 @@
 # contributor: GitHub operations for a Dagger coding agent.
 #
-# The capabilities, smallest first:
+# The principle: an agent should operate GitHub the way a human at a
+# terminal does — with the `gh` CLI. One general `gh` tool replaces the
+# bespoke tools this module used to grow one at a time (ghApi, submitPr,
+# updatePr, openIssue, …): every verb gh has is available at once, the
+# agent already knows the CLI's shape from its training, and its output is
+# already written for a reader. `gh pr view 123`, `gh issue list --label
+# bug`, `gh pr checks`, `gh issue create --body-file tmp/body.md` — no
+# schema to learn, no tool to add for the next verb. `--json`/`--jq` are
+# for extracting one field, `gh api` for what the CLI has no verb for.
 #
-# - `ghApi` makes read-only GitHub REST requests (GET-only by design).
+# The `gh` tool mounts the whole workspace (worktree and .git) into a
+# throwaway container and runs from its root, so `--body-file <path>` can
+# name a file the agent drafted with its editor, and git — hence gh —
+# sees the checkout's origin remote. The mount is a snapshot: nothing gh
+# does writes back into the workspace. A denylist keeps gh from touching
+# the account, the gh installation, or repository-level settings.
 #
-# - `reviewComments` reads pull request review threads via the GitHub API,
-#   so an agent can be pointed at review feedback — a PR number, a PR URL,
-#   or a single-comment #discussion_r link — and read the full thread with
-#   its file/line/diff context.
+# A few operations stay bespoke, each for a concrete reason:
 #
-# - `prComment` leaves feedback on a pull request — on the conversation, or
-#   anchored to a file/line of the diff. Comments are agent-authored by
-#   definition, so the tool enforces a ":robot:" body prefix that tells
-#   readers a machine wrote the comment, not the human operator.
+# - `comment` posts to an issue or pull request — on the conversation,
+#   anchored to a file/line of a PR's diff, or as a reply inside a review
+#   thread. Comments are agent-authored by definition, so the tool enforces
+#   a ":robot:" body prefix telling readers a machine wrote it; `gh pr
+#   comment`/`gh issue comment`/`gh pr review` are denied so the marker
+#   can't be skipped.
 #
-# - `submitPr` opens a pull request for a branch that is already on the
-#   remote. Getting the branch there is the committer module's business
-#   (commit, then push); this tool is only the last step, so the whole
-#   contribution flow is reviewable primitives instead of one opaque leap.
+# - `updateComment` edits an existing comment or description with
+#   editor-style exact-match replacement — surgical, never a rewrite.
+#   `gh pr edit --body` replaces the whole text (and still trips over
+#   GitHub's retired Projects-classic GraphQL fields), so it's denied in
+#   favor of this.
 #
-# - `updatePr` edits a pull request that already exists — title, body,
-#   base branch, draft/ready state, open/closed — so iterating on a
-#   submission doesn't require a new PR or a human detour. Metadata only:
-#   the code side of a PR changes by pushing more commits to its head
-#   branch (committer's push, or pushBranch for a fork).
+# - `reviewComments` renders a PR's review threads with their file, line,
+#   and diff hunk. `gh pr view --comments` shows conversation comments only;
+#   the line-anchored threads people leave in reviews have no gh rendering.
 #
 # - `pushBranch` publishes the workspace's committed HEAD to a branch on a
 #   DIFFERENT repository — typically a fork, for when the agent cannot or
@@ -31,7 +42,20 @@
 #   push only reaches the checkout's own remote; this one names its
 #   destination, completing the fork flow: checkout upstream → edit →
 #   commit → pushBranch(repo: "you/fork", branch: "fix-x") →
-#   submitPr(branch: "you:fix-x").
+#   `gh pr create --head you:fix-x`.
+#
+# - `mount` attaches ANOTHER repository's checkout to the workspace,
+#   read-only, under mnt/<name> (Workspace.withMountedDirectory): the
+#   agent's own read/grep/find then work on it, with their line offsets and
+#   limits, while the mount stays outside the pending changeset — never in
+#   status/diff, never committed or exported. Without it, agents reach for
+#   `gh api repos/../contents/..`, which hands back base64 they cannot
+#   read; that endpoint is denied so the cheap mistake has no path. The
+#   mount root is fixed at mnt/ so the gh toolbox can exclude it (a
+#   mounted checkout can be large, and Workspace.directory includes
+#   mounts). This is the first leg of the journey this module is shaped
+#   around: study a dependency with full tool capabilities → find the fix
+#   belongs upstream → hand a worker the checkout + push + PR.
 #
 # - `checkout` re-points the agent at a DIFFERENT repository: it fetches a
 #   git repo as a Workspace (GitRef.asWorkspace) and returns a continuation
@@ -45,22 +69,15 @@
 #   overlays them onto the fresh checkout as uncommitted edits — the escape
 #   hatch for scratch work, or a task begun on the wrong branch.
 #
-# These replace the old monolithic `contribute` tool, which predated
-# committer's push and the staff module: it fetched the repo, ran a
-# throwaway sub-agent to completion, and turned the delta into a PR in one
-# opaque call. Now the main agent decides — run the errand itself via
-# checkout → edit → commit → push → submitPr, or hire a staff worker to do
-# exactly that while its own workspace stays put.
-#
 # Configuration lives in dagger.toml settings, not per-call arguments:
-# `githubToken` authenticates GitHub API operations, reaching the container
+# `githubToken` authenticates GitHub operations, reaching the container
 # only as a secret env var (GH_TOKEN) — never baked into an image layer,
-# never echoed. `remote` names the GitHub repository bare PR numbers resolve
-# against; it's a property of the project rather than of any one task (a
-# permanent fork would simply configure a different value). When no remote
-# is configured, the tools fall back to the checkout's own origin remote:
-# the toolbox mounts the workspace's git directory at .git, so git — and
-# therefore gh — sees the repository it is operating on.
+# never echoed. `remote` names the GitHub repository bare issue/PR numbers
+# resolve against; it's a property of the project rather than of any one
+# task (a permanent fork would simply configure a different value). When no
+# remote is configured, the tools fall back to the checkout's own origin
+# remote: the toolbox mounts the workspace's git directory at .git, so git —
+# and therefore gh — sees the repository it is operating on.
 
 # Tail-truncate command output to keep tool results context-friendly.
 let tailLines = 200
@@ -90,37 +107,38 @@ let head(s: String!, lines: Int! = patchLines): String! {
 }
 
 """
-GitHub operations: read pull request reviews and the REST API, comment on
-pull requests, open pull requests for pushed branches, and switch the
-conversation to a checkout of another repository.
+GitHub operations: run the `gh` CLI against the workspace's checkout, post
+agent-marked comments on issues and pull requests and edit them
+surgically, read pull request review threads with their diff context,
+mount other repositories into the workspace read-only, push to a fork, and
+switch the conversation to a checkout of another repository.
 """
 type Contributor {
   # Private so the secret is never exposed as a field/tool argument.
   let token: Secret = null
-  # The GitHub repository PR numbers resolve against. Private: configured in
-  # settings, not steered per-call.
+  # The GitHub repository bare issue/PR numbers resolve against. Private:
+  # configured in settings, not steered per-call.
   let remote: String! = ""
 
   new(
     """
-    A GitHub token used to authenticate API calls, including opening pull
-    requests.
+    A GitHub token used to authenticate `gh` and the GitHub API.
 
     Wire it up in dagger.toml settings rather than passing it around:
 
         [env.dev.modules.contributor.settings]
         githubToken = "env://GITHUB_TOKEN"
 
-    Without it, everything that talks to the GitHub API is unavailable.
-    Git operations use the host's own git credentials instead.
+    Without it, everything that talks to GitHub is unavailable. Git
+    operations use the host's own git credentials instead.
     """
     githubToken: Secret = null,
     """
-    The GitHub repository this project's pull requests live in, as
-    "owner/name" (a github.com URL works too). Like the token, this belongs
-    in dagger.toml settings — it's a property of the project, not of any one
-    task, so it shouldn't vary between contributors or throwaway forks (a
-    permanent fork would simply configure a different value):
+    The GitHub repository this project's issues and pull requests live in,
+    as "owner/name" (a github.com URL works too). Like the token, this
+    belongs in dagger.toml settings — it's a property of the project, not
+    of any one task, so it shouldn't vary between contributors or throwaway
+    forks (a permanent fork would simply configure a different value):
 
         [env.dev.modules.contributor.settings]
         remote = "dagger/dagger"
@@ -140,8 +158,358 @@ type Contributor {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: ["checkMountsOutsideToolbox"])
       .withSystemPrompt(systemPrompt)
+  }
+
+  """
+  Run the GitHub CLI, `gh`, from the root of the workspace's checkout.
+
+  Use it the way a human at a terminal would: `gh pr view 14174`, `gh pr
+  view 14174 --comments`, `gh issue list --label bug`, `gh pr checks 14174`,
+  `gh issue create --title "..." --body-file tmp/body.md`, `gh pr create
+  --title "..." --body-file tmp/pr.md`, `gh release list`, `gh run view
+  <id> --log-failed`. The output is already written for a reader. Reach
+  for `--json`/`--jq` only to extract a specific field (an id, a URL, a
+  head sha), and `gh api <path>` only for what the CLI has no verb for.
+
+  The whole workspace is mounted, so `--body-file <path>` can name a file
+  you wrote with your editor (e.g. under tmp/). The mount is a snapshot:
+  gh cannot write into the workspace. Bare issue/PR numbers resolve against
+  the configured remote, or the checkout's origin remote when none is
+  configured; pass `--repo owner/name` to target another repository.
+
+  Not available here: account, config, secret, key, extension, alias and
+  codespace management; `repo delete/archive/rename/edit`; `api` with a
+  DELETE method; `api` on the contents/blobs endpoints (use `mount`, then
+  read the files with your file tools); `pr comment`, `issue comment` and
+  `pr review` (use `comment`, which marks the comment as agent-authored);
+  and `pr edit`/`issue edit` with `--body`/`--body-file` (use
+  `updateComment`, which edits text surgically instead of rewriting it).
+  """
+  gh(
+    source: Workspace!,
+    """
+    Arguments to `gh`, already tokenized, WITHOUT the leading "gh" — e.g.
+    ["pr", "view", "14174"] or ["issue", "list", "--label", "bug"].
+    """
+    args: [String!]!,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): any invocation may mutate GitHub or read something
+    # live; never replay a previous result from the session cache.
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    if (args.isEmpty) {
+      raise "gh: pass the subcommand and its arguments, e.g. [\"pr\", \"view\", \"123\"]"
+    }
+
+    # The command and subcommand are the first two positional tokens;
+    # flags — and the value of the few global-ish flags that take one — are
+    # skipped so `gh -R owner/name pr view 1` still reads as `pr view`.
+    let positional: [String!]! = []
+    let skipNext = false
+    let hasRepoFlag = false
+    let done = false
+    args.each { a =>
+      if (done) {
+        # Everything after "--" is positional to gh, but never the command.
+        null
+      } else if (skipNext) {
+        skipNext = false
+      } else if (a == "--") {
+        done = true
+      } else if (a.hasPrefix("-")) {
+        if (a == "-R" or a == "--repo") {
+          hasRepoFlag = true
+          skipNext = true
+        } else if (a.hasPrefix("--repo=") or a.hasPrefix("-R")) {
+          hasRepoFlag = true
+        } else if (a == "--hostname") {
+          skipNext = true
+        }
+      } else if (positional.length < 2) {
+        positional = positional + [a]
+      }
+    }
+    let cmd = positional[0] ?? ""
+    let sub = positional[1] ?? ""
+
+    if (["auth", "config", "secret", "ssh-key", "gpg-key", "extension", "extensions", "ext", "alias", "codespace", "cs"].contains(cmd)) {
+      raise `gh ${cmd} is not available from this tool: it manages the gh installation or the GitHub account, not the project.`
+    }
+    if (cmd == "repo" and ["delete", "archive", "rename", "edit"].contains(sub)) {
+      raise `gh repo ${sub} is not available from this tool: repository-level changes are for the human operator to make.`
+    }
+    if (cmd == "api" and hasMethod(args, "DELETE")) {
+      raise "gh api with a DELETE method is not available from this tool: deleting things on GitHub is for the human operator to do."
+    }
+    if (cmd == "api" and args.any { a => a.containsMatch(contentsApi) }) {
+      raise "reading files through gh api is not available from this tool: the contents and blobs endpoints return base64, truncated and unreadable. " + "Use `mount` to mount the repository into the workspace, then read, grep and find under mnt/<name> like any other files."
+    }
+    if ((cmd == "pr" and (sub == "comment" or sub == "review")) or (cmd == "issue" and sub == "comment")) {
+      raise `gh ${cmd} ${sub} is not available from this tool: ` + "use the `comment` tool instead, which marks the comment as agent-authored (\":robot:\") so readers can tell a machine wrote it."
+    }
+    if ((cmd == "pr" or cmd == "issue") and sub == "edit" and hasBodyFlag(args)) {
+      raise `gh ${cmd} edit with --body/--body-file is not available from this tool: ` + "it replaces the whole description. Use `updateComment` to change exactly the text that needs changing."
+    }
+
+    # A configured remote is what bare numbers mean; inject it for the
+    # subcommands that take --repo, unless the caller named a repository
+    # themselves. `gh api` has no --repo: GH_REPO resolves its
+    # {owner}/{repo} placeholders instead. Without a configured remote, gh
+    # resolves the repository from the mounted checkout's origin.
+    let slug = remoteSlug
+    let full = args
+    if (slug != "" and !hasRepoFlag and ["issue", "pr", "release", "label", "run", "workflow"].contains(cmd)) {
+      full = withRepoFlag(args, slug)
+    }
+    let apiRepo = if (cmd == "api") { slug } else { "" }
+
+    # Plain, non-interactive output: no prompts, no pager, no color, no
+    # update nag. The arguments reach gh as argv, never spliced into shell
+    # source.
+    let script = """
+      set -eu
+      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
+      # newline; HTTP headers reject it.
+      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
+      export GH_TOKEN
+      if [ -n "$API_REPO" ]; then
+        GH_REPO="$API_REPO"
+        export GH_REPO
+      fi
+      exec gh "$@"
+    """
+
+    let ran = toolbox(source)
+      .withEnvVariable("API_REPO", apiRepo)
+      .withEnvVariable("GH_PROMPT_DISABLED", "1")
+      .withEnvVariable("GH_NO_UPDATE_NOTIFIER", "1")
+      .withEnvVariable("GH_PAGER", "cat")
+      .withEnvVariable("NO_COLOR", "1")
+      .withEnvVariable("TERM", "dumb")
+      # any call may mutate or read something live: never serve it from
+      # the exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script, "gh"] + full, expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+
+    if (ran.exitCode != 0) {
+      raise `gh ${full.join(" ")} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
+    }
+
+    # gh output reads top-down, so head-truncate. Some verbs report only on
+    # stderr ("✓ Closed pull request …"); don't lose that when stdout is
+    # empty.
+    if (ran.stdout.trimSpace == "") {
+      head(ran.combinedOutput)
+    } else {
+      head(ran.stdout)
+    }
+  }
+
+  """
+  Post a comment on a GitHub issue or pull request — on the conversation,
+  anchored to a file (and optionally a line) of a pull request's diff, or
+  as a reply inside an existing review thread.
+
+  Comments posted this way are agent-authored, so `body` MUST start with
+  ":robot:" — the marker that tells readers a machine wrote the comment,
+  not the human operator. Calls without the prefix are rejected. Keep it
+  kind, brief, and to-the-point.
+  """
+  comment(
+    source: Workspace!,
+    """
+    The issue or pull request to comment on: a number like "13831"
+    (resolved against the configured remote, or the checkout's origin
+    remote when none is configured) or a URL like
+    "https://github.com/dagger/dagger/pull/13831" or
+    "https://github.com/dagger/dagger/issues/13800".
+    """
+    target: String!,
+    """
+    The comment body (Markdown), starting with ":robot:".
+    """
+    body: String!,
+    """
+    File path within the repository to anchor the comment to, as a review
+    comment on that file of the pull request's diff. Empty posts on the
+    conversation instead. Pull requests only.
+    """
+    path: String! = "",
+    """
+    Line number to anchor the comment to, in the file's post-PR version.
+    The line must appear in the PR's diff. 0 anchors to the file as a
+    whole. Requires `path`.
+    """
+    line: Int! = 0,
+    """
+    An existing review comment to reply to, as the "#discussion_r<id>" link
+    GitHub hands out (a bare "discussion_r<id>" or the numeric id work
+    too). The reply lands in that comment's thread. Mutually exclusive
+    with `path`/`line`.
+    """
+    replyTo: String! = "",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): posting a comment is a side effect, not something to
+    # replay from the session cache.
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    if (!body.trimSpace.hasPrefix(":robot:")) {
+      raise robotPrefixError
+    }
+    if (line != 0 and path == "") {
+      raise "a line anchor needs a file: pass `path` along with `line`"
+    }
+    if (replyTo != "" and path != "") {
+      raise "`replyTo` and `path`/`line` are mutually exclusive: a reply lands in an existing thread, a path opens a new one"
+    }
+    let ref = issueRef(target)
+    let replyId = if (replyTo == "") { "" } else { commentId(replyTo) }
+
+    # Replies and file-anchored comments go through the review-comments
+    # API (the latter needs the PR's current head commit); plain feedback is
+    # an issue comment, which is how GitHub models a conversation comment
+    # on issues and pull requests alike. The body travels as a file, never
+    # spliced into shell source.
+    let script = resolveRepoSh + "\n" + """
+      if [ -n "$REPLY_TO" ]; then
+        gh api --method POST "repos/$OWNER_REPO/pulls/$NUMBER/comments/$REPLY_TO/replies" \
+          -F "body=@/tmp/body.md" --jq .html_url
+      elif [ -n "$FILE_PATH" ]; then
+        if ! head_sha="$(gh api "repos/$OWNER_REPO/pulls/$NUMBER" --jq .head.sha 2>/dev/null)"; then
+          echo "$OWNER_REPO#$NUMBER is not a pull request (or does not exist): file/line-anchored comments need a pull request" >&2
+          exit 1
+        fi
+        set -- api --method POST "repos/$OWNER_REPO/pulls/$NUMBER/comments" \
+          -F "body=@/tmp/body.md" \
+          -f "commit_id=$head_sha" \
+          -f "path=$FILE_PATH"
+        if [ "$LINE" -gt 0 ]; then
+          set -- "$@" -F "line=$LINE" -f side=RIGHT
+        else
+          set -- "$@" -f subject_type=file
+        fi
+        gh "$@" --jq .html_url
+      else
+        gh api --method POST "repos/$OWNER_REPO/issues/$NUMBER/comments" \
+          -F "body=@/tmp/body.md" --jq .html_url
+      fi
+    """
+
+    let ran = toolbox(source)
+      .withNewFile("/tmp/body.md", body)
+      .withEnvVariable("OWNER_REPO", ref.repo)
+      .withEnvVariable("NUMBER", ref.number)
+      .withEnvVariable("FILE_PATH", path)
+      .withEnvVariable("LINE", toString(line))
+      .withEnvVariable("REPLY_TO", replyId)
+      # posting must actually happen every time, not be served from the
+      # exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+
+    if (ran.exitCode != 0) {
+      raise `commenting on ${ref.repo}#${ref.number} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
+    }
+
+    `Posted comment: ${ran.stdout.trimSpace}`
+  }
+
+  """
+  Edit a comment, or an issue/pull request description, by exact-match
+  replacement — the same semantics as editing a file: `oldText` must occur
+  exactly once in the current text and is replaced by `newText`. Include
+  enough surrounding context to make the match unique; the rest of the
+  text is untouched.
+
+  Comments can only be edited when they are agent-authored (their body
+  starts with ":robot:") — human comments are off limits. Descriptions
+  (the opening text of an issue or pull request) are editable regardless.
+  """
+  updateComment(
+    source: Workspace!,
+    """
+    What to edit: a comment link with "#issuecomment-<id>" (a conversation
+    comment) or "#discussion_r<id>" (a review comment), or an issue/PR
+    reference — a number like "13831" (resolved against the configured
+    remote, or the checkout's origin remote) or a URL like
+    "https://github.com/dagger/dagger/pull/13831" — to edit its
+    description.
+    """
+    target: String!,
+    """
+    The exact text to replace. Must occur exactly once.
+    """
+    oldText: String!,
+    """
+    The replacement text.
+    """
+    newText: String!,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): reads the live text, then edits it — never replay
+    # either from the session cache.
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    if (oldText == "") {
+      raise "`oldText` must not be empty: name the text to replace"
+    }
+    let ref = editRef(target)
+
+    # Read the current body, let jq do the replacement (it handles
+    # arbitrary multi-line text; --rawfile keeps old/new out of the program
+    # and the shell), then PATCH it back — the body travels as a file, never
+    # spliced into shell source. A comment is only touched when it is
+    # agent-marked; a description (issues/N or pulls/N) is fair game. For a
+    # description, pulls/N is probed first: an issue 404s there.
+    let script = resolveRepoSh + "\n" + """
+      case "$KIND" in
+        issuecomment) api="repos/$OWNER_REPO/issues/comments/$COMMENT_ID"; guard=1 ;;
+        review) api="repos/$OWNER_REPO/pulls/comments/$COMMENT_ID"; guard=1 ;;
+        *)
+          if gh api "repos/$OWNER_REPO/pulls/$NUMBER" >/dev/null 2>&1; then
+            api="repos/$OWNER_REPO/pulls/$NUMBER"
+          else
+            api="repos/$OWNER_REPO/issues/$NUMBER"
+          fi
+          guard=""
+          ;;
+      esac
+      gh api "$api" >/tmp/current.json
+      jq -j --arg guard "$guard" --rawfile old /tmp/old.txt --rawfile new /tmp/new.txt -f /tmp/replace.jq /tmp/current.json >/tmp/body.md
+      gh api --method PATCH "$api" -F "body=@/tmp/body.md" --jq .html_url
+    """
+
+    let ran = toolbox(source)
+      .withNewFile("/tmp/old.txt", oldText)
+      .withNewFile("/tmp/new.txt", newText)
+      .withNewFile("/tmp/replace.jq", replaceJq)
+      .withEnvVariable("OWNER_REPO", ref.repo)
+      .withEnvVariable("NUMBER", ref.number)
+      .withEnvVariable("KIND", ref.kind)
+      .withEnvVariable("COMMENT_ID", ref.commentId)
+      # the read must be live and the edit must actually happen every
+      # time, not be served from the exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+
+    if (ran.exitCode != 0) {
+      # jq's error prefix ("jq: error (at /tmp/current.json:0): ") is noise
+      # around the reasons replaceJq raises on purpose.
+      let why = ran.combinedOutput.replaceMatches(`(?m)^jq: error \([^)]*\): `, with: "")
+      raise `updating ${ref.what} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(why)
+    }
+
+    `Updated ${ran.stdout.trimSpace}`
   }
 
   """
@@ -220,427 +588,12 @@ type Contributor {
   }
 
   """
-  Make an authenticated, read-only GitHub API request (`gh api`) and return
-  the response, optionally filtered through a jq expression.
-
-  Covers everything the REST API exposes: code search
-  ("search/code?q=repo:owner/name+needle"), PR/issue metadata, releases,
-  file listings, and so on. Requests are GET-only — this tool cannot
-  mutate anything on GitHub.
-
-  Raw GitHub payloads are huge; pass `jq` to select just the fields you
-  need (e.g. ".items[].path").
-  """
-  ghApi(
-    source: Workspace!,
-    """
-    The API path to GET, e.g. "repos/dagger/dagger/releases/latest" or
-    "search/code?q=repo:badlogic/pi-mono+toolSnippets". A leading slash is
-    fine. Placeholders {owner}/{repo} resolve against the configured remote,
-    or the checkout's own origin remote when none is configured.
-    """
-    path: String!,
-    """
-    jq expression applied to the response (gh's built-in --jq), e.g.
-    ".items[] | {path, repository: .repository.full_name}". Empty returns
-    the raw JSON.
-    """
-    jq: String! = "",
-    """
-    Follow pagination (--paginate) and concatenate all pages. Combine with
-    a jq filter to keep the output manageable.
-    """
-    paginate: Boolean! = false,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): the API is a live read — issues get comments, releases
-    # get published; don't replay stale responses from the session cache.
-    let tok = token
-    if (tok == null) {
-      raise noTokenError
-    }
-
-    let script = """
-      set -eu
-      # Secret commands (e.g. `gh auth token`) commonly emit a trailing
-      # newline; HTTP headers reject it.
-      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
-      export GH_TOKEN
-      # A configured remote wins for {owner}/{repo} placeholders; without
-      # one, gh resolves them itself from the checkout's git directory,
-      # which the toolbox mounts at .git.
-      if [ -n "$OWNER_REPO" ]; then
-        GH_REPO="$OWNER_REPO"
-        export GH_REPO
-      fi
-      set -- api --method GET "${API_PATH#/}"
-      if [ -n "$PAGINATE" ]; then set -- "$@" --paginate; fi
-      if [ -n "$JQ_EXPR" ]; then set -- "$@" --jq "$JQ_EXPR"; fi
-      gh "$@"
-    """
-
-    let ran = toolbox(source)
-      .withEnvVariable("API_PATH", path)
-      .withEnvVariable("JQ_EXPR", jq)
-      .withEnvVariable("OWNER_REPO", remoteSlug)
-      .withEnvVariable("PAGINATE", if (paginate) { "1" } else { "" })
-      # live read: never serve API responses from the exec cache
-      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
-      .withSecretVariable("GH_TOKEN", tok)
-      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
-
-    if (ran.exitCode != 0) {
-      raise `GET ${path} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
-    }
-
-    # JSON reads top-down, so head-truncate like a patch.
-    head(ran.stdout)
-  }
-
-  """
-  Leave feedback on a GitHub pull request as a comment — on the PR
-  conversation, or anchored to a file (and optionally a line) of the diff.
-
-  Comments posted this way are agent-authored, so `body` MUST start with
-  ":robot:" — the marker that tells readers a machine wrote the comment,
-  not the human operator. Calls without the prefix are rejected.
-  """
-  prComment(
-    source: Workspace!,
-    """
-    The pull request to comment on: a number like "13831" (resolved against
-    the configured remote, or the checkout's origin remote when none is
-    configured) or a URL like
-    "https://github.com/dagger/dagger/pull/13831".
-    """
-    pr: String!,
-    """
-    The comment body (Markdown), starting with ":robot:". Keep it kind,
-    brief, and to-the-point.
-    """
-    body: String!,
-    """
-    File path within the repository to anchor the comment to, as a review
-    comment on that file. Empty posts on the PR conversation instead.
-    """
-    path: String! = "",
-    """
-    Line number to anchor the comment to, in the file's post-PR version.
-    The line must appear in the PR's diff. 0 anchors to the file as a
-    whole. Requires `path`.
-    """
-    line: Int! = 0,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): posting a comment is a side effect, not something to
-    # replay from the session cache.
-    let tok = token
-    if (tok == null) {
-      raise noTokenError
-    }
-    if (!body.trimSpace.hasPrefix(":robot:")) {
-      raise robotPrefixError
-    }
-    if (line != 0 and path == "") {
-      raise "a line anchor needs a file: pass `path` along with `line`"
-    }
-
-    # Same PR-reference forms as reviewComments, minus the discussion links
-    # (replying into a thread is reviewComments territory; this tool opens
-    # new ones).
-    let repo = ""
-    let number = ""
-    let ref = pr.trimPrefix("#")
-    if (ref.containsMatch(`^\d+$`)) {
-      repo = remoteSlug
-      number = ref
-    } else {
-      let m = ref.match(`github\.com/([^/]+)/([^/]+)/pull/(\d+)`)
-      if (m == null) {
-        raise `not a pull request reference: "${pr}" — pass a PR number or a github.com PR URL`
-      }
-      repo = (m.captures[0] ?? "") + "/" + (m.captures[1] ?? "")
-      number = m.captures[2] ?? ""
-    }
-
-    # File-anchored comments go through the review-comments API (which needs
-    # the PR's current head commit); plain feedback is an issue comment on
-    # the PR conversation. The body travels as a file, never spliced into
-    # shell source.
-    let script = resolveRepoSh + "\n" + """
-      if [ -n "$FILE_PATH" ]; then
-        head_sha="$(gh api "repos/$OWNER_REPO/pulls/$PR_NUMBER" --jq .head.sha)"
-        set -- api --method POST "repos/$OWNER_REPO/pulls/$PR_NUMBER/comments" \
-          -F "body=@/tmp/body.md" \
-          -f "commit_id=$head_sha" \
-          -f "path=$FILE_PATH"
-        if [ "$LINE" -gt 0 ]; then
-          set -- "$@" -F "line=$LINE" -f side=RIGHT
-        else
-          set -- "$@" -f subject_type=file
-        fi
-        gh "$@" --jq .html_url
-      else
-        gh api --method POST "repos/$OWNER_REPO/issues/$PR_NUMBER/comments" \
-          -F "body=@/tmp/body.md" --jq .html_url
-      fi
-    """
-
-    let ran = toolbox(source)
-      .withNewFile("/tmp/body.md", body)
-      .withEnvVariable("OWNER_REPO", repo)
-      .withEnvVariable("PR_NUMBER", number)
-      .withEnvVariable("FILE_PATH", path)
-      .withEnvVariable("LINE", toString(line))
-      # posting must actually happen every time, not be served from the
-      # exec cache
-      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
-      .withSecretVariable("GH_TOKEN", tok)
-      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
-
-    if (ran.exitCode != 0) {
-      raise `commenting on ${repo}#${number} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
-    }
-
-    `Posted comment: ${ran.stdout.trimSpace}`
-  }
-
-  """
-  Open a pull request for a branch that is already on the remote.
-
-  This is the last step of a contribution, not the whole trip: make the
-  change, commit it, and push it to a branch first (the committer tools) —
-  then submit that branch. The PR is opened exactly as described here; review
-  your work with the git tools before calling this.
-  """
-  submitPr(
-    source: Workspace!,
-    """
-    The head branch to open the pull request from — the branch you pushed,
-    e.g. "fix-span-leak". For a PR from a fork, qualify it as "owner:branch".
-    """
-    branch: String!,
-    """
-    Pull request title.
-    """
-    title: String!,
-    """
-    Pull request body (Markdown). Say what changed and why, for a reviewer.
-    """
-    body: String! = "",
-    """
-    The GitHub repository to open the pull request on, as "owner/name" (a
-    github.com URL works too). Empty targets the configured remote, or the
-    checkout's own origin remote when none is configured — so after a
-    `checkout` this defaults to the repository you checked out.
-    """
-    repo: String! = "",
-    """
-    Base branch the pull request merges into. Empty means the repository's
-    default branch.
-    """
-    baseBranch: String! = "",
-    """
-    Open the pull request as a draft.
-    """
-    draft: Boolean! = false,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): opening a PR is a side effect, not something to replay
-    # from the session cache.
-    let tok = token
-    if (tok == null) {
-      raise noTokenError
-    }
-    let slug = if (repo == "") { remoteSlug } else { normalizeSlug(repo) }
-    # For messages only: slug may be empty, meaning "whatever the checkout's
-    # origin remote says" — the script resolves it.
-    let where = if (slug == "") { "the checkout's repository" } else { slug }
-
-    # The body travels as a file, never spliced into shell source.
-    let script = resolveRepoSh + "\n" + """
-      set -- pr create --repo "$OWNER_REPO" --head "$BRANCH" \
-        --title "$PR_TITLE" --body-file /tmp/pr.md
-      if [ -n "$BASE_BRANCH" ]; then set -- "$@" --base "$BASE_BRANCH"; fi
-      if [ -n "$DRAFT" ]; then set -- "$@" --draft; fi
-      gh "$@"
-    """
-
-    let ran = toolbox(source)
-      .withNewFile("/tmp/pr.md", body)
-      .withEnvVariable("OWNER_REPO", slug)
-      .withEnvVariable("BRANCH", branch)
-      .withEnvVariable("BASE_BRANCH", baseBranch)
-      .withEnvVariable("PR_TITLE", title)
-      .withEnvVariable("DRAFT", if (draft) { "1" } else { "" })
-      # PR creation must actually happen every time, not be served from the
-      # exec cache
-      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
-      .withSecretVariable("GH_TOKEN", tok)
-      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
-
-    if (ran.exitCode != 0) {
-      raise `opening a pull request on ${where} from ${branch} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
-    }
-
-    `Opened pull request: ${ran.stdout.trimSpace}`
-  }
-
-  """
-  Update an existing pull request: retitle it, rewrite its body, retarget
-  its base branch, flip it between draft and ready for review, or close and
-  reopen it.
-
-  Every argument besides `pr` is optional, and only the ones you pass
-  change — the rest of the pull request stays exactly as it is. This edits
-  the PR's metadata, not its commits: new code reaches a PR by pushing more
-  commits to its head branch (the committer `push`, or `pushBranch` for a
-  fork).
-  """
-  updatePr(
-    source: Workspace!,
-    """
-    The pull request to update: a number like "13831" (resolved against
-    the configured remote, or the checkout's origin remote when none is
-    configured) or a URL like
-    "https://github.com/dagger/dagger/pull/13831".
-    """
-    pr: String!,
-    """
-    New pull request title. Omitted leaves the title unchanged.
-    """
-    title: String = null,
-    """
-    New pull request body (Markdown), replacing the old one entirely — so
-    re-state everything worth keeping. Omitted leaves the body unchanged.
-    """
-    body: String = null,
-    """
-    New base branch the pull request merges into (retargeting). Omitted
-    leaves the base unchanged.
-    """
-    baseBranch: String = null,
-    """
-    true converts the pull request to a draft; false marks it ready for
-    review. Omitted leaves its draft state unchanged.
-    """
-    draft: Boolean = null,
-    """
-    "closed" closes the pull request; "open" reopens it. Omitted leaves it
-    as-is.
-    """
-    state: String = null,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): updating a PR is a side effect, not something to
-    # replay from the session cache.
-    let tok = token
-    if (tok == null) {
-      raise noTokenError
-    }
-    if (title == null and body == null and baseBranch == null and draft == null and state == null) {
-      raise "nothing to update: pass at least one of `title`, `body`, `baseBranch`, `draft`, or `state`"
-    }
-    if (state != null) {
-      if (state != "open" and state != "closed") {
-        raise `not a pull request state: "${state}" — pass "open" to reopen or "closed" to close`
-      }
-    }
-    if (baseBranch != null) {
-      if (baseBranch.trimSpace == "") {
-        raise "updatePr: `baseBranch` must not be empty"
-      }
-    }
-
-    # Same PR-reference forms as prComment: a bare number resolves against
-    # the configured remote, a github.com PR URL names its own repository.
-    let repo = ""
-    let number = ""
-    let ref = pr.trimPrefix("#")
-    if (ref.containsMatch(`^\d+$`)) {
-      repo = remoteSlug
-      number = ref
-    } else {
-      let m = ref.match(`github\.com/([^/]+)/([^/]+)/pull/(\d+)`)
-      if (m == null) {
-        raise `not a pull request reference: "${pr}" — pass a PR number or a github.com PR URL`
-      }
-      repo = (m.captures[0] ?? "") + "/" + (m.captures[1] ?? "")
-      number = m.captures[2] ?? ""
-    }
-
-    # The current state is read first so repeated calls converge instead of
-    # erroring (closing a closed PR, etc.). Reopen happens before everything
-    # else so draft/ready flips work on a PR being revived; close happens
-    # last for the same reason. Metadata lands via REST PATCH — `gh pr edit`
-    # would be the obvious tool, but its GraphQL preamble still selects
-    # Projects (classic) fields, which GitHub now rejects outright; only the
-    # draft flip has no REST route, so `gh pr ready` handles that alone. The
-    # body travels as a file, never spliced into shell source, and gh's own
-    # stdout chatter is dropped so stdout carries just the summary (stderr
-    # still reaches the error path via combinedOutput).
-    let script = resolveRepoSh + "\n" + """
-      url="https://github.com/$OWNER_REPO/pull/$PR_NUMBER"
-      api="repos/$OWNER_REPO/pulls/$PR_NUMBER"
-      pr_json="$(gh api "$api")"
-      was_state="$(printf '%s' "$pr_json" | jq -r .state)"
-      was_draft="$(printf '%s' "$pr_json" | jq -r .draft)"
-      summary=""
-      note() { summary="${summary:+$summary, }$1"; }
-      if [ "$NEW_STATE" = "open" ]; then
-        if [ "$was_state" = "open" ]; then note "already open"
-        else gh api --method PATCH "$api" -f state=open >/dev/null; note "reopened"; fi
-      fi
-      if [ -n "$SET_TITLE" ] || [ -n "$SET_BODY" ] || [ -n "$BASE_BRANCH" ]; then
-        set -- api --method PATCH "$api"
-        if [ -n "$SET_TITLE" ]; then set -- "$@" -f "title=$PR_TITLE"; note "title"; fi
-        if [ -n "$SET_BODY" ]; then set -- "$@" -F "body=@/tmp/body.md"; note "body"; fi
-        if [ -n "$BASE_BRANCH" ]; then set -- "$@" -f "base=$BASE_BRANCH"; note "base -> $BASE_BRANCH"; fi
-        gh "$@" >/dev/null
-      fi
-      case "$SET_DRAFT" in
-        true)
-          if [ "$was_draft" = "true" ]; then note "already a draft"
-          else gh pr ready --undo "$url" >/dev/null; note "converted to draft"; fi
-          ;;
-        false)
-          if [ "$was_draft" = "false" ]; then note "already ready for review"
-          else gh pr ready "$url" >/dev/null; note "marked ready for review"; fi
-          ;;
-      esac
-      if [ "$NEW_STATE" = "closed" ]; then
-        if [ "$was_state" = "closed" ]; then note "already closed"
-        else gh api --method PATCH "$api" -f state=closed >/dev/null; note "closed"; fi
-      fi
-      printf 'Updated %s: %s\n' "$url" "$summary"
-    """
-
-    let ran = toolbox(source)
-      .withNewFile("/tmp/body.md", body ?? "")
-      .withEnvVariable("OWNER_REPO", repo)
-      .withEnvVariable("PR_NUMBER", number)
-      .withEnvVariable("SET_TITLE", if (title == null) { "" } else { "1" })
-      .withEnvVariable("PR_TITLE", title ?? "")
-      .withEnvVariable("SET_BODY", if (body == null) { "" } else { "1" })
-      .withEnvVariable("BASE_BRANCH", baseBranch ?? "")
-      .withEnvVariable("SET_DRAFT", if (draft == null) { "" } else if (draft ?? false) { "true" } else { "false" })
-      .withEnvVariable("NEW_STATE", state ?? "")
-      # updating must actually happen every time, not be served from the
-      # exec cache
-      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
-      .withSecretVariable("GH_TOKEN", tok)
-      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
-
-    if (ran.exitCode != 0) {
-      raise `updating ${repo}#${number} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
-    }
-
-    ran.stdout.trimSpace
-  }
-
-  """
   Publish the workspace's committed HEAD to a branch on ANOTHER repository —
   typically a fork, for when you cannot or should not push branches to the
   repository you checked out. The committer `push` tool only reaches the
   checkout's own remote; this one names its destination, so the fork flow is
-  checkout upstream → edit → commit → pushBranch → submitPr with branch
-  "owner:branch".
+  checkout upstream → edit → commit → pushBranch → `gh pr create --head
+  owner:branch`.
 
   Pending changes are NOT pushed: commit first. The push API handles
   authentication using the host's own git credentials and respects
@@ -712,6 +665,91 @@ type Contributor {
   }
 
   """
+  Mount another git repository's checkout into the workspace, read-only, to
+  study it with your regular file tools.
+
+  The tree appears under mnt/<name> and read, grep and find work on it like
+  on any other directory — with their usual line offsets and limits — but
+  it stays out of the pending changeset: never in status or diff, cannot be
+  edited, never committed or exported. This is how to read code that lives
+  in another repository (an upstream dependency, a project you were asked
+  about): NOT `gh api repos/.../contents/...`, which returns base64 and is
+  refused. The engine fetches each (repo, ref) once and caches it, so
+  mounting is cheap.
+
+  Mounting only reads. To work IN the other repository — edit, commit,
+  push — use `checkout` (one-way) or hand the errand to a worker. Mounts
+  belong to this workspace and do not follow a `checkout`.
+  """
+  mount(
+    source: Workspace!,
+    """
+    The repository: "owner/name" GitHub shorthand or a full git URL, e.g.
+    "dagger/dagger" or "https://github.com/dagger/dagger".
+    """
+    repo: String!,
+    """
+    Branch, tag, or commit to mount. Empty means the default branch.
+    """
+    ref: String! = "",
+    """
+    Directory name under mnt/ to mount at. Empty uses the repository's name
+    (mnt/dagger for dagger/dagger). Mounting at a name already in use
+    replaces that mount.
+    """
+    name: String! = "",
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): a branch ref resolves live; a later identical call
+    # must mount the repository as it is then.
+    let url = repoUrl(repo)
+    let repository = git(url)
+    let target = if (ref == "") {
+      repository.head
+    } else {
+      # ref() accepts a commit id, tag, branch, or fully-qualified ref.
+      repository.ref(ref)
+    }
+    # Force the resolution HERE, so a typo'd repo or ref fails as this call
+    # instead of poisoning every later read under the mount.
+    let sha = target.commitSHA rescue {
+      e: Error => raise `cannot mount ${repo}: ${plainError(e.message)}`
+    }
+    let dir = mountPath(if (name == "") { repoName(url) } else { name })
+
+    let at = if (ref == "") { "" } else { `@${ref}` }
+    print(`Mounted ${repo}${at} (${short(sha)}) read-only at ${dir}/ — read, grep and find work on it; unmount with unmount("${Path(dir).name}") when done.`)
+
+    source.withMountedDirectory(dir, target.tree(discardGitDir: true))
+  }
+
+  """
+  Remove a mount created with `mount`, restoring whatever the workspace had
+  at that path.
+  """
+  unmount(
+    source: Workspace!,
+    """
+    The mount's directory name under mnt/, e.g. "dagger" (or "mnt/dagger").
+    """
+    name: String!,
+  ): Workspace! {
+    source.withoutMount(mountPath(name.trimPrefix(mountRoot + "/")))
+  }
+
+  # Mounts stay out of the gh toolbox's snapshot: a mounted checkout can be
+  # large, and gh never needs it.
+  checkMountsOutsideToolbox: String! @check {
+    let ws = directory
+      .withNewFile("tmp/body.md", "draft\n")
+      .asWorkspace
+      .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
+    assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
+    let seen = toolboxTree(ws).entries
+    assert { seen.contains("tmp/") and !seen.contains("mnt/") }
+    "mounts are excluded from the toolbox snapshot"
+  }
+
+  """
   Switch this conversation to a checkout of a DIFFERENT git repository.
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
@@ -729,8 +767,9 @@ type Contributor {
   is a disposable copy) instead of switching yourself.
 
   A checked-out workspace cannot export back to the host: the only way work
-  leaves it is commit + push (then submitPr). Git authentication is handled
-  by the API using the host's own git credentials, not the GitHub token.
+  leaves it is commit + push (then `gh pr create`). Git authentication is
+  handled by the API using the host's own git credentials, not the GitHub
+  token.
   """
   checkout(
     llm: LLM!,
@@ -849,21 +888,88 @@ type Contributor {
 
   # ---- helpers ------------------------------------------------------------
 
-  # Shared toolbox for GitHub operations: git, gh, and jq, with the
-  # workspace's git directory mounted at .git so git — and therefore gh —
-  # sees the checkout: its origin remote resolves bare PR numbers and
-  # {owner}/{repo} placeholders when no remote is configured.
+  # Shared toolbox for GitHub operations: git, gh, and jq, run from the root
+  # of the workspace's checkout. The workspace's files are mounted so
+  # `--body-file <path>` can name a file the agent wrote — including files
+  # git ignores, where drafts belong — and its git directory is mounted on
+  # top at .git so git — and therefore gh — sees the checkout: its origin
+  # remote resolves bare numbers and {owner}/{repo} placeholders when no
+  # remote is configured. Both are snapshots inside a throwaway container:
+  # nothing that runs here can write back into the workspace.
   let toolbox(source: Workspace!): Container! {
     container
-      .from("alpine:3.20")
-      .withExec(["apk", "add", "--no-cache", "git", "github-cli", "jq"])
+      .from("alpine:3.22")
+      .withExec(["apk", "add", "--no-cache", "git", "jq"])
+      # gh comes from its own releases, not apk: distro packages lag, and
+      # GitHub retires GraphQL fields (Projects classic) faster than they
+      # catch up, which breaks `gh pr view` outright.
+      .withExec(["sh", "-c", installGhSh])
       # The mounted git dir arrives with whatever ownership the engine gives
       # it; keep git from refusing to read a repo it thinks is someone
       # else's.
       .withExec(["git", "config", "--global", "--add", "safe.directory", "*"])
       .withWorkdir("/workspace")
-      .withDirectory("/workspace/.git", source.git.directory)
+      .withMountedDirectory("/workspace", toolboxTree(source))
+      .withMountedDirectory("/workspace/.git", source.git.directory)
   }
+
+  # The workspace files the toolbox sees. Workspace.directory includes
+  # mounted content (a mount shadows the tree at its path), so the mount
+  # root is excluded: a mounted checkout can be large, and gh never needs
+  # it.
+  let toolboxTree(source: Workspace!): Directory! {
+    source.directory("/", exclude: [mountRoot])
+  }
+
+  # Every `mount` lands under this workspace-relative directory, so the
+  # toolbox can exclude mounts without tracking them.
+  let mountRoot: String! = "mnt"
+
+  # REST paths that serve file contents base64-encoded: the repository
+  # contents endpoint (a directory listing is fine from `find` on a mount
+  # too) and git blobs. Matched against every `gh api` argument, path or
+  # full URL.
+  let contentsApi: Regexp! = `repos/[^/\s]+/[^/\s]+/(contents(/|\?|$)|git/blobs/)`
+
+  # The workspace-relative mount path for a mount name; rejects names that
+  # would escape the mount root.
+  let mountPath(name: String!): String! {
+    if (!name.containsMatch(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)) {
+      raise `invalid mount name ${JSON.encode(name)}: use a single directory name such as "dagger"`
+    }
+    mountRoot + "/" + name
+  }
+
+  # Expand GitHub "owner/name" shorthand into a clone URL; anything that
+  # already looks like a URL passes through.
+  let repoUrl(repo: String!): String! {
+    let r = repo.trimSpace
+    if (r.containsMatch(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)) {
+      "https://github.com/" + r
+    } else {
+      r
+    }
+  }
+
+  # The repository's name from its URL: the last path element, minus .git.
+  let repoName(url: String!): String! {
+    Path(url.trimSuffix("/").trimSuffix(".git")).name
+  }
+
+  let ghVersion: String! = "2.101.0"
+
+  let installGhSh: String! = ```
+    set -eu
+    case "$(uname -m)" in
+      x86_64) arch=amd64 ;;
+      aarch64) arch=arm64 ;;
+      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+    esac
+    wget -qO /tmp/gh.tgz "https://github.com/cli/cli/releases/download/v${ghVersion}/gh_${ghVersion}_linux_$arch.tar.gz"
+    tar -xzf /tmp/gh.tgz -C /tmp
+    install -m 0755 "/tmp/gh_${ghVersion}_linux_$arch/bin/gh" /usr/local/bin/gh
+    rm -rf /tmp/gh.tgz "/tmp/gh_${ghVersion}_linux_$arch"
+  ```
 
   # The configured remote normalized to "owner/name", or "" when none is
   # configured — the shell side (resolveRepoSh) then falls back to the
@@ -907,6 +1013,86 @@ type Contributor {
     }
   }
 
+  # An issue or pull request reference — a bare number (resolved against
+  # the configured remote; "" leaves it to resolveRepoSh and the checkout's
+  # origin) or a github.com issue/PR URL — as repo + number.
+  let issueRef(target: String!): {{repo: String!, number: String!}}! {
+    let ref = target.trimSpace.trimPrefix("#")
+    if (ref.containsMatch(`^\d+$`)) {
+      return {{repo: remoteSlug, number: ref}}
+    }
+    let m = ref.match(`github\.com/([^/]+)/([^/]+)/(?:pull|issues)/(\d+)`)
+    if (m == null) {
+      raise `not an issue or pull request reference: "${target}" — pass a number or a github.com issue/PR URL`
+    }
+    {{repo: (m.captures[0] ?? "") + "/" + (m.captures[1] ?? ""), number: m.captures[2] ?? ""}}
+  }
+
+  # What updateComment edits, by the shape of the reference: a comment link
+  # ("#issuecomment-<id>" or "#discussion_r<id>") names a comment; a plain
+  # issue/PR reference names its description (kind "description", which the
+  # shell side resolves to pulls/N or issues/N).
+  let editRef(target: String!): {{repo: String!, number: String!, kind: String!, commentId: String!, what: String!}}! {
+    let base = issueRef(target)
+    let m = target.match(`#(?:issuecomment-|(?:discussion_)?r)(\d+)`)
+    if (m == null) {
+      return {{repo: base.repo, number: base.number, kind: "description", commentId: "", what: `the description of ${base.repo}#${base.number}`}}
+    }
+    let id = m.captures[0] ?? ""
+    if (target.contains("#issuecomment-")) {
+      {{repo: base.repo, number: base.number, kind: "issuecomment", commentId: id, what: `comment ${id} on ${base.repo}#${base.number}`}}
+    } else {
+      {{repo: base.repo, number: base.number, kind: "review", commentId: id, what: `review comment ${id} on ${base.repo}#${base.number}`}}
+    }
+  }
+
+  # The numeric id of a review comment reference: a "#discussion_r<id>"
+  # link, a bare "discussion_r<id>", or the number itself.
+  let commentId(ref: String!): String! {
+    let s = ref.trimSpace
+    if (s.containsMatch(`^\d+$`)) {
+      return s
+    }
+    let m = s.match(`(?:discussion_)?r(\d+)$`)
+    if (m == null) {
+      raise `not a review comment reference: "${ref}" — pass a #discussion_r<id> link or the comment's numeric id`
+    }
+    m.captures[0] ?? ""
+  }
+
+  # True when args carry an HTTP method flag (-X/--method, joined or
+  # separate) naming `method`.
+  let hasMethod(args: [String!]!, method: String!): Boolean! {
+    let found = false
+    args.each { t, i =>
+      let u = t.toUpper
+      if (t == "-X" or t == "--method") {
+        if ((args[i + 1] ?? "").toUpper == method) {
+          found = true
+        }
+      } else if (u.hasPrefix("--METHOD=") or u.hasPrefix("-X")) {
+        if (u.trimPrefix("--METHOD=").trimPrefix("-X") == method) {
+          found = true
+        }
+      }
+    }
+    found
+  }
+
+  # True when args carry gh's body flags (--body/-b, --body-file/-F).
+  let hasBodyFlag(args: [String!]!): Boolean! {
+    args.any { t =>
+      t == "--body" or t == "-b" or t == "--body-file" or t == "-F" or t.hasPrefix("--body=") or t.hasPrefix("--body-file=")
+    }
+  }
+
+  # args with `--repo slug` added — before a "--" separator when there is
+  # one, so the flag stays a flag.
+  let withRepoFlag(args: [String!]!, slug: String!): [String!]! {
+    let before = args.takeWhile { t => t != "--" }
+    before + ["--repo", slug] + args.dropFirst(before.length)
+  }
+
   # A checkout with the target's own agents left out: the fallback when
   # reading or composing them fails, which must never strand the switch
   # itself.
@@ -927,6 +1113,26 @@ type Contributor {
   let short(sha: String!): String! {
     sha.split("", 8).takeFirst(7).join("")
   }
+
+  # jq program for updateComment: given the current object (a comment or an
+  # issue/PR), $old and $new (--rawfile), and $guard (non-empty when the
+  # target is a comment), emit the edited body or fail with the reason.
+  let replaceJq: String! = """
+    def robot: test("^\\s*:robot:");
+    (.body // "") as $body
+    | if $guard != "" and ($body | robot | not)
+      then error("refusing to edit: this comment is not agent-authored (its body does not start with \":robot:\")")
+      else . end
+    | ($body | indices($old) | length) as $n
+    | if $n == 0
+      then error("oldText not found in the current text")
+      elif $n > 1
+      then error("oldText matches \($n) times; include more surrounding context to make it unique")
+      else ($body | split($old) | join($new)) end
+    | if $guard != "" and (robot | not)
+      then error("refusing to edit: the edited comment would no longer start with \":robot:\"")
+      else . end
+  """
 
   # jq program rendering a PR's review comments (a JSON array of pages, via
   # `jq -s` over `gh api --paginate`) as markdown threads. DISCUSSION_ID
@@ -979,7 +1185,7 @@ type Contributor {
   """
 
   let noTokenError: String! = """
-    No GitHub token is configured, so GitHub API operations are unavailable.
+    No GitHub token is configured, so GitHub operations are unavailable.
     Wire one up in dagger.toml:
 
         [env.dev.modules.contributor.settings]
@@ -994,53 +1200,75 @@ type Contributor {
 
   # Instructions for the agent holding these tools.
   let systemPrompt: String! = """
-    You have GitHub tools: `reviewComments` and `ghApi` for reading,
-    `prComment` for review feedback, `submitPr` for opening pull requests,
-    `updatePr` for editing them afterwards, and `checkout` for switching
-    this conversation to another repository.
+    You have GitHub tools: `gh` runs the GitHub CLI; `comment` and
+    `updateComment` post and edit agent-marked comments; `reviewComments`
+    reads a pull request's review threads; `mount` attaches another
+    repository's checkout to your workspace, read-only; `pushBranch` pushes
+    to a fork; `checkout` switches this conversation to another repository.
 
-    `ghApi` GETs any GitHub REST API path with authentication — code search
-    ("search/code?q=repo:owner/name+needle"), PR/issue metadata, releases,
-    CI check runs. Reach for it instead of fetching github.com web pages,
-    which render as mostly navigation noise. Always pass a `jq` filter to
-    keep the response small; raw payloads rarely fit in context.
+    Use `gh` the way a human at a terminal would, and read its output as
+    they would: `gh pr view 14174`, `gh pr view 14174 --comments`, `gh pr
+    diff 14174`, `gh pr checks 14174`, `gh issue list --label bug`, `gh
+    issue view 8`, `gh run view <id> --log-failed`, `gh release list`.
+    Reach for `--json`/`--jq` only to extract a specific field — an id, a
+    URL, a head sha — and for `gh api <path>` only when the CLI has no verb
+    for it (`gh api repos/{owner}/{repo}/...`; {owner}/{repo} resolve to the
+    configured remote or the checkout's origin). Prefer gh to fetching
+    github.com pages, which render as navigation noise. Bare numbers
+    resolve against the configured remote (else the checkout's origin);
+    pass `--repo owner/name` for another repository.
+
+    To READ code that lives in another repository — an upstream
+    dependency, a project you were asked about — `mount` it:
+    mount(repo: "dagger/dagger") attaches its checkout under mnt/dagger,
+    and your regular read, grep and find work on it like on any other
+    files, offsets and limits included. Pass `ref` to pin a branch, tag or
+    commit. Never read files through `gh api .../contents/...` or blobs:
+    they come back base64-encoded, and the tool refuses them. A mount is
+    read-only and stays out of status, diff and commits, so exploring is
+    side-effect-free; `unmount` when done. Three tiers for another
+    repository: `mount` to read it, `checkout` to work in it, a worker to
+    hand off the whole errand.
+
+    To file an issue or open a pull request, write the body with your
+    editor to a scratch file (e.g. tmp/body.md; the workspace is mounted,
+    read-only in effect, so gh can read it) and pass `--body-file`. A
+    contribution is the ordinary flow made of reviewable steps: edit,
+    review with the git tools, `commit`, `push` to a feature branch, then
+    `gh pr create --title "..." --body-file tmp/pr.md` with a body written
+    for a reviewer (add `--head owner:branch` for a branch on a fork). Edit
+    a PR's metadata with `gh pr edit`/`gh pr ready`/`gh pr close` — but not
+    its body: descriptions are edited with `updateComment`.
+
+    `comment` posts on an issue or pull request: pass the target (a number
+    or URL) and a body, plus optionally a `path` (and `line`) to anchor it
+    to a PR's diff, or `replyTo` (a #discussion_r<id> link) to reply in a
+    review thread. Comments are agent-authored, so the body must start with
+    ":robot:" — the tool rejects it otherwise, and `gh pr comment`/`gh
+    issue comment`/`gh pr review` are unavailable for the same reason.
+    Keep feedback kind, brief, and to-the-point.
+
+    `updateComment` edits an existing comment (an #issuecomment-<id> or
+    #discussion_r<id> link) or an issue/PR description (a number or URL)
+    by exact-match replacement, like editing a file: `oldText` must occur
+    exactly once and is swapped for `newText`. Change only what needs
+    changing. Only agent-authored comments (starting with ":robot:") can be
+    edited; descriptions always can.
 
     `reviewComments` reads the review comment threads on a pull request —
-    each with its file, line, and diff context. Pass a PR number (resolved
-    against the configured GitHub remote, falling back to the checkout's
-    own origin remote) or a full PR URL; the
-    single-comment links people paste in conversation (ending in
-    #discussion_r<id>) narrow the output to just that comment's thread. When
-    asked to look at or address review feedback, read the thread first and
-    act on what it actually says.
-
-    `prComment` leaves feedback on a pull request: pass the PR and a body,
-    plus optionally a file path (and line within the diff) to anchor it as
-    a review comment. Comments posted this way are agent-authored, so the
-    body must start with ":robot:" — the tool rejects it otherwise. Keep
-    feedback kind, brief, and to-the-point.
-
-    `submitPr` opens a pull request for a branch that is ALREADY on the
-    remote — it is the last step, not the whole trip. A contribution is the
-    ordinary flow you already know, made of reviewable steps: edit, review
-    with the git tools, `commit`, `push` to a feature branch, then
-    `submitPr` with a real title and a body written for a reviewer. It
-    targets the configured remote — or the checkout's own origin remote
-    when none is configured — unless you pass `repo`.
-
-    `updatePr` edits a pull request that already exists: retitle it,
-    rewrite its body, retarget its base branch, flip it between draft and
-    ready for review, or close and reopen it. Only the arguments you pass
-    change. It edits metadata only — new code reaches a PR by pushing more
-    commits to its head branch (`push`, or `pushBranch` for a fork).
+    each with its file, line, and diff context, which `gh pr view` does not
+    show. Pass a PR number or URL; the single-comment links people paste in
+    conversation (ending in #discussion_r<id>) narrow the output to just
+    that comment's thread. When asked to look at or address review
+    feedback, read the thread first and act on what it actually says.
 
     `pushBranch` publishes the workspace's committed HEAD to a branch on
     ANOTHER repository — typically a fork, for when you cannot or should
     not push branches to the repository you checked out (the committer
     `push` only reaches the checkout's own remote). The fork flow is:
     checkout upstream → edit → commit → pushBranch(repo: "you/fork",
-    branch: "fix-x") → submitPr(branch: "you:fix-x"). Pending changes are
-    not pushed: commit first.
+    branch: "fix-x") → `gh pr create --head you:fix-x`. Pending changes
+    are not pushed: commit first.
 
     `checkout` replaces this conversation's workspace with a fresh checkout
     of another git repository — for when work belongs somewhere else, e.g.
@@ -1051,15 +1279,19 @@ type Contributor {
     you name them in `keep` (glob patterns, like `commit`'s paths), which
     carries those files into the new checkout as uncommitted edits. That is
     the way out when you have scratch edits you never meant to commit, or
-    realize you started from the wrong branch. A checked-out workspace
-    cannot export back to the host — its work leaves only by commit + push
-    — so the full errand is checkout → edit → commit → push (or pushBranch,
-    to a fork) → submitPr.
+    realize you started from the wrong branch. Mounts do not follow: they
+    belong to the workspace being left. A checked-out workspace cannot
+    export back to the host — its work leaves only by commit + push — so
+    the full errand is checkout → edit → commit → push (or pushBranch, to
+    a fork) → `gh pr create`.
 
     Because checkout is one-way, prefer delegating the whole errand when you
     have the means to (e.g. a staff worker or sub-agent whose workspace is a
     disposable copy): tell it to checkout the repository, make the change,
-    commit, push, and submit the PR, and your own workspace stays bound.
-    Only checkout yourself when switching repositories IS the task at hand.
+    commit, push, and open the PR, and your own workspace stays bound. The
+    natural shape: `mount` the dependency and investigate it with your full
+    toolset here; once you know the fix belongs upstream, hand a worker the
+    checkout, the change, and the push. Only checkout yourself when
+    switching repositories IS the task at hand.
   """
 }

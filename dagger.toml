@@ -62,10 +62,6 @@ name = "contributor"
 is-module = true
 name = "delegate"
 
-[sdks.dang.scopes.librarian]
-is-module = true
-name = "librarian"
-
 [sdks.dang.scopes.sandbox]
 is-module = true
 name = "sandbox"
