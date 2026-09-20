@@ -1,5 +1,5 @@
-# Install in other workspaces: dagger install github.com/vito/agents/browser
-# Registered in this repository so normal checks include browser coverage.
+# Optional: dagger install github.com/vito/agents/browser
+# Keep unregistered here until the typed media APIs ship in the CI engine.
 
 # Only the fields needed by the module's lifecycle bookkeeping; the complete
 # wire response remains available as an artifact and in the printed summary.

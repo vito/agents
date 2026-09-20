@@ -24,9 +24,6 @@ githubToken = "cmd://gh auth token"
 [modules.context]
 source = "context"
 
-[modules.browser]
-source = "browser"
-
 
 
 
