@@ -126,7 +126,7 @@ type Contributor {
 
     Wire it up in dagger.toml settings rather than passing it around:
 
-        [env.dev.modules.contributor.settings]
+        [modules.contributor.settings]
         githubToken = "env://GITHUB_TOKEN"
 
     Without it, everything that talks to GitHub is unavailable. Git
@@ -140,7 +140,7 @@ type Contributor {
     of any one task, so it shouldn't vary between contributors or throwaway
     forks (a permanent fork would simply configure a different value):
 
-        [env.dev.modules.contributor.settings]
+        [modules.contributor.settings]
         remote = "dagger/dagger"
 
     When unset, tools that need a repository fall back to the origin remote
@@ -1197,7 +1197,7 @@ type Contributor {
     No GitHub token is configured, so GitHub operations are unavailable.
     Wire one up in dagger.toml:
 
-        [env.dev.modules.contributor.settings]
+        [modules.contributor.settings]
         githubToken = "env://GITHUB_TOKEN"
   """
 
