@@ -58,7 +58,7 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
   // than the worker deadline so the invalidation observation can be retrieved.
   const response = await request('/command', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command) }, Math.min(650000, (command.timeoutMs || 30000) + 45000));
   const envelope = await response.json();
-  if (!envelope.summary || !Array.isArray(envelope.artifacts)) throw new Error('Malformed browser control response');
+  if (!envelope.summary || typeof envelope.summary.instanceID !== 'string' || !envelope.summary.instanceID || !Array.isArray(envelope.artifacts)) throw new Error('Malformed browser control response');
   if (instance && envelope.summary.instanceID !== instance) throw new Error('Session instance changed; refusing restarted service results');
   await fs.mkdir(artifacts, { recursive: true });
   // Fresh client containers normally start empty; refuse to overwrite retained
@@ -66,7 +66,9 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
   if ((await fs.readdir(artifacts)).length) throw new Error('Artifact output directory must be empty');
   for (const name of envelope.artifacts) {
     if (!safeRelative(name)) throw new Error('Invalid artifact path from browser control');
-    const response = await request(`/artifact?id=${encodeURIComponent(envelope.observation)}&path=${encodeURIComponent(name)}`);
+    // Pin every fetch, not just the command: the service can restart between
+    // its result response and materialization of the retained artifact bytes.
+    const response = await request(`/artifact?id=${encodeURIComponent(envelope.observation)}&path=${encodeURIComponent(name)}&expectedInstance=${encodeURIComponent(envelope.summary.instanceID)}`);
     const bytes = Buffer.from(await response.arrayBuffer());
     const target = path.join(artifacts, name);
     await fs.mkdir(path.dirname(target), { recursive: true });

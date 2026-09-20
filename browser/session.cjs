@@ -137,6 +137,13 @@ async function worker(config, workspace, working) {
   context.on('response', response => events.network.add({ type: 'response', status: response.status(), url: clip(response.url(), 4000) }));
   context.on('requestfailed', request => events.network.add({ type: 'failed', url: clip(request.url(), 4000), error: request.failure()?.errorText }));
   const page = await context.newPage();
+  let stopping = false;
+  const closed = resource => {
+    if (!stopping) process.send?.({ fatal: `${resource} closed; session invalidated` });
+  };
+  browser.on('disconnected', () => closed('Browser'));
+  context.on('close', () => closed('Browser context'));
+  page.on('close', () => closed('Session page'));
   // Provenance comes from the served main-document response, not from the
   // current source pointer at framenavigated: hash/history changes are not reloads.
   page.on('response', response => {
@@ -262,11 +269,13 @@ async function worker(config, workspace, working) {
       if (data.truncated) warnings.push({ code: 'diagnostics-truncated', message: `${kind} buffer exceeded ${EVENT_LIMIT} events` });
       if (kind === 'pageerrors' && data.events.length) warnings.push({ code: 'page-errors', message: `${data.events.length} page or mock errors` });
       if (kind === 'network' && data.events.some(event => event.type === 'failed')) warnings.push({ code: 'network-failures', message: 'Some browser requests failed' });
+      if (kind === 'network' && data.events.some(event => event.type === 'response' && event.status >= 400)) warnings.push({ code: 'http-errors', message: 'Some browser responses returned HTTP 4xx or 5xx' });
       if (kind === 'console' && data.events.some(event => event.type === 'error')) warnings.push({ code: 'console-errors', message: 'Console errors were observed' });
     }
     if (loadedFingerprint !== null && loadedFingerprint !== fingerprint) warnings.push({ code: 'stale-document', message: 'Source changed; the loaded document has not been reloaded' });
     if (loadedFingerprint === null) warnings.push({ code: 'unknown-loaded-source', message: 'Loaded document has no verified workspace fingerprint' });
     if (cmd.op === 'stop') {
+      stopping = true;
       await browser.close();
       await staticServer?.close();
       for (const dir of sourceDirs) await fs.rm(dir, { recursive: true, force: true });
@@ -293,7 +302,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   const instanceID = crypto.randomUUID();
   const child = fork(__filename, ['--worker', JSON.stringify({ ...config, token: undefined }), workspace, working], { detached: true, stdio: ['ignore', 'ignore', 'inherit', 'ipc'], env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^BROWSER_(TOKEN|INSTANCE|ENDPOINT)$/.test(key))) });
   let state = { session: config.session, instanceID, state: 'starting', fingerprint: config.fingerprint || '', loadedFingerprint: null, fixtureRevision: 0 };
-  let pending, exited = false, killed = false, idle, queue = Promise.resolve(), queued = 0, usedBytes = 0;
+  let pending, exited = false, killTask, idle, queue = Promise.resolve(), queued = 0, usedBytes = 0;
   const retained = new Map();
   const ids = new Set();
   let startupResolve, startupReject;
@@ -301,10 +310,18 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   child.on('message', message => {
     if (message.ready) { state = { ...message.ready, instanceID }; startupResolve(); }
     if (message.state && state.state === 'running') state = { ...state, ...message.state, instanceID };
+    if (message.fatal && !['failed', 'stopped'].includes(state.state)) {
+      clearTimeout(idle);
+      state = { ...state, state: 'failed', failure: String(message.fatal) };
+      startupReject(new Error(state.failure));
+      pending?.reject(new Error(state.failure)); pending = null;
+      void kill().catch(error => { state.failure = errorText(error); });
+    }
     if (message.done && pending?.id === message.done) { const waiting = pending; pending = null; message.error ? waiting.reject(new Error(message.error)) : waiting.resolve(message.result); }
   });
   child.on('error', error => { startupReject(error); pending?.reject(error); pending = null; });
   child.on('exit', (code, signal) => {
+    clearTimeout(idle);
     exited = true;
     if (!['stopped', 'failed'].includes(state.state)) state = { ...state, state: 'failed', failure: `Browser worker exited (code ${code}, signal ${signal})` };
     startupReject(new Error(state.failure || 'Browser worker exited during startup'));
@@ -313,12 +330,15 @@ async function controller(config, { workspace = '/workspace', observations = '/o
     // expiry. The group is killed only once, avoiding PID reuse after retention.
     void kill().catch(error => { state.failure = errorText(error); });
   });
-  const kill = async () => {
-    if (killed) return;
-    killed = true;
-    // Kill the process group, including browser descendants. Never reuse it.
-    try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    if (!exited) await new Promise(resolve => child.once('exit', resolve));
+  const kill = () => {
+    // Every caller must wait for termination, including when a fatal message
+    // and the active command's rejection both try to invalidate the worker.
+    if (!killTask) killTask = (async () => {
+      // Kill the process group, including browser descendants. Never reuse it.
+      try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+      if (!exited) await new Promise(resolve => child.once('exit', resolve));
+    })();
+    return killTask;
   };
   const startupTimer = setTimeout(() => { startupReject(new Error('Browser launch timed out')); }, 45000);
   try { await startup; } catch (error) { await kill(); await fs.rm(working, { recursive: true, force: true }); throw error; }
@@ -400,6 +420,8 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       if (req.headers.origin || auth.length !== expected.length || !crypto.timingSafeEqual(auth, expected)) { res.writeHead(403).end('Forbidden'); return; }
       const url = new URL(req.url, 'http://control');
       if (req.method === 'GET' && url.pathname === '/artifact') {
+        const expectedInstance = url.searchParams.get('expectedInstance');
+        if (expectedInstance && expectedInstance !== instanceID) throw new Error('Session instance changed; refusing restarted service artifacts');
         const id = url.searchParams.get('id'), name = url.searchParams.get('path');
         if (!validID(id) || !retained.get(id)?.has(name)) throw new Error('Unknown artifact');
         const file = await regularFile(path.join(observations, id), name);
@@ -418,7 +440,12 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       validateCommand(cmd);
       if (queued >= 32) throw new Error('Command queue is full');
       queued++; clearTimeout(idle);
-      const task = queue.then(() => execute(cmd));
+      const task = queue.then(() => {
+        // A transport timeout while waiting must not apply an abandoned action
+        // later. Active commands still run under the controller's deadline.
+        if (res.destroyed) throw new Error('Command cancelled before execution');
+        return execute(cmd);
+      });
       queue = task.catch(() => {});
       let envelope;
       try { envelope = await task; } finally { queued--; armIdle(); }

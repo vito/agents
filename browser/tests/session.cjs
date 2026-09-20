@@ -41,8 +41,8 @@ async function fixture(t, overrides = {}) {
       if (!response.ok) throw new Error(`${response.status}: ${text}`);
       return JSON.parse(text);
     },
-    async file(id, name) {
-      const response = await fetch(`${service.endpoint}/artifact?id=${encodeURIComponent(id)}&path=${encodeURIComponent(name)}`, { headers: { Authorization: `Bearer ${token}` } });
+    async file(id, name, expectedInstance = service.instanceID) {
+      const response = await fetch(`${service.endpoint}/artifact?id=${encodeURIComponent(id)}&path=${encodeURIComponent(name)}&expectedInstance=${encodeURIComponent(expectedInstance)}`, { headers: { Authorization: `Bearer ${token}` } });
       if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
       return Buffer.from(await response.arrayBuffer());
     },
@@ -168,6 +168,18 @@ test('failed assertions preserve session; diagnostics have cursors, truncation a
   assert.equal(truncated.summary.inspection.truncated, true);
 });
 
+test('HTTP error responses are distinct from network transport failures', async t => {
+  const f = await fixture(t);
+  await navigate(f);
+  const result = await f.request({ op: 'exec', script: `
+    await mock('**/unavailable', {status: 503, json: {error:'fixture unavailable'}});
+    assert.equal(await page.evaluate(() => fetch('/unavailable').then(r => r.status)), 503);
+  ` });
+  passes(result);
+  assert.ok(result.summary.warnings.some(w => w.code === 'http-errors'));
+  assert.equal(result.summary.warnings.some(w => w.code === 'network-failures'), false);
+});
+
 test('page errors between commands are retained in the next observation', async t => {
   const f = await fixture(t);
   await navigate(f);
@@ -216,6 +228,61 @@ test('requests are serialized and reused observation IDs cannot mutate earlier e
   passes(await f.request({ op: 'exec', script: `assert.equal(await page.evaluate(() => window.serial), 'second');` }));
 });
 
+test('queued commands disconnected by their client never execute', async t => {
+  const f = await fixture(t);
+  await navigate(f);
+  const marker = path.join(f.root, 'started');
+  const first = f.request({ op: 'exec', script: `await require('node:fs/promises').writeFile(${JSON.stringify(marker)}, 'ready'); await page.waitForTimeout(500);` });
+  for (let attempts = 0; ; attempts++) {
+    if (await fs.stat(marker).catch(() => null)) break;
+    assert.ok(attempts < 200, 'first command started');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  const abort = new AbortController();
+  const abandoned = fetch(`${f.service.endpoint}/command`, {
+    method: 'POST', signal: abort.signal,
+    headers: { Authorization: `Bearer ${f.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ op: 'exec', id: 'abandoned', expectedInstance: f.service.instanceID, script: 'await page.evaluate(() => window.abandoned = true)' }),
+  });
+  const rejected = assert.rejects(abandoned, /abort/i);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  abort.abort();
+  await rejected;
+  passes(await first);
+  passes(await f.request({ op: 'exec', script: 'assert.equal(await page.evaluate(() => window.abandoned), undefined)' }));
+  await assert.rejects(fs.stat(path.join(f.observations, 'abandoned')), /ENOENT/);
+});
+
+for (const resource of ['page', 'context', 'browser']) test(`closing the ${resource} invalidates the session`, async t => {
+  const f = await fixture(t);
+  const first = await navigate(f);
+  const bytes = await f.file(first.observation, 'screenshot.png');
+  const result = await f.request({ op: 'exec', script: `await ${resource}.close();` });
+  assert.equal(result.summary.ok, false);
+  assert.equal(result.summary.state, 'failed');
+  assert.match(result.summary.checks[0].error, /closed; session invalidated/);
+  assert.equal((await f.request({ op: 'status' })).summary.state, 'failed');
+  await assert.rejects(f.request({ op: 'exec', script: '' }), /Session is failed/);
+  assert.deepEqual(await f.file(first.observation, 'screenshot.png'), bytes);
+});
+
+test('browser closure between commands stays failed after the idle deadline', async t => {
+  const f = await fixture(t, { idleTimeoutMs: 600 });
+  const marker = path.join(f.root, 'close-browser');
+  passes(await f.request({ op: 'exec', script: `
+    const timer = setInterval(async () => {
+      if (!await require('node:fs/promises').stat(${JSON.stringify(marker)}).catch(() => null)) return;
+      clearInterval(timer);
+      await browser.close().catch(() => {});
+    }, 20);
+  ` }));
+  await fs.writeFile(marker, 'close');
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  const status = await f.request({ op: 'status' });
+  assert.equal(status.summary.state, 'failed');
+  assert.match(status.summary.failure, /closed; session invalidated/);
+});
+
 for (const [name, script] of [
   ['async', `await new Promise(resolve => setTimeout(resolve, 1200)); await require('node:fs/promises').writeFile(artifactsPath + '/late.txt', 'unsafe late write');`],
   ['sync', 'while (true) {}'],
@@ -245,6 +312,7 @@ test('controller rejects origins, credentials, restarts, unsafe paths and unsafe
   await assert.rejects(f.request({ op: 'exec', script: '', expectedInstance: 'different-boot' }), /instance changed/);
   await assert.rejects(f.request({ op: 'exec', id: '../escape', script: '' }), /Invalid observation ID/);
   const observation = await navigate(f);
+  await assert.rejects(f.file(observation.observation, 'results.json', 'different-boot'), /instance changed/);
   for (const name of ['../results.json', '/etc/passwd', 'missing', 'x\\y', 'trace.zip/../results.json']) await assert.rejects(f.file(observation.observation, name), /Unknown artifact/);
   // Even an inventoried path must still be a regular file when fetched.
   await fs.unlink(path.join(f.observations, observation.observation, 'screenshot.png'));
@@ -279,11 +347,17 @@ test('client materializes immutable evidence and state, detects restarts, and pr
   const f = await fixture(t);
   const output = path.join(f.root, 'client'); await fs.mkdir(output);
   const options = { endpoint: f.service.endpoint, token: f.token, instance: f.service.instanceID, artifacts: path.join(output, 'artifacts'), summaryPath: path.join(output, 'summary.json'), statePath: path.join(output, 'state.json') };
+  const artifactInstances = [];
+  f.service.server.on('request', req => {
+    const url = new URL(req.url, f.service.endpoint);
+    if (url.pathname === '/artifact') artifactInstances.push(url.searchParams.get('expectedInstance'));
+  });
   const result = await client({ op: 'exec', id: 'client-observation', script: `console.log('captured, not stdout'); await page.goto(baseURL);` }, options);
   passes(result);
   assert.deepEqual(JSON.parse(await fs.readFile(options.summaryPath, 'utf8')), result);
   assert.equal(JSON.parse(await fs.readFile(options.statePath, 'utf8')).instanceID, f.service.instanceID);
   assert.deepEqual((await fs.readdir(options.artifacts)).sort(), result.artifacts);
+  assert.deepEqual(artifactInstances, result.artifacts.map(() => f.service.instanceID));
   await assert.rejects(client({ op: 'status' }, { ...options, instance: 'restarted' }), /instance changed/);
   // The CLI's fixed paths are safe in the disposable prepared test container.
   await fs.rm('/artifacts', { recursive: true, force: true });
