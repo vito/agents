@@ -35,7 +35,7 @@ async function workspaceFile(root, name) {
   return real;
 }
 
-async function serve(root) {
+async function serve(root, { currentRoot, responseHeaders } = {}) {
   root = await fs.realpath(root);
   const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8', '.wasm': 'application/wasm' };
   const server = http.createServer(async (req, res) => {
@@ -45,11 +45,14 @@ async function serve(root) {
     try {
       const pathname = decodeURIComponent(req.url.split(/[?#]/, 1)[0]);
       if (pathname.includes('\0') || pathname.includes('\\') || pathname.split('/').includes('..')) throw new Error('Unsafe path');
-      let file = await workspaceFile(root, `.${pathname}`);
-      if ((await fs.stat(file)).isDirectory()) file = await workspaceFile(root, path.join(file, 'index.html'));
+      // A persistent session swaps the source pointer, not the listening URL.
+      // Resolve it once so a request sees one complete source generation.
+      const requestRoot = currentRoot ? await fs.realpath(currentRoot()) : root;
+      let file = await workspaceFile(requestRoot, `.${pathname}`);
+      if ((await fs.stat(file)).isDirectory()) file = await workspaceFile(requestRoot, path.join(file, 'index.html'));
       if (!(await fs.stat(file)).isFile()) throw new Error('Not a file');
       const body = await fs.readFile(file);
-      res.writeHead(200, { 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': body.length });
+      res.writeHead(200, { ...responseHeaders?.(requestRoot), 'Content-Type': types[path.extname(file).toLowerCase()] || 'application/octet-stream', 'Content-Length': body.length });
       res.end(req.method === 'HEAD' ? undefined : body);
     } catch (error) {
       res.writeHead(error.code === 'ENOENT' ? 404 : 403).end('Not found');
