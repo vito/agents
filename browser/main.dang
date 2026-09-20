@@ -1,5 +1,5 @@
-# Optional: dagger install github.com/vito/agents/browser
-# Deliberately not installed in this repository's default agent composition.
+# Install in other workspaces: dagger install github.com/vito/agents/browser
+# Registered in this repository so normal checks include browser coverage.
 
 # Only the fields needed by the module's lifecycle bookkeeping; the complete
 # wire response remains available as an artifact and in the printed summary.
