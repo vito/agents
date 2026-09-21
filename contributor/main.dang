@@ -796,14 +796,8 @@ type Contributor {
     Branch, tag, or commit SHA to check out. Empty uses the repository's
     default branch. Branches stay attached; tags and SHAs use detached HEAD.
     Use a full SHA for a remote commit; abbreviated SHAs may not resolve.
-    Mutually exclusive with the compatibility `branch` argument.
     """
     ref: String! = "",
-    """
-    Compatibility alias for selecting a branch. Prefer `ref`; do not set
-    both. Empty leaves selection to `ref` or the repository's default branch.
-    """
-    branch: String! = "",
     """
     Glob patterns of pending changes to carry into the new checkout, relative
     to the workspace root (e.g. "notes/**" or "scratch.md") — the same
@@ -823,7 +817,7 @@ type Contributor {
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): resolves a live remote and rebinds the conversation; a
     # later identical call must fetch the repo as it is then.
-    let prepared = checkoutWorkspace(source, git(repo), repo, ref, branch, keep)
+    let prepared = checkoutWorkspace(source, git(repo), repo, ref, keep)
     let target = prepared.workspace
     let where = prepared.where
 
@@ -895,19 +889,18 @@ type Contributor {
       .withNewFile("left.txt", "left behind\n")
       .withoutFile("delete.txt")
 
-    # Empty ref, branches (including the compatibility spelling), tags of
-    # both kinds, and a SHA all go through the exact production helper.
+    # Empty ref, branches, tags of both kinds, and a SHA all go through the
+    # exact production helper.
     let cases = [
-      {{ref: "", branch: "", sha: baseSha, state: "branch main", head: "ref: refs/heads/main\n", marker: "base\n"}},
-      {{ref: "feature", branch: "", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-      {{ref: "refs/heads/feature", branch: "", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-      {{ref: "", branch: "feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-      {{ref: "v1", branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
-      {{ref: "v1-annotated", branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
-      {{ref: baseSha, branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+      {{ref: "", sha: baseSha, state: "branch main", head: "ref: refs/heads/main\n", marker: "base\n"}},
+      {{ref: "feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+      {{ref: "refs/heads/feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+      {{ref: "v1", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+      {{ref: "v1-annotated", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+      {{ref: baseSha, sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
     ]
     cases.each { c =>
-      let prepared = checkoutWorkspace(source, fixture, "fixture", c.ref, c.branch)
+      let prepared = checkoutWorkspace(source, fixture, "fixture", c.ref)
       assert { prepared.where.contains(c.sha + "; " + c.state) }
       assert { prepared.workspace.git.head.commitSHA == c.sha }
       assert { prepared.workspace.git.directory.file("HEAD").contents == c.head }
@@ -926,11 +919,6 @@ type Contributor {
       assert { target.git.uncommitted.diffStats.{{path}}.length == 3 }
       assert { prepared.where.contains("3 pending file(s) kept:") }
     }
-    # Reject conflicting selectors even if they name the same branch.
-    let both = checkoutWorkspace(source, fixture, "fixture", "main", "main").where rescue {
-      e: Error => e.message
-    }
-    assert { both.contains("mutually exclusive") }
     let missing = checkoutWorkspace(source, fixture, "fixture", "no-such-ref").where rescue {
       e: Error => e.message
     }
@@ -960,17 +948,9 @@ type Contributor {
     repository: GitRepository!,
     repo: String!,
     ref: String! = "",
-    branch: String! = "",
     keep: [String!]! = [],
   ): {{workspace: Workspace!, where: String!}}! {
-    if (ref != "" and branch != "") {
-      raise "checkout: `ref` and `branch` are mutually exclusive; pass only `ref` (preferred) or the compatibility `branch` argument"
-    }
-    let selected = if (branch != "") {
-      # Retain the old branch-only lookup for compatibility, including when
-      # a tag has the same name as the branch.
-      repository.branch(branch)
-    } else if (ref != "") {
+    let selected = if (ref != "") {
       repository.ref(ref)
     } else {
       repository.head
@@ -986,7 +966,7 @@ type Contributor {
     } else {
       "detached HEAD"
     }
-    let label = if (ref != "") { ref } else if (branch != "") { branch } else { "HEAD" }
+    let label = if (ref != "") { ref } else { "HEAD" }
 
     # Pending changes selected by `keep`, resolved against the OLD workspace
     # before anything switches. An explicit selection that matches nothing
@@ -1427,9 +1407,8 @@ type Contributor {
     of a git repository — the writable starting point for development,
     PR review, or addressing feedback outside the current workspace. Pass
     `ref` to select a branch, tag, or commit SHA; omit it for the default
-    branch. `branch` remains a compatibility alias for branch selection;
-    never set both. Branch refs keep their branch; tags and SHAs produce
-    detached HEAD, so publishing from them needs an explicit push branch.
+    branch. Branch refs keep their branch; tags and SHAs produce detached
+    HEAD, so publishing from them needs an explicit push branch.
     Checkout reports the resolved SHA and branch/detached state. Your
     tools come along and operate on the new checkout, and any agents the
     target workspace itself defines are composed on top of them. The switch
