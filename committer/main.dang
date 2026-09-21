@@ -20,8 +20,8 @@
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
 #     workspace to the returned state. `date` is required (for reproducible
 #     commits); currentTimestamp supplies it.
-#   * Workspace.withReset(commit:, hard: false) moves HEAD while preserving
-#     the working tree, so commits can be redone without losing pending edits.
+#   * Workspace.withReset(commit:, hard:) moves HEAD, preserving the working
+#     tree by default or replacing it with the target commit when hard is true.
 #   * GitRef.push publishes HEAD to the checkout's remote, engine-side (no
 #     host checkout involved), with an optional lease in the style of
 #     `--force-with-lease`. An effect on the remote, so never cached.
@@ -37,7 +37,7 @@
 #     through the returned LLM.
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, commit, reset, rebase, and push.
+history, restore files, commit, reset, rebase, and push.
 """
 type Committer {
   # Keep the workspace being left so reset can restore pruned history too.
@@ -62,7 +62,7 @@ type Committer {
   let rebaseBranch: String! = ""
 
   let plumbing = [
-    "withSavedWorkspace", "withRebaseState", "withoutRebaseState", "checkMessages", "checkRebaseHelpers", "checkRebaseReplay", "checkFiltering"
+    "withSavedWorkspace", "withRebaseState", "withoutRebaseState", "checkMessages", "checkRebaseHelpers", "checkRebaseReplay", "checkFiltering", "checkRestore"
   ]
 
   """
@@ -140,6 +140,75 @@ type Committer {
   }
 
   """
+  Restore selected files from a commit without moving HEAD.
+
+  Selected paths become identical to the source commit's tree: modified or
+  deleted files are restored, and selected additions absent from that commit
+  are removed. Paths outside the selection are left alone. There is no staging
+  area: this replaces working-tree files, not index entries.
+
+  Use `preview: true` to inspect the changes without applying them. Only restore
+  when discarding the selected edits is intended; use `reset` to move HEAD.
+  """
+  restore(
+    source: Workspace!,
+    """
+    Required, nonempty glob patterns relative to the workspace root, using the
+    same conventions as status and commit (e.g. "sdk/php/generated/**"). Matches
+    files in either the working tree or source commit, including deleted files.
+    Fails if no files match; use "**" explicitly to select everything.
+    """
+    paths: [String!]!,
+    """
+    Commit to restore from: HEAD by default, or a short/full hash, branch, or tag.
+    HEAD itself is never moved.
+    """
+    ref: String! = "HEAD",
+    """
+    Show the proposed changes without modifying the workspace.
+    """
+    preview: Boolean! = false,
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    if (paths.isEmpty or paths.any { p => p.trimSpace == "" }) {
+      raise "restore: specify nonempty path patterns; use ** explicitly to restore everything"
+    }
+    if (ref.trimSpace == "") {
+      raise "restore: specify a source commit, or omit ref to use HEAD"
+    }
+    let before = source.snapshot
+    let sha = resolveSpec(before, ref, head(before).commitSHA)
+    let tree = repositoryHolding(before, sha).commit(id: sha).tree(discardGitDir: true)
+    # Diff BOTH trees before filtering: filtering only the source tree misses
+    # additions that need removal, and filtering only the workspace misses
+    # deleted files that need restoration. withChanges applies exact contents,
+    # not a three-way merge that could keep edits we intended to discard.
+    let changes = tree.changes(from: before.directory("/")).filter(include: paths)
+    if (changes.isEmpty) {
+      # Distinguish an already-restored selection from a typo. Reuse Changeset's
+      # glob semantics rather than introducing a second path matcher.
+      if (tree.changes(from: directory).filter(include: paths).isEmpty) {
+        raise `restore: no files match paths: ${paths.join(", ")}`
+      }
+      print(`Selected files already match ${short(sha)}; nothing to restore.`)
+      return source
+    }
+    print((if (preview) { "Restore preview" } else { "Restoring files" })
+      + ` from ${sha}; HEAD unchanged.\n\n`
+      + statBlock(changes, [], maxFiles) + "\n\n"
+      + patchBlock(changes.asPatch.contents, [], 400))
+    if (preview) {
+      return source
+    }
+    # Apply to the original workspace: a snapshot pins HEAD and can lose the
+    # branch attachment, which restore must preserve along with the commit.
+    let restored = source.withChanges(changes)
+    restored.git.uncommitted.diffStats.{{path}}.length rescue {
+      e: Error => raise `restore failed: ${plainError(e.message)}`
+    }
+    restored
+  }
+
+  """
   Record the workspace's pending changes as a git commit and advance HEAD.
 
   Without `paths`, EVERYTHING `status` lists is committed — including files
@@ -213,13 +282,15 @@ type Committer {
   Reset to a commit, or restore a workspace saved by an earlier reset.
 
   Use this to redo or combine local commits: read `log`, choose the commit to
-  return to, reset, then review `status` / `diff` and commit again. Changes
-  from the undone commits and any pending edits remain in the workspace
-  when resetting to a commit that has not been saved.
+  return to, reset, then review `status` / `diff` and commit again. By default,
+  changes from the undone commits and any pending edits remain in the workspace
+  when resetting to a commit that has not been saved. With `hard: true`, the
+  working tree is replaced by the target commit's tree, discarding pending edits.
 
   Each reset saves the workspace being left under its HEAD hash. Returning
   to a saved hash restores that entire workspace, including its pending
-  edits, rather than carrying over your current working tree. The workspace
+  edits, rather than carrying over your current working tree — unless `hard`
+  is true, which restores only the saved commit's tree. The workspace
   you leave is saved in turn, so you can go back again. Full hashes or unique
   prefixes of at least four characters select saved workspaces.
   Each hash keeps its most recently saved workspace.
@@ -236,6 +307,12 @@ type Committer {
     to undo.
     """
     commit: String!,
+    """
+    Replace the working tree with the target commit's tree, discarding pending
+    edits even for a saved workspace. Defaults to false. The workspace being
+    left is still saved for recovery.
+    """
+    hard: Boolean! = false,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     let want = commit.trimSpace
     if (want == "") {
@@ -251,16 +328,22 @@ type Committer {
     }
     let remembered = saved[matches.takeFirst.join("")]
     let target = if (remembered != null) {
-      remembered
+      if (hard) {
+        remembered.withReset(commit: remembered.git.head.commitSHA, hard: true)
+      } else {
+        remembered
+      }
     } else {
-      before.withReset(commit: want, hard: false)
+      before.withReset(commit: want, hard: hard)
     }
     # Force evaluation before returning the workspace, like commit: failures
     # should surface here, not while the agent is rebinding its workspace.
     let sha = target.git.head.commitSHA rescue {
       e: Error => raise `reset failed: ${plainError(e.message)}`
     }
-    let note = if (remembered != null) {
+    let note = if (hard) {
+      "Working tree replaced with the target commit's tree; pending edits discarded."
+    } else if (remembered != null) {
       "Restored the saved workspace, including its pending edits."
     } else {
       "Working tree preserved; review status / diff before committing again."
@@ -1105,6 +1188,77 @@ type Committer {
     "Glob filtering and commit checks passed."
   }
 
+  """
+  Check selective restoration, previews, and validation on private fixtures.
+  """
+  checkRestore(source: Workspace!): String! @check {
+    let root = "restore-check-" + Random.string
+    let fixture = source.git.head.asWorkspace
+      .withNewFile(root + "/edit.go", "before\n")
+      .withNewFile(root + "/deleted.go", "restore me\n")
+      .withNewFile(root + "/old.go", "rename\n")
+      .withNewFile(root + "/keep.txt", "keep\n")
+    let base = fixture.withCommit(
+      changes: fixture.git.uncommitted,
+      message: "fixture",
+      date: "2026-09-15T12:00:00Z",
+    )
+    let working = base.withNewFile(root + "/edit.go", "after\n")
+      .withoutFile(root + "/deleted.go")
+      .withoutFile(root + "/old.go")
+      .withNewFile(root + "/new.go", "rename\n")
+      .withNewFile(root + "/nested/added.go", "added\n")
+      .withNewFile(root + "/keep.txt", "unselected\n")
+      .withNewFile(root + "/nested/keep.txt", "unselected addition\n")
+    let paths = [root + "/**/*.go"]
+    let previewed = restore(working, paths, preview: true)
+    assert { previewed.directory("/").changes(from: working.directory("/")).isEmpty }
+    assert { head(previewed).commitSHA == head(working).commitSHA }
+    let restored = restore(working, paths)
+    assert { head(restored).commitSHA == head(working).commitSHA }
+    assert { branchOf(restored) == branchOf(working) }
+    assert { restored.file(root + "/edit.go").contents == "before\n" }
+    assert { restored.file(root + "/deleted.go").contents == "restore me\n" }
+    assert { restored.file(root + "/old.go").contents == "rename\n" }
+    assert { restored.git.uncommitted.filter(include: paths).isEmpty }
+    assert { restored.file(root + "/keep.txt").contents == "unselected\n" }
+    assert { restored.file(root + "/nested/keep.txt").contents == "unselected addition\n" }
+    # Selecting just one side of a rename must not touch the unselected side.
+    let oldOnly = restore(working, [root + "/old.go"])
+    assert { oldOnly.file(root + "/old.go").contents == "rename\n" }
+    assert { oldOnly.file(root + "/new.go").contents == "rename\n" }
+    let newOnly = restore(working, [root + "/new.go"])
+    assert { newOnly.directory("/").changes(from: working.withoutFile(root + "/new.go").directory("/")).isEmpty }
+    # Restore from an older commit, leaving HEAD and unrelated pending edits.
+    let tip = working.withCommit(
+      changes: working.git.uncommitted.filter(include: paths),
+      message: "fixture tip",
+      date: "2026-09-15T12:01:00Z",
+    )
+    let historical = restore(tip, paths, ref: head(base).commitSHA)
+    assert { head(historical).commitSHA == head(tip).commitSHA }
+    assert { historical.directory("/").changes(from: restored.directory("/")).isEmpty }
+    let abbreviated = restore(tip, paths, ref: short(head(base).commitSHA))
+    assert { abbreviated.directory("/").changes(from: historical.directory("/")).isEmpty }
+    # A matching but unchanged selection succeeds, unlike a typo.
+    assert { restore(restored, paths).directory("/").changes(from: restored.directory("/")).isEmpty }
+    [[], [""], ["   "]].each { invalid =>
+      let error = restore(working, invalid).git.head.commitSHA rescue { e: Error => e.message }
+      assert { error.contains("specify nonempty path patterns") }
+    }
+    let missing = restore(working, [root + "/missing/**"]).git.head.commitSHA rescue { e: Error => e.message }
+    assert { missing.contains("no files match") }
+    let badCommit = restore(working, paths, ref: "not-a-real-ref").git.head.commitSHA rescue { e: Error => e.message }
+    assert { badCommit.contains("cannot resolve commit") }
+    let emptyCommit = restore(working, paths, ref: " ").git.head.commitSHA rescue { e: Error => e.message }
+    assert { emptyCommit.contains("specify a source commit") }
+    # Explicit whole-tree selection also restores files outside the fixture.
+    assert { restore(working, ["**"]).git.uncommitted.isEmpty }
+    let tools = agent(llm.withWorkspace(source)).tools
+    assert { tools.contains("restore") and !tools.contains("checkRestore") }
+    "Restore checks passed."
+  }
+
   # ---------------------------------------------------------------- helpers
 
   # Bound commit-message searches in `log`; commit resolution has no window.
@@ -1640,6 +1794,12 @@ type Committer {
     - `diff` — those same changes as a full Git-style unified patch, when you
       need to read the actual hunks. Scope it with `paths`; an unscoped patch
       can be huge.
+    - `restore` — replace selected working-tree files from `ref`
+      (default HEAD) without moving HEAD. Required `paths` are globs like
+      status/commit; selection covers both trees, so deleted files return and
+      additions absent from the source are removed. Other files stay untouched.
+      Use `preview: true` to review the proposed patch without applying it.
+      Only restore when discarding those edits is intended; there is no index.
     - `commit` — record pending changes as a commit and advance HEAD. Without
       `paths` it commits EVERYTHING `status` lists; with `paths`, only those
       changes, leaving the rest pending.
@@ -1648,7 +1808,10 @@ type Committer {
       Read `log`, choose the target, then reset, review `status` / `diff`, and
       commit again. Each reset saves the workspace you leave and prints its
       hash. Resetting to a saved hash restores that workspace's files and
-      pending edits; other targets keep your current working tree.
+      pending edits; other targets keep your current working tree. Pass
+      `hard: true` to replace the working tree with the target commit's tree
+      instead, discarding pending edits even for saved targets. The workspace
+      being left is still saved for recovery.
       Rewriting published history needs explicit authorization, not an
       automatic force push after a rejection.
     - `rebase` — replay this branch's commits onto the current tip of a

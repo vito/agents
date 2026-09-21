@@ -39,12 +39,15 @@ def field(node, typename, selection):
 MESSAGES = "messages { role content { kind text callId toolName arguments errored signature } }"
 
 
-def reset(llm, commit, error=None):
+def reset(llm, commit, error=None, hard=None):
     history = field(llm, "LLM", MESSAGES)["messages"]
     call_id = "reset_" + str(len(history))
+    arguments = {"commit": commit}
+    if hard is not None:
+        arguments["hard"] = hard
     history.append({"role": "assistant", "content": [{
         "kind": "TOOL_CALL", "callId": call_id, "toolName": "reset",
-        "arguments": json.dumps({"commit": commit}),
+        "arguments": json.dumps(arguments),
     }]})
     model = "replay/" + base64.b64encode(json.dumps(history).encode()).decode()
     result = query('query($llm: ID!, $model: String!) { node(id: $llm) { ... on LLM '
@@ -101,6 +104,16 @@ def main():
         llm = query('query($llm: ID!) { committer { agent(base: $llm) '
                     '{ withoutSystemPrompts { id } } } }', llm=base_llm)["committer"]["agent"]["withoutSystemPrompts"]["id"]
 
+        # Hard reset to an unsaved commit replaces files and removes pending additions.
+        hard_llm, clean = reset(llm, base_sha, hard=True)
+        assert sha(clean) == base_sha
+        assert contents(clean, "file.txt") == "base\n"
+        assert field(clean, "Workspace", "git { uncommitted { isEmpty } }")["git"]["uncommitted"]["isEmpty"]
+        # The discarded workspace is still recoverable with an explicit soft reset.
+        hard_llm, recovered = reset(hard_llm, tip_sha, hard=False)
+        assert sha(recovered) == tip_sha
+        assert contents(recovered, "pending.txt") == "original pending\n"
+
         # Ordinary reset preserves files while moving HEAD backward.
         llm, backward = reset(llm, base_sha)
         assert sha(backward) == base_sha
@@ -133,9 +146,26 @@ def main():
             assert contents(unchanged, "pending.txt") == "original pending\n"
         llm, returned = reset(llm, base_sha)
         assert contents(returned, "pending.txt") == "edited after reset\n"
+
+        # Hard reset also cleans a saved, now-pruned target selected by prefix.
+        llm, clean = reset(llm, tip_sha[:12], hard=True)
+        assert sha(clean) == tip_sha
+        assert contents(clean, "file.txt") == "committed\n"
+        assert field(clean, "Workspace", "git { uncommitted { isEmpty } }")["git"]["uncommitted"]["isEmpty"]
+        llm, recovered = reset(llm, base_sha)
+        assert sha(recovered) == base_sha
+        assert contents(recovered, "pending.txt") == "edited after reset\n"
+
+        # Hard reset to HEAD discards edits without moving the commit.
+        llm, clean = reset(llm, "HEAD", hard=True)
+        assert sha(clean) == base_sha
+        assert contents(clean, "file.txt") == "base\n"
+        assert field(clean, "Workspace", "git { uncommitted { isEmpty } }")["git"]["uncommitted"]["isEmpty"]
+        llm, recovered = reset(llm, base_sha)
+        assert contents(recovered, "pending.txt") == "edited after reset\n"
         assert git("rev-parse", "HEAD") == tip_sha
         assert git("status", "--porcelain") == ""
-    print("PASS: reset recovery, pending edits, tool rebinding, prefixes and failed resets")
+    print("PASS: soft/hard reset, recovery, pending edits, tool rebinding, prefixes and failed resets")
 
 
 if __name__ == "__main__":
