@@ -1,7 +1,5 @@
-# Register repository development checks here, not in the installable agents.
-# The implementations stay with their modules to exercise private helpers and
-# state without exposing those internals as API. They are ordinary methods:
-# installing an agent alone must never register its development checks.
+# Repository development checks exercise the installable agents through their
+# public APIs. No test entry points or test-only tool exclusions live in agents.
 type AgentsDev {
   """Check commit-message validation and conservative description wrapping."""
   committerMessages: String! @check {
@@ -30,17 +28,17 @@ type AgentsDev {
 
   """Check promotion preserves special-character metadata and the Markdown payload."""
   contextPromotionMetadata(source: Workspace!): String! @check {
-    context.checkPromotionMetadata(source: source)
+    testContextPromotionMetadata(source: source)
   }
 
   """Check promotion emits empty lists, false pin, and null active status explicitly."""
   contextPromotionDefaults(source: Workspace!): String! @check {
-    context.checkPromotionDefaults(source: source)
+    testContextPromotionDefaults(source: source)
   }
 
   """Check regression methods are not exposed as context agent tools."""
   contextTools: String! @check {
-    context.checkTools
+    testContextTools
   }
 
   """Check mounts stay out of the GitHub toolbox snapshot."""
@@ -55,17 +53,17 @@ type AgentsDev {
 
   """Check public glob filtering and literal internal drift paths without model calls."""
   staffFiltering(source: Workspace!): String! @check {
-    staff.checkFiltering(source: source)
+    testStaffFiltering(source: source)
   }
 
   """Check internal bookkeeping remains absent from the chief's tools."""
   staffTools(source: Workspace!): String! @check {
-    staff.checkTools(source: source)
+    testStaffTools(source: source)
   }
 
   """Check retained-origin composition after checkout, without model calls."""
   staffComposition: String! @check {
-    staff.checkComposition
+    testStaffComposition
   }
 
   """Exercise persistent service commands, timeout supervision and immutable observations."""

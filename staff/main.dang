@@ -45,12 +45,11 @@ type Staff {
   let compositionSource: Workspace = null
 
   # Public for self-calls, not chief tools: roster bookkeeping and worker
-  # plumbing. Prompt constants and regression checks are excluded too.
+  # plumbing. Prompt constants are excluded too.
   # Workers bind only the dedicated PullTools object, never this full Staff.
   let plumbing = [
     "withWorker", "withDismissed", "chiefLine", "pullTools",
-    "withCompositionSource", "workerBase", "checkComposition",
-    "workerPrompt", "workerPromptFor", "checkFiltering", "checkTools"
+    "withCompositionSource", "workerBase", "workerPrompt", "workerPromptFor"
   ]
 
   """
@@ -738,163 +737,6 @@ type Staff {
   """
   chiefLine(boss: Agent!): ChiefLine! {
     ChiefLine(boss)
-  }
-
-  """
-  Check public glob filtering and literal internal drift paths without model calls.
-  """
-  checkFiltering(source: Workspace!): String! {
-    let root = "staff-glob-check-" + Random.string
-    let base = source.git.head.asWorkspace
-    let working = base
-      .withNewFile(root + "/one.go", "one\n")
-      .withNewFile(root + "/nested/two.go", "two\n")
-      .withNewFile(root + "/nested/keep.txt", "unselected\n")
-    let worker = llm.withWorkspace(working).spawn(name: "filter-fixture")
-    let fixture = Dagger.staff.withWorker("fixture", worker)
-    let patch = fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.go"])
-    assert { patch.contains("+one") and patch.contains("+two") }
-    assert { !patch.contains("keep.txt") }
-    assert { fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.rs"]).contains("no uncommitted changes") }
-    let committed = working.withCommit(
-      changes: working.git.uncommitted.filter(include: [root + "/**"]),
-      message: "fixture",
-      date: "2026-09-15T12:00:00Z",
-    )
-    let committedWorker = llm.withWorkspace(committed).spawn(name: "committed-filter-fixture")
-    let committedFixture = Dagger.staff.withWorker("fixture", committedWorker)
-    let committedPatch = committedFixture.diffOf(
-      source: base, name: "fixture", paths: [root + "/**/*.go"], commit: committed.git.head.commitSHA,
-    )
-    assert { committedPatch.contains("+one") and committedPatch.contains("+two") }
-    assert { !committedPatch.contains("unselected") }
-    worker.stop
-    committedWorker.stop
-
-    let before = directory
-      .withNewFile("old name.txt", "rename\n")
-      .withNewFile("delete me.txt", "remove\n")
-    let after = before.withoutFile("old name.txt").withoutFile("delete me.txt")
-      .withNewFile("new name.txt", "rename\n")
-    let names = [
-      "space name.txt", "tab\tname.txt", "line\nname.txt", "quote\"name.txt",
-      "back\\slash.txt", "[literal].txt", "*.txt", "?.txt", "!literal.txt",
-      " leading.txt", "trailing.txt ", "a/inside.txt", "a/nested/leaf.txt", "outside.txt"
-    ]
-    names.each { name => after = after.withNewFile(name, "added\n") }
-    let changes = after.changes(from: before)
-    names.each { name =>
-      let selected = scopeLiteralChanges(changes, [name])
-      assert { selected.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [name] }
-      assert { selected.asPatch.contents.contains("+added") }
-    }
-    assert { scopeLiteralChanges(changes, ["./a/"]).diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == ["a/inside.txt", "a/nested/leaf.txt"] }
-    assert { scopeLiteralChanges(changes, ["missing"]).isEmpty }
-    assert { scopeLiteralChanges(changes, []).asPatch.contents == changes.asPatch.contents }
-    assert { scopeLiteralChanges(changes, ["."]).asPatch.contents == changes.asPatch.contents }
-    assert { scopeLiteralChanges(changes, [""]).asPatch.contents == changes.asPatch.contents }
-    assert { scopeLiteralChanges(changes, ["delete me.txt"]).removedPaths == ["delete me.txt"] }
-    assert { scopeLiteralChanges(changes, ["old name.txt"]).removedPaths == ["old name.txt"] }
-    assert { scopeLiteralChanges(changes, ["new name.txt"]).addedPaths == ["new name.txt"] }
-    let renamed = scopeLiteralChanges(changes, ["old name.txt", "new name.txt"])
-    assert { renamed.diffStats.{{kind}}.map { s => s.kind } == [DiffStatKind.RENAMED] }
-    "Staff filtering checks passed."
-  }
-
-  """
-  Check that internal bookkeeping remains absent from the chief's tools.
-  """
-  checkTools(source: Workspace!): String! {
-    let tools = agent(llm.withWorkspace(source)).tools
-    assert { tools.contains("spawn") and tools.contains("dismiss") }
-    assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
-    assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
-    assert { !tools.contains("checkComposition") }
-    assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
-    "Staff tool visibility checks passed."
-  }
-
-  """
-  Check retained-origin composition after checkout, without model calls.
-  """
-  checkComposition: String! {
-    let origin = directory
-      .withNewFile("dagger.toml", """
-        [env.dev.modules.probe]
-        source = "probe"
-        [modules.staff]
-        source = "staff"
-        """)
-      .withNewFile("probe/dagger-module.toml", """
-        name = "probe"
-        engineVersion = "v1.0.0-0"
-        [runtime]
-        source = "dang"
-        """)
-      .withNewFile("probe/main.dang", """
-        type Probe {
-          agent(base: LLM!): LLM! @agent {
-            base.withTools(currentNode)
-              .withModel("origin-model")
-              .withSystemPrompt(`origin capabilities for ${base.workspace.file("marker").contents}`)
-          }
-          originRead(source: Workspace!): String! {
-            source.file("marker").contents
-          }
-          originWrite(source: Workspace!): Changeset! {
-            source.directory("/").withNewFile("written", "worker")
-              .changes(from: source.directory("/"))
-          }
-        }
-        """)
-      .withNewFile("staff/dagger-module.toml", """
-        name = "staff"
-        engineVersion = "v1.0.0-0"
-        [runtime]
-        source = "dang"
-        """)
-      .withNewFile("staff/main.dang", """
-        type Staff {
-          agent(base: LLM!): LLM! @agent {
-            raise "staff orchestration must be excluded"
-          }
-        }
-        """)
-      .withNewFile("marker", "origin")
-      .asWorkspace.withConfigEnvironment("dev")
-    let target = directory.withNewFile("marker", "checkout with pending edits").asWorkspace
-    let fixture = Dagger.staff.withCompositionSource(origin)
-    let worker = fixture.workerBase(target).sync
-    assert { worker.tools.contains("originRead") and worker.tools.contains("originWrite") }
-    assert { worker.workspace.file("marker").contents == "checkout with pending edits" }
-    assert { worker.model == "origin-model" }
-    assert { worker.messages.{{role}}.all { m => m.role == LLMMessageRole.SYSTEM } }
-    assert { worker.messages.{{content.{{text}}}}.any { m =>
-      m.content.any { c => (c.text ?? "").contains("origin capabilities for checkout with pending edits") }
-    } }
-    assert { fixture.workerBase(target, model: "fixture-model").model == "fixture-model" }
-
-    # Roster mutations must preserve the saved origin; no turn is started.
-    let handle = worker.spawn(name: "composition-fixture")
-    let roster = fixture.withWorker("fixture", handle)
-    assert { roster.workerBase(target).tools.contains("originRead") }
-    let dismissed = roster.withDismissed("fixture", handle)
-    assert { dismissed.workerBase(target).tools.contains("originRead") }
-    handle.stop
-
-    # A destination with agent code is not implicitly trusted or composed.
-    let hostile = origin.withNewFile("probe/main.dang", """
-      type Probe {
-        agent(base: LLM!): LLM! @agent {
-          raise "destination agents must not execute"
-        }
-      }
-      """)
-    assert { fixture.workerBase(hostile).tools.contains("originRead") }
-    assert { origin.file("marker").contents == "origin" }
-    # Preserve direct API use when no chief composition has captured an origin.
-    assert { Dagger.staff.workerBase(origin).tools.contains("originRead") }
-    "Staff checkout composition checks passed."
   }
 
   # Address a member by name, with a helpful miss.
