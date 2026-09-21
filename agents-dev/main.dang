@@ -66,33 +66,7 @@ type AgentsDev {
     testStaffComposition
   }
 
-  """Exercise persistent service commands, timeout supervision and immutable observations."""
-  browserSessionRunner: Void @check {
-    testBrowserSessionRunner
-  }
-
-  """Verify persistent sessions through real Dagger service calls."""
-  browserSessions(source: Workspace!): Void @check {
-    testBrowserSessions(source)
-  }
-
-  """Exercise the runner in real Chromium, including failure artifacts and polling."""
-  browserRunner: Void @check {
-    testBrowserRunner
-  }
-
-  """Verify pending snapshots, script files, retained evidence, and service binding."""
-  browserWorkspace(source: Workspace!): Void @check {
-    testBrowserWorkspace(source)
-  }
-
-  """Smoke-test every bundled browser and report its installed version."""
-  browserBrowsers: Void @check {
-    testBrowserBrowsers
-  }
-
-  """Keep prepared containers and regression methods out of the browser toolbox."""
-  browserTools: Void @check {
-    testBrowserTools
-  }
+  # Browser checks are parked in browser-tests/checks.dang until CI's engine
+  # supports their APIs. Keep the browser dependency unwired too: even loading
+  # its schema requires the newer engine.
 }
