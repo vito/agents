@@ -20,8 +20,8 @@
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
 #     workspace to the returned state. `date` is required (for reproducible
 #     commits); currentTimestamp supplies it.
-#   * Workspace.withReset(commit:, hard: false) moves HEAD while preserving
-#     the working tree, so commits can be redone without losing pending edits.
+#   * Workspace.withReset(commit:, hard:) moves HEAD, preserving the working
+#     tree by default or replacing it with the target commit when hard is true.
 #   * GitRef.push publishes HEAD to the checkout's remote, engine-side (no
 #     host checkout involved), with an optional lease in the style of
 #     `--force-with-lease`. An effect on the remote, so never cached.
@@ -213,13 +213,15 @@ type Committer {
   Reset to a commit, or restore a workspace saved by an earlier reset.
 
   Use this to redo or combine local commits: read `log`, choose the commit to
-  return to, reset, then review `status` / `diff` and commit again. Changes
-  from the undone commits and any pending edits remain in the workspace
-  when resetting to a commit that has not been saved.
+  return to, reset, then review `status` / `diff` and commit again. By default,
+  changes from the undone commits and any pending edits remain in the workspace
+  when resetting to a commit that has not been saved. With `hard: true`, the
+  working tree is replaced by the target commit's tree, discarding pending edits.
 
   Each reset saves the workspace being left under its HEAD hash. Returning
   to a saved hash restores that entire workspace, including its pending
-  edits, rather than carrying over your current working tree. The workspace
+  edits, rather than carrying over your current working tree — unless `hard`
+  is true, which restores only the saved commit's tree. The workspace
   you leave is saved in turn, so you can go back again. Full hashes or unique
   prefixes of at least four characters select saved workspaces.
   Each hash keeps its most recently saved workspace.
@@ -236,6 +238,12 @@ type Committer {
     to undo.
     """
     commit: String!,
+    """
+    Replace the working tree with the target commit's tree, discarding pending
+    edits even for a saved workspace. Defaults to false. The workspace being
+    left is still saved for recovery.
+    """
+    hard: Boolean! = false,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     let want = commit.trimSpace
     if (want == "") {
@@ -251,16 +259,22 @@ type Committer {
     }
     let remembered = saved[matches.takeFirst.join("")]
     let target = if (remembered != null) {
-      remembered
+      if (hard) {
+        remembered.withReset(commit: remembered.git.head.commitSHA, hard: true)
+      } else {
+        remembered
+      }
     } else {
-      before.withReset(commit: want, hard: false)
+      before.withReset(commit: want, hard: hard)
     }
     # Force evaluation before returning the workspace, like commit: failures
     # should surface here, not while the agent is rebinding its workspace.
     let sha = target.git.head.commitSHA rescue {
       e: Error => raise `reset failed: ${plainError(e.message)}`
     }
-    let note = if (remembered != null) {
+    let note = if (hard) {
+      "Working tree replaced with the target commit's tree; pending edits discarded."
+    } else if (remembered != null) {
       "Restored the saved workspace, including its pending edits."
     } else {
       "Working tree preserved; review status / diff before committing again."
@@ -1648,7 +1662,10 @@ type Committer {
       Read `log`, choose the target, then reset, review `status` / `diff`, and
       commit again. Each reset saves the workspace you leave and prints its
       hash. Resetting to a saved hash restores that workspace's files and
-      pending edits; other targets keep your current working tree.
+      pending edits; other targets keep your current working tree. Pass
+      `hard: true` to replace the working tree with the target commit's tree
+      instead, discarding pending edits even for saved targets. The workspace
+      being left is still saved for recovery.
       Rewriting published history needs explicit authorization, not an
       automatic force push after a rejection.
     - `rebase` — replay this branch's commits onto the current tip of a
