@@ -68,31 +68,31 @@ type AgentsDev {
 
   """Exercise persistent service commands, timeout supervision and immutable observations."""
   browserSessionRunner: Void @check {
-    browser.checkSessionRunner
+    testBrowserSessionRunner
   }
 
   """Verify persistent sessions through real Dagger service calls."""
   browserSessions(source: Workspace!): Void @check {
-    browser.checkSessions(ws: source)
+    testBrowserSessions(source)
   }
 
   """Exercise the runner in real Chromium, including failure artifacts and polling."""
   browserRunner: Void @check {
-    browser.checkRunner
+    testBrowserRunner
   }
 
   """Verify pending snapshots, script files, retained evidence, and service binding."""
   browserWorkspace(source: Workspace!): Void @check {
-    browser.checkWorkspace(ws: source)
+    testBrowserWorkspace(source)
   }
 
   """Smoke-test every bundled browser and report its installed version."""
   browserBrowsers: Void @check {
-    browser.checkBrowsers
+    testBrowserBrowsers
   }
 
   """Keep prepared containers and regression methods out of the browser toolbox."""
   browserTools: Void @check {
-    browser.checkTools
+    testBrowserTools
   }
 }

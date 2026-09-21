@@ -25,7 +25,7 @@ type Browser {
   let closedSessions: Map[String!]! = [:]
   let releasedSessions: [String!]! = []
   let playwrightVersion = "1.58.2"
-  let plumbing = ["prepared", "checkRunner", "checkTools", "checkWorkspace", "checkBrowsers", "checkSessionRunner", "checkSessions"]
+  let plumbing = ["prepared"]
   let source: Directory!
 
   new(source: Directory! @defaultPath(path: ".")) {
@@ -333,158 +333,14 @@ type Browser {
     finished
   }
 
-  """Exercise persistent service commands, timeout supervision and immutable observations."""
-  checkSessionRunner: Void {
-    prepared.withFile("/opt/browser/tests/session.cjs", source.file("tests/session.cjs"))
-      .withExec(["node", "--test", "/opt/browser/tests/session.cjs"]).sync
-    null
-  }
-
-  """Verify persistent sessions through real Dagger service calls."""
-  checkSessions(ws: Workspace!): Void {
-    let root = "/browser-session-check-" + Random.string
-    let html = """
-      <!doctype html><title>First</title>
-      <label>Filter <input id="filter"></label>
-      <details><summary>Tools</summary><ul id="items"></ul></details><p id="revision"></p>
-      <script>
-      async function refresh() {
-        const data = await (await fetch('/snapshot.json')).json();
-        document.querySelector('#revision').textContent = data.revision;
-        document.querySelector('#items').replaceChildren(...data.tools.map(name => {
-          const li = document.createElement('li'); li.textContent = name; return li;
-        }));
-      }
-      refresh(); setInterval(refresh, 100);
-      </script>
-    """
-    let step = """
-      await check('starts blank', async () => assert.equal(page.url(), 'about:blank'));
-      await mock('**/snapshot.json', {json: {revision: 'one', tools: ['browser.run']}});
-      await page.goto(baseURL);
-      await page.locator('summary').click();
-      await page.locator('#filter').fill('browser');
-      await page.locator('#filter').evaluate(el => el.setSelectionRange(2, 5));
-      await check('initial fixture', async () => await expect(page.locator('#revision')).toHaveText('one'));
-      await screenshot('before');
-    """
-    let initial = ws.withNewFile(root + "/index.html", html)
-      .withNewFile(root + "/gone.txt", "deleted by sync")
-      .withNewFile(root + "/step.cjs", step)
-    let started = start(initial, root: root)
-    let sid = started.liveServices.keys.filter { id => !liveServices.keys.contains(id) }[0] ?? ""
-    {
-      let first = started.exec(initial, sid, scriptPath: root + "/step.cjs")
-      let firstID = first.runs.keys.filter { id => !started.runs.keys.contains(id) }[0] ?? ""
-      assert { first.readArtifact(firstID).contains("\"ok\": true") }
-      let beforeImage = first.artifact(firstID, "before.png").digest
-      let second = first.exec(initial, sid, script: """
-        await mock('**/snapshot.json', {json: {revision: 'two', tools: ['browser.exec']}});
-        await check('same live page after polling', async () => {
-          await expect(page.locator('#revision')).toHaveText('two');
-          await expect(page.locator('#filter')).toBeFocused();
-          await expect(page.locator('#filter')).toHaveValue('browser');
-          assert.deepEqual(await page.locator('#filter').evaluate(el => [el.selectionStart, el.selectionEnd]), [2, 5]);
-          await expect(page.locator('details')).toHaveAttribute('open');
-        });
-      """)
-      let secondID = second.runs.keys.filter { id => !first.runs.keys.contains(id) }[0] ?? ""
-      assert { second.readArtifact(secondID).contains("\"ok\": true") }
-      let inspected = second.inspect(sid, kind: "screenshot", selector: "details")
-      let inspectID = inspected.runs.keys.filter { id => !second.runs.keys.contains(id) }[0] ?? ""
-      assert { inspected.artifact(inspectID, "screenshot.png").size > 0 }
-      let edited = initial.withNewFile(root + "/index.html", html.replace("First", "Second"))
-        .withoutFile(root + "/gone.txt")
-      let synced = inspected.syncWorkspace(edited, sid)
-      let verified = synced.exec(edited, sid, script: """
-        await check('sync neither reloads nor retains deleted files', async () => {
-          await expect(page).toHaveTitle('First');
-          await expect(page.locator('#filter')).toBeFocused();
-          assert.equal(await page.evaluate(async () => (await fetch('/gone.txt')).status), 404);
-        });
-        await page.reload();
-        await check('explicit reload loads new source and retained mocks', async () => {
-          await expect(page).toHaveTitle('Second');
-          await expect(page.locator('#revision')).toHaveText('two');
-        });
-      """)
-      let verifiedID = verified.runs.keys.filter { id => !synced.runs.keys.contains(id) }[0] ?? ""
-      assert { verified.readArtifact(verifiedID).contains("\"ok\": true") }
-      assert { verified.readArtifact(verifiedID).contains(edited.directory(root).digest) }
-      let failed = verified.exec(edited, sid, script: "await check('deliberate failure', async () => assert.fail('expected'));", timeoutMs: 5000)
-      let failedID = failed.runs.keys.filter { id => !verified.runs.keys.contains(id) }[0] ?? ""
-      assert { failed.readArtifact(failedID).contains("\"ok\": false") }
-      let recovered = failed.exec(edited, sid, script: "await check('still alive', async () => await expect(page).toHaveTitle('Second'));")
-      let recoveredID = recovered.runs.keys.filter { id => !failed.runs.keys.contains(id) }[0] ?? ""
-      assert { recovered.readArtifact(recoveredID).contains("\"ok\": true") }
-      let stopped = recovered.stop(sid)
-      assert { stopped.artifact(firstID, "before.png").digest == beforeImage }
-      assert { stopped.artifact(inspectID, "screenshot.png").size > 0 }
-      assert { stopped.sessions.contains("released") }
-      let rejected = stopped.exec(edited, sid, script: "throw Error('must not execute')").sessions rescue { e: Error => e.message }
-      assert { rejected.contains("stopped") }
-      stopped.stop(sid)
-      null
-    } rescue { e: Error => {
-      started.service(sid).stop(kill: true)
-      raise e.message
-    }}
-
-    let app = container.from("node:22-bookworm-slim")
-      .withExposedPort(8080).asService(args: ["node", "-e", "require('http').createServer((q,r)=>r.end('<title>bound app</title>')).listen(8080,'0.0.0.0')"])
-    let remote = start(ws, url: "http://app:8080", services: [app], serviceHostnames: ["app"])
-    let remoteID = remote.liveServices.keys.filter { id => !liveServices.keys.contains(id) }[0] ?? ""
-    {
-      let checked = remote.exec(ws, remoteID, script: "await page.goto(baseURL); await check('bound app', async () => await expect(page).toHaveTitle('bound app'));")
-      let observation = checked.runs.keys.filter { id => !remote.runs.keys.contains(id) }[0] ?? ""
-      assert { checked.readArtifact(observation).contains("\"ok\": true") }
-      let rejected = checked.syncWorkspace(ws, remoteID).sessions rescue { e: Error => e.message }
-      assert { rejected.contains("cannot deploy an external URL") }
-      checked.stop(remoteID)
-      null
-    } rescue { e: Error => {
-      remote.service(remoteID).stop(kill: true)
-      raise e.message
-    }}
-
-    let timed = start(initial, root: root)
-    let timedID = timed.liveServices.keys.filter { id => !liveServices.keys.contains(id) }[0] ?? ""
-    {
-      let failed = timed.exec(initial, timedID, script: "await new Promise(() => {});", timeoutMs: 50)
-      let observation = failed.runs.keys.filter { id => !timed.runs.keys.contains(id) }[0] ?? ""
-      assert { failed.readArtifact(observation).contains("\"state\": \"failed\"") }
-      let rejected = failed.exec(initial, timedID, script: "throw Error('must not run')").sessions rescue { e: Error => e.message }
-      assert { rejected.contains("session is failed") }
-      let closed = failed.stop(timedID)
-      assert { closed.readArtifact(observation).contains("session-invalidated") }
-      null
-    } rescue { e: Error => {
-      timed.service(timedID).stop(kill: true)
-      raise e.message
-    }}
-
-    # Service bindings can auto-start a stopped Dagger service. Pinning its
-    # process instance must reject that fresh process BEFORE executing code.
-    let lost = start(initial, root: root)
-    let lostID = lost.liveServices.keys.filter { id => !liveServices.keys.contains(id) }[0] ?? ""
-    lost.service(lostID).stop(kill: true);
-    {
-      let rejected = lost.exec(initial, lostID, script: "throw Error('must not run')").sessions rescue { e: Error => e.message }
-      assert { rejected.contains("Session instance changed") }
-      lost.stop(lostID)
-      null
-    } rescue { e: Error => {
-      lost.service(lostID).stop(kill: true)
-      raise e.message
-    }}
-    null
-  }
-
   let result(run: String!): Directory! {
     let value = runs[run]
     if (value == null) { raise "unknown run or observation: " + run }
     value
   }
+
+  """List retained run and observation handles, including evidence from stopped sessions."""
+  observations: [String!]! { runs.keys }
 
   """List retained artifact paths for a run. These are not workspace files."""
   artifacts(run: String!): String! {
@@ -519,109 +375,6 @@ type Browser {
     if (offset < 0 or limit < 1 or limit > 1000) { raise "offset must be nonnegative; limit must be 1..1000" }
     let lines = artifact(run, path).contents.split("\n")
     lines.dropFirst(offset).takeFirst(limit).join("\n")
-  }
-
-  """Exercise the runner in real Chromium, including failure artifacts and polling."""
-  checkRunner: Void {
-    prepared
-      .withFile("/opt/browser/tests/runner.cjs", source.file("tests/runner.cjs"))
-      .withExec(["node", "--test", "/opt/browser/tests/runner.cjs"])
-      .sync
-    null
-  }
-
-  """Verify pending snapshots, script files, retained evidence, and service binding."""
-  checkWorkspace(ws: Workspace!): Void {
-    # Private workspace forks: the check never returns workspace changes.
-    let root = "/browser-check-" + Random.string
-    let testScript = """
-      await check('starts blank', async () => assert.equal(page.url(), 'about:blank'));
-      await page.goto(baseURL);
-      await check('pending title', async () => await expect(page).toHaveTitle('pending-first'));
-      await screenshot('named');
-    """
-    let first = ws.withNewFile(root + "/index.html", "<title>pending-first</title>")
-      .withNewFile(root + "/test.cjs", testScript)
-    let a = run(first, root: root, scriptPath: root + "/test.cjs")
-    let aID = a.runs.keys[0] ?? ""
-    let firstReport = a.artifact(aID, "results.json").contents
-    assert { firstReport.contains("\"ok\": true") }
-    assert { firstReport.contains(first.directory(root).digest) }
-    assert { a.artifacts(aID).contains("trace.zip") }
-    assert { a.artifact(aID, "screenshot.png").size > 0 }
-    assert { a.readArtifact(aID, offset: 1, limit: 2).split("\n").length == 2 }
-
-    # Inspect queued media without calling a model. The continuation keeps the
-    # caller's history/tools and adds a caption and real image bytes in order.
-    let beforeView = llm.withTools(currentNode, except: plumbing).withPrompt("preserve this history")
-    let viewed = a.viewScreenshot(beforeView, aID)
-    let messages = viewed.messages.{{role, content.{{kind, text, mimeType, data}}}}
-    assert { messages.length == 2 }
-    assert { messages[0].content[0].text == "preserve this history" }
-    assert { messages[1].role == LLMMessageRole.USER }
-    assert { messages[1].content.length == 2 }
-    assert { messages[1].content[0].kind == LLMContentBlockKind.TEXT }
-    assert { messages[1].content[0].text.contains(aID) }
-    assert { messages[1].content[0].text.contains("screenshot.png") }
-    let image = messages[1].content[1]
-    assert { image.kind == LLMContentBlockKind.IMAGE }
-    assert { image.mimeType == "image/png" }
-    assert { image.data.hasPrefix("iVBOR") }
-    assert { !viewed.transcript.contains(image.data ?? "") }
-    assert { viewed.tools == beforeView.tools }
-    let named = a.viewScreenshot(beforeView, aID, "named.png")
-    assert { named.messages.{{content.{{kind}}}}[1].content[1].kind == LLMContentBlockKind.IMAGE }
-    assert { a.artifact(aID, "results.json").contents == firstReport }
-    ["../screenshot.png", "/screenshot.png", ""].each { invalid =>
-      let rejected = a.viewScreenshot(beforeView, aID, invalid).transcript rescue { e: Error => e.message }
-      assert { rejected.contains("artifact path must be relative") }
-    }
-    let unknown = a.viewScreenshot(beforeView, "missing-run").transcript rescue { e: Error => e.message }
-    assert { unknown.contains("unknown run") }
-    let notImage = a.viewScreenshot(beforeView, aID, "results.json").transcript rescue { e: Error => "rejected non-image" }
-    assert { notImage == "rejected non-image" }
-
-    let second = first.withNewFile(root + "/index.html", "<title>pending-second</title>")
-    let b = a.run(second, root: root, script: testScript, timeoutMs: 1500)
-    let bID = b.runs.keys.filter { id => id != aID }[0] ?? ""
-    let secondReport = b.artifact(bID, "results.json").contents
-    assert { secondReport.contains("\"ok\": false") }
-    assert { secondReport.contains(second.directory(root).digest) }
-    assert { first.directory(root).digest != second.directory(root).digest }
-    assert { b.artifact(aID, "results.json").contents == firstReport }
-
-    let service = container.from("node:22-bookworm-slim")
-      .withDefaultArgs(["node", "-e", "require('http').createServer((q,r)=>r.end('<title>service</title>')).listen(8080,'0.0.0.0')"])
-      .withExposedPort(8080).asService
-    let c = run(ws, url: "http://app:8080", service: service, script: "await page.goto(baseURL); await check('bound service', async () => await expect(page).toHaveTitle('service'));")
-    let cID = c.runs.keys[0] ?? ""
-    assert { c.artifact(cID, "results.json").contents.contains("\"ok\": true") }
-    null
-  }
-
-  """Smoke-test every bundled browser, reporting the actual installed versions."""
-  checkBrowsers: Void {
-    prepared.withExec(["node", "-e", """
-      (async () => {
-        for (const name of ['chromium', 'firefox', 'webkit']) {
-          const browser = await require('@playwright/test')[name].launch();
-          const page = await browser.newPage();
-          await page.setContent('<title>ready</title>');
-          require('node:assert/strict').equal(await page.title(), 'ready');
-          console.log(name + ': ' + browser.version());
-          await browser.close();
-        }
-      })().catch(error => { console.error(error); process.exit(1); });
-    """]).sync
-    null
-  }
-
-  """Keep prepared containers and checks out of the agent's browser toolbox."""
-  checkTools: Void {
-    let tools = agent(llm).tools
-    assert { plumbing.all { tool => !tools.contains(tool) } }
-    assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot"].all { tool => tools.contains(tool) } }
-    null
   }
 
   let systemPrompt = """
