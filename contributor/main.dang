@@ -740,7 +740,7 @@ type Contributor {
 
   # Mounts stay out of the gh toolbox's snapshot: a mounted checkout can be
   # large, and gh never needs it.
-  checkMountsOutsideToolbox: String! @check {
+  checkMountsOutsideToolbox: String! {
     let ws = directory
       .withNewFile("tmp/body.md", "draft\n")
       .asWorkspace
@@ -859,7 +859,7 @@ type Contributor {
   """
   Check checkout selection, HEAD state, and kept edits on a local Git fixture.
   """
-  checkCheckoutRefs: String! @check {
+  checkCheckoutRefs: String! {
     let fixture = container.from("alpine:3.22")
       .withExec(["apk", "add", "--no-cache", "git"])
       .withWorkdir("/repo")

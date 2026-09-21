@@ -334,14 +334,14 @@ type Browser {
   }
 
   """Exercise persistent service commands, timeout supervision and immutable observations."""
-  checkSessionRunner: Void @check {
+  checkSessionRunner: Void {
     prepared.withFile("/opt/browser/tests/session.cjs", source.file("tests/session.cjs"))
       .withExec(["node", "--test", "/opt/browser/tests/session.cjs"]).sync
     null
   }
 
   """Verify persistent sessions through real Dagger service calls."""
-  checkSessions(ws: Workspace!): Void @check {
+  checkSessions(ws: Workspace!): Void {
     let root = "/browser-session-check-" + Random.string
     let html = """
       <!doctype html><title>First</title>
@@ -522,7 +522,7 @@ type Browser {
   }
 
   """Exercise the runner in real Chromium, including failure artifacts and polling."""
-  checkRunner: Void @check {
+  checkRunner: Void {
     prepared
       .withFile("/opt/browser/tests/runner.cjs", source.file("tests/runner.cjs"))
       .withExec(["node", "--test", "/opt/browser/tests/runner.cjs"])
@@ -531,7 +531,7 @@ type Browser {
   }
 
   """Verify pending snapshots, script files, retained evidence, and service binding."""
-  checkWorkspace(ws: Workspace!): Void @check {
+  checkWorkspace(ws: Workspace!): Void {
     # Private workspace forks: the check never returns workspace changes.
     let root = "/browser-check-" + Random.string
     let testScript = """
@@ -600,7 +600,7 @@ type Browser {
   }
 
   """Smoke-test every bundled browser, reporting the actual installed versions."""
-  checkBrowsers: Void @check {
+  checkBrowsers: Void {
     prepared.withExec(["node", "-e", """
       (async () => {
         for (const name of ['chromium', 'firefox', 'webkit']) {
@@ -617,7 +617,7 @@ type Browser {
   }
 
   """Keep prepared containers and checks out of the agent's browser toolbox."""
-  checkTools: Void @check {
+  checkTools: Void {
     let tools = agent(llm).tools
     assert { plumbing.all { tool => !tools.contains(tool) } }
     assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot"].all { tool => tools.contains(tool) } }

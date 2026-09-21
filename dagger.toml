@@ -3,6 +3,9 @@
 # Example:
 #   dagger install github.com/dagger/dagger/modules/wolfi
 
+[modules.agents-dev]
+source = "agents-dev"
+
 [modules.dagger-dang-sdk]
 source = "github.com/dagger/dang-sdk"
 

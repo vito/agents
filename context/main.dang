@@ -434,7 +434,7 @@ type Context {
   """
   Check promotion preserves special-character metadata and the Markdown payload.
   """
-  checkPromotionMetadata(source: Workspace!): String! @check {
+  checkPromotionMetadata(source: Workspace!): String! {
     let tags = [
       "comma,inside", "colon: inside", "double\"quote", "single'quote",
       "line\nbreak", "true", "null", "123", "[brackets]", "# comment",
@@ -471,7 +471,7 @@ type Context {
   """
   Check promotion emits empty lists, false pin, and null active status explicitly.
   """
-  checkPromotionDefaults(source: Workspace!): String! @check {
+  checkPromotionDefaults(source: Workspace!): String! {
     let fixture = Context().blockWrite("notes/defaults", BlockKind.NOTE, "plain payload")
     let changes = fixture.promote(source, "notes/defaults")
     let contents = source.directory("/").withChanges(changes)
@@ -492,7 +492,7 @@ type Context {
   """
   Check regression checks are not exposed as context agent tools.
   """
-  checkTools: String! @check {
+  checkTools: String! {
     let tools = agent(llm).tools
     assert { tools.contains("promote") and tools.contains("blockWrite") }
     assert { !tools.contains("checkPromotionMetadata") }

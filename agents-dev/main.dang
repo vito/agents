@@ -1,0 +1,100 @@
+# Register repository development checks here, not in the installable agents.
+# The implementations stay with their modules to exercise private helpers and
+# state without exposing those internals as API. They are ordinary methods:
+# installing an agent alone must never register its development checks.
+type AgentsDev {
+  """Check commit-message validation and conservative description wrapping."""
+  committerMessages: String! @check {
+    committer.checkMessages
+  }
+
+  """Check rebase origin-URL parsing and conflict-marker detection."""
+  committerRebaseHelpers: String! @check {
+    committer.checkRebaseHelpers
+  }
+
+  """Check rebase planning, replay, conflicts, and resolution on private fixtures."""
+  committerRebaseReplay(source: Workspace!): String! @check {
+    committer.checkRebaseReplay(source: source)
+  }
+
+  """Check glob filtering and commits on a private frozen workspace."""
+  committerFiltering(source: Workspace!): String! @check {
+    committer.checkFiltering(source: source)
+  }
+
+  """Check selective restoration, previews, and validation on private fixtures."""
+  committerRestore(source: Workspace!): String! @check {
+    committer.checkRestore(source: source)
+  }
+
+  """Check promotion preserves special-character metadata and the Markdown payload."""
+  contextPromotionMetadata(source: Workspace!): String! @check {
+    context.checkPromotionMetadata(source: source)
+  }
+
+  """Check promotion emits empty lists, false pin, and null active status explicitly."""
+  contextPromotionDefaults(source: Workspace!): String! @check {
+    context.checkPromotionDefaults(source: source)
+  }
+
+  """Check regression methods are not exposed as context agent tools."""
+  contextTools: String! @check {
+    context.checkTools
+  }
+
+  """Check mounts stay out of the GitHub toolbox snapshot."""
+  contributorMountsOutsideToolbox: String! @check {
+    contributor.checkMountsOutsideToolbox
+  }
+
+  """Check checkout selection, HEAD state, and kept edits on a local Git fixture."""
+  contributorCheckoutRefs: String! @check {
+    contributor.checkCheckoutRefs
+  }
+
+  """Check public glob filtering and literal internal drift paths without model calls."""
+  staffFiltering(source: Workspace!): String! @check {
+    staff.checkFiltering(source: source)
+  }
+
+  """Check internal bookkeeping remains absent from the chief's tools."""
+  staffTools(source: Workspace!): String! @check {
+    staff.checkTools(source: source)
+  }
+
+  """Check retained-origin composition after checkout, without model calls."""
+  staffComposition: String! @check {
+    staff.checkComposition
+  }
+
+  """Exercise persistent service commands, timeout supervision and immutable observations."""
+  browserSessionRunner: Void @check {
+    browser.checkSessionRunner
+  }
+
+  """Verify persistent sessions through real Dagger service calls."""
+  browserSessions(source: Workspace!): Void @check {
+    browser.checkSessions(ws: source)
+  }
+
+  """Exercise the runner in real Chromium, including failure artifacts and polling."""
+  browserRunner: Void @check {
+    browser.checkRunner
+  }
+
+  """Verify pending snapshots, script files, retained evidence, and service binding."""
+  browserWorkspace(source: Workspace!): Void @check {
+    browser.checkWorkspace(ws: source)
+  }
+
+  """Smoke-test every bundled browser and report its installed version."""
+  browserBrowsers: Void @check {
+    browser.checkBrowsers
+  }
+
+  """Keep prepared containers and regression methods out of the browser toolbox."""
+  browserTools: Void @check {
+    browser.checkTools
+  }
+}

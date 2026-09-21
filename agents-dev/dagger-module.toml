@@ -1,0 +1,25 @@
+name = "agents-dev"
+engineVersion = "v1.0.0-0"
+
+[runtime]
+  source = "dang"
+
+[[dependencies]]
+  name = "browser"
+  source = "../browser"
+
+[[dependencies]]
+  name = "committer"
+  source = "../committer"
+
+[[dependencies]]
+  name = "context"
+  source = "../context"
+
+[[dependencies]]
+  name = "contributor"
+  source = "../contributor"
+
+[[dependencies]]
+  name = "staff"
+  source = "../staff"

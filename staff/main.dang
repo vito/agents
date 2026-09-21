@@ -743,7 +743,7 @@ type Staff {
   """
   Check public glob filtering and literal internal drift paths without model calls.
   """
-  checkFiltering(source: Workspace!): String! @check {
+  checkFiltering(source: Workspace!): String! {
     let root = "staff-glob-check-" + Random.string
     let base = source.git.head.asWorkspace
     let working = base
@@ -804,7 +804,7 @@ type Staff {
   """
   Check that internal bookkeeping remains absent from the chief's tools.
   """
-  checkTools(source: Workspace!): String! @check {
+  checkTools(source: Workspace!): String! {
     let tools = agent(llm.withWorkspace(source)).tools
     assert { tools.contains("spawn") and tools.contains("dismiss") }
     assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
@@ -817,7 +817,7 @@ type Staff {
   """
   Check retained-origin composition after checkout, without model calls.
   """
-  checkComposition: String! @check {
+  checkComposition: String! {
     let origin = directory
       .withNewFile("dagger.toml", """
         [env.dev.modules.probe]

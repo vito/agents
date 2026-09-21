@@ -907,7 +907,7 @@ type Committer {
   """
   Check commit-message validation and conservative description wrapping.
   """
-  checkMessages: String! @check {
+  checkMessages: String! {
     let valid = "committer: enforce commit style\n\nKeep history readable."
     assert { formatMessage(valid) == valid }
     assert { formatMessage(valid.replace("\n", "\r\n")) == valid }
@@ -971,7 +971,7 @@ type Committer {
   """
   Check rebase's pure helpers: origin-URL parsing and conflict-marker detection.
   """
-  checkRebaseHelpers: String! @check {
+  checkRebaseHelpers: String! {
     let config = """
       [core]
       	repositoryformatversion = 0
@@ -1020,7 +1020,7 @@ type Committer {
   Check the rebase pipeline on private fixtures: fork point, fast-forward,
   replay, conflict landing, and recording the resolution.
   """
-  checkRebaseReplay(source: Workspace!): String! @check {
+  checkRebaseReplay(source: Workspace!): String! {
     # Returning a String keeps fixture commits local to this check; the
     # caller's workspace and host checkout are never rebound or exported.
     let root = "rebase-check-" + Random.string
@@ -1125,7 +1125,7 @@ type Committer {
   """
   Check glob filtering and commits on a private frozen workspace.
   """
-  checkFiltering(source: Workspace!): String! @check {
+  checkFiltering(source: Workspace!): String! {
     # Returning a String keeps fixture commits local to this check; the
     # caller's workspace and host checkout are never rebound or exported.
     let root = "glob-check-" + Random.string
@@ -1191,7 +1191,7 @@ type Committer {
   """
   Check selective restoration, previews, and validation on private fixtures.
   """
-  checkRestore(source: Workspace!): String! @check {
+  checkRestore(source: Workspace!): String! {
     let root = "restore-check-" + Random.string
     let fixture = source.git.head.asWorkspace
       .withNewFile(root + "/edit.go", "before\n")
