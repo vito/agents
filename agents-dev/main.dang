@@ -2,28 +2,28 @@
 # public APIs. No test entry points or test-only tool exclusions live in agents.
 type AgentsDev {
   """Check commit-message validation and conservative description wrapping."""
-  committerMessages: String! @check {
-    committer.checkMessages
+  committerMessages(source: Workspace!): String! @check {
+    checkCommitterMessages(source)
   }
 
-  """Check rebase origin-URL parsing and conflict-marker detection."""
+  """Check rebase origin selection and conflict-marker validation through the API."""
   committerRebaseHelpers: String! @check {
-    committer.checkRebaseHelpers
+    checkCommitterRebaseHelpers
   }
 
   """Check rebase planning, replay, conflicts, and resolution on private fixtures."""
-  committerRebaseReplay(source: Workspace!): String! @check {
-    committer.checkRebaseReplay(source: source)
+  committerRebaseReplay: String! @check {
+    checkCommitterRebaseReplay
   }
 
   """Check glob filtering and commits on a private frozen workspace."""
   committerFiltering(source: Workspace!): String! @check {
-    committer.checkFiltering(source: source)
+    checkCommitterFiltering(source)
   }
 
   """Check selective restoration, previews, and validation on private fixtures."""
   committerRestore(source: Workspace!): String! @check {
-    committer.checkRestore(source: source)
+    checkCommitterRestore(source)
   }
 
   """Check promotion preserves special-character metadata and the Markdown payload."""
