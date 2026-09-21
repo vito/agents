@@ -35,13 +35,24 @@ let committerRebaseFixture: Container! {
 }
 
 let committerRebaseService: Service! {
-  committerRebaseFixture.withExposedPort(9418).asService(args: [
-    "git", "daemon", "--verbose", "--export-all", "--listen=0.0.0.0",
-  ]).start
+  # Parallel checks must own different services so cleanup cannot stop a peer.
+  committerRebaseFixture.withEnvVariable("CHECK_NONCE", Random.string)
+    .withExposedPort(9418).asService(args: [
+      "git", "daemon", "--verbose", "--export-all", "--listen=0.0.0.0",
+    ]).start
 }
 
 let checkCommitterRebaseHelpers: String! {
   let service = committerRebaseService
+  let result = runCommitterRebaseHelpers(service) rescue { e: Error => {
+    service.stop(kill: true)
+    raise e.message
+  }}
+  service.stop(kill: true)
+  result
+}
+
+let runCommitterRebaseHelpers(service: Service!): String! {
   let url = service.endpoint(scheme: "git") + "/repo"
   let fixture = committerRebaseFixture
   # An unrelated remote and origin's push URL must not win over its fetch URL.
@@ -55,21 +66,23 @@ let checkCommitterRebaseHelpers: String! {
   """, "fixture", url]).directory("/repo").asGit
   let source = configured.tag("fork").asWorkspace
   let onto = configured.branch("main").commitSHA
-  let rebased = committer.rebase(llm: llm.withWorkspace(source), source: source, onto: "main").workspace
+  # Pin continuations before inspecting their workspaces: repeated lazy reads
+  # would execute the non-cacheable rebase/rebaseContinue operations again.
+  let rebased = committer.rebase(llm: llm.withWorkspace(source), source: source, onto: "main").sync.workspace
   assert { rebased.git.head.commitSHA == onto }
   assert { rebased.git.uncommitted.isEmpty }
 
   # Explicit repo also works without an origin section (or any config).
   [fixture, fixture.withNewFile("/repo/.git/config", "")].each { local =>
     let bare = local.directory("/repo").asGit.tag("fork").asWorkspace
-    let missing = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main").workspace.git.head.commitSHA rescue { e: Error => e.message }
+    let missing = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
     assert { missing.contains("the checkout has no origin remote") }
-    let result = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main", repo: url).workspace
+    let result = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main", repo: url).sync.workspace
     assert { result.git.head.commitSHA == onto }
   }
 
   let origin = configured.tag("colliding").asWorkspace
-  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main")
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main").sync
   let landed = stopped.workspace
   # Reconstruct the expected continuation through existing public bookkeeping:
   # LLM exposes the rebound workspace but not its rebound Committer object.
@@ -82,36 +95,45 @@ let checkCommitterRebaseHelpers: String! {
   )
   let markedFiles = landed.withNewFile("aaa-clean.go", "=======\n")
     .withNewFile("zzz-quoted.md", "  <<<<<<< indented, not a marker\n")
-  let marked = continuing.rebaseContinue(llm: stopped, source: markedFiles).workspace.git.head.commitSHA rescue { e: Error => e.message }
+  let marked = continuing.rebaseContinue(llm: stopped, source: markedFiles).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
   assert { marked.contains("conflict markers remain in shared.txt; resolve them first") }
   let closingOnly = landed.withNewFile("shared.txt", ">>>>>>> theirs\n")
-  let closingError = continuing.rebaseContinue(llm: stopped, source: closingOnly).workspace.git.head.commitSHA rescue { e: Error => e.message }
+  let closingError = continuing.rebaseContinue(llm: stopped, source: closingOnly).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
   assert { closingError.contains("conflict markers remain in shared.txt") }
   let resolved = landed.withNewFile("shared.txt", "=======\n  <<<<<<< indented, not a marker\n")
-  let done = continuing.rebaseContinue(llm: stopped, source: resolved).workspace
+  let done = continuing.rebaseContinue(llm: stopped, source: resolved).sync.workspace
   assert { done.git.uncommitted.isEmpty }
   assert { done.file("shared.txt").contents == "=======\n  <<<<<<< indented, not a marker\n" }
   # Empty pending patches pass marker validation and drop the stopped commit.
   let clean = landed.withReset(commit: landed.git.head.commitSHA, hard: true)
-  let dropped = continuing.rebaseContinue(llm: stopped, source: clean).workspace
+  let dropped = continuing.rebaseContinue(llm: stopped, source: clean).sync.workspace
   assert { dropped.git.head.commitSHA == clean.git.head.commitSHA }
   "Rebase helper checks passed."
 }
 
 let checkCommitterRebaseReplay: String! {
   let service = committerRebaseService
+  let result = runCommitterRebaseReplay(service) rescue { e: Error => {
+    service.stop(kill: true)
+    raise e.message
+  }}
+  service.stop(kill: true)
+  result
+}
+
+let runCommitterRebaseReplay(service: Service!): String! {
   let url = service.endpoint(scheme: "git") + "/repo"
   let fixture = committerRebaseFixture.directory("/repo").asGit
   let origin = fixture.branch("feature").asWorkspace
   let upstream = fixture.branch("main")
   # A clean replay proves that upstream's hash is adopted rather than copied.
   let clean = fixture.tag("clean").asWorkspace
-  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", repo: url).workspace
+  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", repo: url).sync.workspace
   assert { applied.git.head.targetCommit.parentShas == [upstream.commitSHA] }
   assert { applied.git.uncommitted.isEmpty }
   assert { applied.file("ours.txt").contents == "o\n" }
 
-  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url)
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url).sync
   let landed = stopped.workspace
   assert { landed.git.head.targetCommit.parentShas == [upstream.commitSHA] }
   assert { landed.git.head.targetCommit.message.trimSpace == "fixture: ours, clean" }
@@ -133,7 +155,7 @@ let checkCommitterRebaseReplay: String! {
     oldHead: origin.git.head.commitSHA, branch: "feature",
   )
   let resolved = landed.withNewFile("shared.txt", "upstream+ours\n")
-  let done = continuing.rebaseContinue(llm: stopped, source: resolved).workspace
+  let done = continuing.rebaseContinue(llm: stopped, source: resolved).sync.workspace
   let replayed = done.git.head.log(limit: 10, base: upstream).{{message, authorName, authorEmail, authoredDate}}
   assert { replayed.length == 3 }
   let original = fixture.commit(id: colliding).{{message, authorName, authorEmail, authoredDate}}
