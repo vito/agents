@@ -1,0 +1,176 @@
+let testStaffFiltering(source: Workspace!): String! {
+  let root = "staff-glob-check-" + Random.string
+  let base = source.git.head.asWorkspace
+  let working = base
+    .withNewFile(root + "/one.go", "one\n")
+    .withNewFile(root + "/nested/two.go", "two\n")
+    .withNewFile(root + "/nested/keep.txt", "unselected\n")
+  let worker = llm.withWorkspace(working).spawn(name: "filter-fixture")
+  let fixture = staff.withWorker("fixture", worker)
+  let patch = fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.go"])
+  assert { patch.contains("+one") and patch.contains("+two") }
+  assert { !patch.contains("keep.txt") }
+  assert { fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.rs"]).contains("no uncommitted changes") }
+  let committed = working.withCommit(
+    changes: working.git.uncommitted.filter(include: [root + "/**"]),
+    message: "fixture",
+    date: "2026-09-15T12:00:00Z",
+  )
+  let committedWorker = llm.withWorkspace(committed).spawn(name: "committed-filter-fixture")
+  let committedFixture = staff.withWorker("fixture", committedWorker)
+  let committedPatch = committedFixture.diffOf(
+    source: base, name: "fixture", paths: [root + "/**/*.go"], commit: committed.git.head.commitSHA,
+  )
+  assert { committedPatch.contains("+one") and committedPatch.contains("+two") }
+  assert { !committedPatch.contains("unselected") }
+  worker.stop
+  committedWorker.stop
+
+  # Exercise literal drift filtering through pullPending. All other pending
+  # changes are already present in the chief: interpreting a filename as a glob
+  # would try to reapply those additions and fail (or pull the wrong files).
+  let seeded = base
+    .withNewFile(root + "/old name.txt", "rename\n")
+    .withNewFile(root + "/delete me.txt", "remove\n")
+  let before = seeded.withCommit(changes: seeded.git.uncommitted,
+    message: "fixture", date: "2026-09-15T12:00:00Z")
+  let after = before.withoutFile(root + "/old name.txt").withoutFile(root + "/delete me.txt")
+    .withNewFile(root + "/new name.txt", "rename\n")
+  let names = [
+    "space name.txt", "tab\tname.txt", "line\nname.txt", "quote\"name.txt",
+    "back\\slash.txt", "[literal].txt", "*.txt", "?.txt", "!literal.txt",
+    " leading.txt", "trailing.txt ", "a/inside.txt", "a/nested/leaf.txt", "outside.txt"
+  ]
+  names.each { name =>
+    let tree = after.directory("/")
+    after = after.withChanges(tree.withNewFile(root + "/" + name, "added\n").changes(from: tree))
+  }
+  let literalWorker = llm.withWorkspace(after).spawn(name: "literal-filter-fixture")
+  let literalFixture = staff.withWorker("fixture", literalWorker);
+  {
+    names.each { name =>
+      # Directory.withoutFile accepts globs; build the sibling set explicitly
+      # so names such as *.txt remain literal fixture data.
+      let siblings = directory.withNewFile("new name.txt", "rename\n")
+      names.filter { candidate => candidate != name }.each { sibling =>
+        siblings = siblings.withNewFile(sibling, "added\n")
+      }
+      let tree = after.directory("/")
+      let chief = after.withChanges(tree.withoutDirectory(root).withDirectory(root, siblings).changes(from: tree))
+      let selected = literalFixture.pullPending(source: chief, name: "fixture")
+      assert { selected.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [root + "/" + name] }
+      assert { selected.asPatch.contents.contains("+added") }
+      assert { chief.directory("/").withChanges(selected).changes(from: after.directory("/")).isEmpty }
+    }
+    let withoutDir = after.withoutDirectory(root + "/a")
+    let directoryDelta = literalFixture.pullPending(source: withoutDir, name: "fixture")
+    assert { directoryDelta.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [root + "/a/inside.txt", root + "/a/nested/leaf.txt"] }
+    assert { literalFixture.pullPending(source: after, name: "fixture").isEmpty }
+    assert { literalFixture.pullPending(source: before, name: "fixture").asPatch.contents == after.git.uncommitted.asPatch.contents }
+    let undeleted = after.withNewFile(root + "/delete me.txt", "remove\n")
+    assert { literalFixture.pullPending(source: undeleted, name: "fixture").removedPaths == [root + "/delete me.txt"] }
+    let oldOnly = after.withNewFile(root + "/old name.txt", "rename\n")
+    assert { literalFixture.pullPending(source: oldOnly, name: "fixture").removedPaths == [root + "/old name.txt"] }
+    let newOnly = after.withoutFile(root + "/new name.txt")
+    assert { literalFixture.pullPending(source: newOnly, name: "fixture").addedPaths == [root + "/new name.txt"] }
+    let unrenamed = newOnly.withNewFile(root + "/old name.txt", "rename\n")
+    let renamed = literalFixture.pullPending(source: unrenamed, name: "fixture")
+    assert { renamed.diffStats.{{kind}}.map { s => s.kind } == [DiffStatKind.RENAMED] }
+    null
+  } rescue { e: Error => {
+    literalWorker.stop
+    raise e.message
+  }}
+  literalWorker.stop
+  "Staff filtering checks passed."
+}
+
+let testStaffTools(source: Workspace!): String! {
+  let tools = staff.agent(llm.withWorkspace(source)).tools
+  assert { tools.contains("spawn") and tools.contains("dismiss") }
+  assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
+  assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
+  assert { !tools.contains("checkComposition") }
+  assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
+  "Staff tool visibility checks passed."
+}
+
+let testStaffComposition: String! {
+  let origin = directory
+    .withNewFile("dagger.toml", """
+      [env.dev.modules.probe]
+      source = "probe"
+      [modules.staff]
+      source = "staff"
+      """)
+    .withNewFile("probe/dagger-module.toml", """
+      name = "probe"
+      engineVersion = "v1.0.0-0"
+      [runtime]
+      source = "dang"
+      """)
+    .withNewFile("probe/main.dang", """
+      type Probe {
+        agent(base: LLM!): LLM! @agent {
+          base.withTools(currentNode)
+            .withModel("origin-model")
+            .withSystemPrompt(`origin capabilities for ${base.workspace.file("marker").contents}`)
+        }
+        originRead(source: Workspace!): String! {
+          source.file("marker").contents
+        }
+        originWrite(source: Workspace!): Changeset! {
+          source.directory("/").withNewFile("written", "worker")
+            .changes(from: source.directory("/"))
+        }
+      }
+      """)
+    .withNewFile("staff/dagger-module.toml", """
+      name = "staff"
+      engineVersion = "v1.0.0-0"
+      [runtime]
+      source = "dang"
+      """)
+    .withNewFile("staff/main.dang", """
+      type Staff {
+        agent(base: LLM!): LLM! @agent {
+          raise "staff orchestration must be excluded"
+        }
+      }
+      """)
+    .withNewFile("marker", "origin")
+    .asWorkspace.withConfigEnvironment("dev")
+  let target = directory.withNewFile("marker", "checkout with pending edits").asWorkspace
+  let fixture = staff.withCompositionSource(origin)
+  let worker = fixture.workerBase(target).sync
+  assert { worker.tools.contains("originRead") and worker.tools.contains("originWrite") }
+  assert { worker.workspace.file("marker").contents == "checkout with pending edits" }
+  assert { worker.model == "origin-model" }
+  assert { worker.messages.{{role}}.all { m => m.role == LLMMessageRole.SYSTEM } }
+  assert { worker.messages.{{content.{{text}}}}.any { m =>
+    m.content.any { c => (c.text ?? "").contains("origin capabilities for checkout with pending edits") }
+  } }
+  assert { fixture.workerBase(target, model: "fixture-model").model == "fixture-model" }
+
+  # Roster mutations must preserve the saved origin; no turn is started.
+  let handle = worker.spawn(name: "composition-fixture")
+  let roster = fixture.withWorker("fixture", handle)
+  assert { roster.workerBase(target).tools.contains("originRead") }
+  let dismissed = roster.withDismissed("fixture", handle)
+  assert { dismissed.workerBase(target).tools.contains("originRead") }
+  handle.stop
+
+  # A destination with agent code is not implicitly trusted or composed.
+  let hostile = origin.withNewFile("probe/main.dang", """
+    type Probe {
+      agent(base: LLM!): LLM! @agent {
+        raise "destination agents must not execute"
+      }
+    }
+    """)
+  assert { fixture.workerBase(hostile).tools.contains("originRead") }
+  assert { origin.file("marker").contents == "origin" }
+  # Preserve direct API use when no chief composition has captured an origin.
+  assert { staff.workerBase(origin).tools.contains("originRead") }
+  "Staff checkout composition checks passed."
+}

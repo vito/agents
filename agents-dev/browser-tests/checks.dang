@@ -1,0 +1,261 @@
+# Resolve side-effecting dependency calls once before reading multiple fields.
+let browserSnapshot(state: Dagger.Browser!): Dagger.Browser! {
+  node(id: state.id).{{... on Dagger.Browser!}}
+}
+
+let browserSessionHandle(state: Dagger.Browser!): String! {
+  let handle = state.sessions.match(`"session":\s*"([^"]+)"`).captures[0] ?? ""
+  assert { handle != "" }
+  handle
+}
+
+let browserObservation(state: Dagger.Browser!, previous: Dagger.Browser!): String! {
+  let added = state.observations.filter { id => !previous.observations.contains(id) }
+  assert { added.length == 1 }
+  added[0] ?? ""
+}
+
+let testBrowserSessionRunner: Void {
+  browser.prepared.withFile("/opt/browser/tests/session.cjs", currentModule.source.file("browser-tests/session.cjs"))
+    .withExec(["node", "--test", "/opt/browser/tests/session.cjs"]).sync
+  null
+}
+
+let testBrowserSessions(ws: Workspace!): Void {
+  let root = "/browser-session-check-" + Random.string
+  let html = """
+    <!doctype html><title>First</title>
+    <label>Filter <input id="filter"></label>
+    <details><summary>Tools</summary><ul id="items"></ul></details><p id="revision"></p>
+    <script>
+    async function refresh() {
+      const data = await (await fetch('/snapshot.json')).json();
+      document.querySelector('#revision').textContent = data.revision;
+      document.querySelector('#items').replaceChildren(...data.tools.map(name => {
+        const li = document.createElement('li'); li.textContent = name; return li;
+      }));
+    }
+    refresh(); setInterval(refresh, 100);
+    </script>
+  """
+  let step = """
+    await check('starts blank', async () => assert.equal(page.url(), 'about:blank'));
+    await mock('**/snapshot.json', {json: {revision: 'one', tools: ['browser.run']}});
+    await page.goto(baseURL);
+    await page.locator('summary').click();
+    await page.locator('#filter').fill('browser');
+    await page.locator('#filter').evaluate(el => el.setSelectionRange(2, 5));
+    await check('initial fixture', async () => await expect(page.locator('#revision')).toHaveText('one'));
+    await screenshot('before');
+  """
+  let initial = ws.withNewFile(root + "/index.html", html)
+    .withNewFile(root + "/gone.txt", "deleted by sync")
+    .withNewFile(root + "/step.cjs", step)
+  let started = browserSnapshot(browser.start(initial, root: root))
+  let sid = browserSessionHandle(started);
+  {
+    let first = browserSnapshot(started.exec(initial, sid, scriptPath: root + "/step.cjs"))
+    let firstID = browserObservation(first, started)
+    assert { first.readArtifact(firstID).contains("\"ok\": true") }
+    let beforeImage = first.artifact(firstID, "before.png").digest
+    let second = browserSnapshot(first.exec(initial, sid, script: """
+      await mock('**/snapshot.json', {json: {revision: 'two', tools: ['browser.exec']}});
+      await check('same live page after polling', async () => {
+        await expect(page.locator('#revision')).toHaveText('two');
+        await expect(page.locator('#filter')).toBeFocused();
+        await expect(page.locator('#filter')).toHaveValue('browser');
+        assert.deepEqual(await page.locator('#filter').evaluate(el => [el.selectionStart, el.selectionEnd]), [2, 5]);
+        await expect(page.locator('details')).toHaveAttribute('open');
+      });
+    """))
+    let secondID = browserObservation(second, first)
+    assert { second.readArtifact(secondID).contains("\"ok\": true") }
+    let inspected = browserSnapshot(second.inspect(sid, kind: "screenshot", selector: "details"))
+    let inspectID = browserObservation(inspected, second)
+    assert { inspected.artifact(inspectID, "screenshot.png").size > 0 }
+    let edited = initial.withNewFile(root + "/index.html", html.replace("First", "Second"))
+      .withoutFile(root + "/gone.txt")
+    let synced = browserSnapshot(inspected.syncWorkspace(edited, sid))
+    let verified = browserSnapshot(synced.exec(edited, sid, script: """
+      await check('sync neither reloads nor retains deleted files', async () => {
+        await expect(page).toHaveTitle('First');
+        await expect(page.locator('#filter')).toBeFocused();
+        assert.equal(await page.evaluate(async () => (await fetch('/gone.txt')).status), 404);
+      });
+      await page.reload();
+      await check('explicit reload loads new source and retained mocks', async () => {
+        await expect(page).toHaveTitle('Second');
+        await expect(page.locator('#revision')).toHaveText('two');
+      });
+    """))
+    let verifiedID = browserObservation(verified, synced)
+    assert { verified.readArtifact(verifiedID).contains("\"ok\": true") }
+    assert { verified.readArtifact(verifiedID).contains(edited.directory(root).digest) }
+    let failed = browserSnapshot(verified.exec(edited, sid, script: "await check('deliberate failure', async () => assert.fail('expected'));", timeoutMs: 5000))
+    let failedID = browserObservation(failed, verified)
+    assert { failed.readArtifact(failedID).contains("\"ok\": false") }
+    let recovered = browserSnapshot(failed.exec(edited, sid, script: "await check('still alive', async () => await expect(page).toHaveTitle('Second'));"))
+    let recoveredID = browserObservation(recovered, failed)
+    assert { recovered.readArtifact(recoveredID).contains("\"ok\": true") }
+    let stopped = browserSnapshot(recovered.stop(sid))
+    assert { stopped.artifact(firstID, "before.png").digest == beforeImage }
+    assert { stopped.artifact(inspectID, "screenshot.png").size > 0 }
+    assert { stopped.sessions.contains("released") }
+    let rejected = stopped.exec(edited, sid, script: "throw Error('must not execute')").sessions rescue { e: Error => e.message }
+    assert { rejected.contains("stopped") }
+    stopped.stop(sid).sessions
+    null
+  } rescue { e: Error => {
+    started.stop(sid).sessions
+    raise e.message
+  }}
+
+  let app = container.from("node:22-bookworm-slim")
+    .withExposedPort(8080).asService(args: ["node", "-e", "require('http').createServer((q,r)=>r.end('<title>bound app</title>')).listen(8080,'0.0.0.0')"])
+  let remote = browserSnapshot(browser.start(ws, url: "http://app:8080", services: [app], serviceHostnames: ["app"]))
+  let remoteID = browserSessionHandle(remote);
+  {
+    let checked = browserSnapshot(remote.exec(ws, remoteID, script: "await page.goto(baseURL); await check('bound app', async () => await expect(page).toHaveTitle('bound app'));"))
+    let observation = browserObservation(checked, remote)
+    assert { checked.readArtifact(observation).contains("\"ok\": true") }
+    let rejected = checked.syncWorkspace(ws, remoteID).sessions rescue { e: Error => e.message }
+    assert { rejected.contains("cannot deploy an external URL") }
+    checked.stop(remoteID).sessions
+    null
+  } rescue { e: Error => {
+    remote.stop(remoteID).sessions
+    raise e.message
+  }}
+
+  let timed = browserSnapshot(browser.start(initial, root: root))
+  let timedID = browserSessionHandle(timed);
+  {
+    let failed = browserSnapshot(timed.exec(initial, timedID, script: "await new Promise(() => {});", timeoutMs: 50))
+    let observation = browserObservation(failed, timed)
+    assert { failed.readArtifact(observation).contains("\"state\": \"failed\"") }
+    let rejected = failed.exec(initial, timedID, script: "throw Error('must not run')").sessions rescue { e: Error => e.message }
+    assert { rejected.contains("session is failed") }
+    let closed = failed.stop(timedID)
+    assert { closed.readArtifact(observation).contains("session-invalidated") }
+    null
+  } rescue { e: Error => {
+    timed.stop(timedID).sessions
+    raise e.message
+  }}
+
+  # Kill the controller from its worker through the public arbitrary-code API.
+  # A subsequent service binding must not silently resume a fresh browser.
+  let lost = browserSnapshot(browser.start(initial, root: root))
+  let lostID = browserSessionHandle(lost);
+  {
+    let crashed = lost.exec(initial, lostID, script: "process.kill(process.ppid, 'SIGKILL'); await new Promise(() => {});", timeoutMs: 1000).sessions rescue { e: Error => e.message }
+    assert { crashed.contains("browser request failed") }
+    let rejected = lost.exec(initial, lostID, script: "throw Error('must not run')").sessions rescue { e: Error => e.message }
+    assert { rejected.contains("Session instance changed") }
+    lost.stop(lostID).sessions
+    null
+  } rescue { e: Error => {
+    lost.stop(lostID).sessions
+    raise e.message
+  }}
+  null
+}
+
+let testBrowserRunner: Void {
+  browser.prepared
+    .withFile("/opt/browser/tests/runner.cjs", currentModule.source.file("browser-tests/runner.cjs"))
+    .withExec(["node", "--test", "/opt/browser/tests/runner.cjs"])
+    .sync
+  null
+}
+
+let testBrowserWorkspace(ws: Workspace!): Void {
+  # Private workspace forks: the check never returns workspace changes.
+  let root = "/browser-check-" + Random.string
+  let testScript = """
+    await check('starts blank', async () => assert.equal(page.url(), 'about:blank'));
+    await page.goto(baseURL);
+    await check('pending title', async () => await expect(page).toHaveTitle('pending-first'));
+    await screenshot('named');
+  """
+  let first = ws.withNewFile(root + "/index.html", "<title>pending-first</title>")
+    .withNewFile(root + "/test.cjs", testScript)
+  let a = browserSnapshot(browser.run(first, root: root, scriptPath: root + "/test.cjs"))
+  let aID = browserObservation(a, browser)
+  let firstReport = a.artifact(aID, "results.json").contents
+  assert { firstReport.contains("\"ok\": true") }
+  assert { firstReport.contains(first.directory(root).digest) }
+  assert { a.artifacts(aID).contains("trace.zip") }
+  assert { a.artifact(aID, "screenshot.png").size > 0 }
+  assert { a.readArtifact(aID, offset: 1, limit: 2).split("\n").length == 2 }
+
+  # Inspect queued media without calling a model. The continuation keeps the
+  # caller's history/tools and adds a caption and real image bytes in order.
+  let beforeView = llm.withTools(browser).withPrompt("preserve this history")
+  let viewed = a.viewScreenshot(beforeView, aID)
+  let messages = viewed.messages.{{role, content.{{kind, text, mimeType, data}}}}
+  assert { messages.length == 2 }
+  assert { messages[0].content[0].text == "preserve this history" }
+  assert { messages[1].role == LLMMessageRole.USER }
+  assert { messages[1].content.length == 2 }
+  assert { messages[1].content[0].kind == LLMContentBlockKind.TEXT }
+  assert { messages[1].content[0].text.contains(aID) }
+  assert { messages[1].content[0].text.contains("screenshot.png") }
+  let image = messages[1].content[1]
+  assert { image.kind == LLMContentBlockKind.IMAGE }
+  assert { image.mimeType == "image/png" }
+  assert { image.data.hasPrefix("iVBOR") }
+  assert { !viewed.transcript.contains(image.data ?? "") }
+  assert { viewed.tools == beforeView.tools }
+  let named = a.viewScreenshot(beforeView, aID, "named.png")
+  assert { named.messages.{{content.{{kind}}}}[1].content[1].kind == LLMContentBlockKind.IMAGE }
+  assert { a.artifact(aID, "results.json").contents == firstReport }
+  ["../screenshot.png", "/screenshot.png", ""].each { invalid =>
+    let rejected = a.viewScreenshot(beforeView, aID, invalid).transcript rescue { e: Error => e.message }
+    assert { rejected.contains("artifact path must be relative") }
+  }
+  let unknown = a.viewScreenshot(beforeView, "missing-run").transcript rescue { e: Error => e.message }
+  assert { unknown.contains("unknown run") }
+  let notImage = a.viewScreenshot(beforeView, aID, "results.json").transcript rescue { e: Error => "rejected non-image" }
+  assert { notImage == "rejected non-image" }
+
+  let second = first.withNewFile(root + "/index.html", "<title>pending-second</title>")
+  let b = browserSnapshot(a.run(second, root: root, script: testScript, timeoutMs: 1500))
+  let bID = browserObservation(b, a)
+  let secondReport = b.artifact(bID, "results.json").contents
+  assert { secondReport.contains("\"ok\": false") }
+  assert { secondReport.contains(second.directory(root).digest) }
+  assert { first.directory(root).digest != second.directory(root).digest }
+  assert { b.artifact(aID, "results.json").contents == firstReport }
+
+  let service = container.from("node:22-bookworm-slim")
+    .withDefaultArgs(["node", "-e", "require('http').createServer((q,r)=>r.end('<title>service</title>')).listen(8080,'0.0.0.0')"])
+    .withExposedPort(8080).asService
+  let c = browserSnapshot(browser.run(ws, url: "http://app:8080", service: service, script: "await page.goto(baseURL); await check('bound service', async () => await expect(page).toHaveTitle('service'));"))
+  let cID = browserObservation(c, browser)
+  assert { c.artifact(cID, "results.json").contents.contains("\"ok\": true") }
+  null
+}
+
+let testBrowserBrowsers: Void {
+  browser.prepared.withExec(["node", "-e", """
+    (async () => {
+      for (const name of ['chromium', 'firefox', 'webkit']) {
+        const browser = await require('@playwright/test')[name].launch();
+        const page = await browser.newPage();
+        await page.setContent('<title>ready</title>');
+        require('node:assert/strict').equal(await page.title(), 'ready');
+        console.log(name + ': ' + browser.version());
+        await browser.close();
+      }
+    })().catch(error => { console.error(error); process.exit(1); });
+  """]).sync
+  null
+}
+
+let testBrowserTools: Void {
+  let tools = browser.agent(llm).tools
+  assert { ["prepared", "checkRunner", "checkTools", "checkWorkspace", "checkBrowsers", "checkSessionRunner", "checkSessions"].all { tool => !tools.contains(tool) } }
+  assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot", "observations"].all { tool => tools.contains(tool) } }
+  null
+}

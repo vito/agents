@@ -1,0 +1,360 @@
+# Development checks call the installed agent API on private workspace forks.
+let committerRebaseFixture: Container! {
+  container.from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git", "git-daemon"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", """
+      git init -b main
+      git config user.name 'Rebase Fixture'
+      git config user.email fixture@example.com
+      export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+      export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+      printf 'base\n' > shared.txt
+      git add .
+      git commit -m 'fixture: fork point'
+      git tag fork
+      printf 'upstream\n' > shared.txt
+      printf 'u\n' > upstream.txt
+      git add .
+      git commit -m 'fixture: upstream change'
+      git checkout -b feature fork
+      printf 'o\n' > ours.txt
+      git add .
+      git commit -m 'fixture: ours, clean'
+      git tag clean
+      export GIT_AUTHOR_DATE=2026-09-15T12:03:00Z
+      export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+      printf 'ours\n' > shared.txt
+      git commit -am 'fixture: ours, colliding' -m 'Keeps its body.'
+      git tag colliding
+      printf 'later\n' > later.txt
+      git add .
+      git commit -m 'fixture: after the conflict'
+      git checkout main
+    """])
+}
+
+let committerRebaseService: Service! {
+  # Parallel checks must own different services so cleanup cannot stop a peer.
+  committerRebaseFixture.withEnvVariable("CHECK_NONCE", Random.string)
+    .withExposedPort(9418).asService(args: [
+      "git", "daemon", "--verbose", "--export-all", "--listen=0.0.0.0",
+    ]).start
+}
+
+let checkCommitterRebaseHelpers: String! {
+  let service = committerRebaseService
+  let result = runCommitterRebaseHelpers(service) rescue { e: Error => {
+    service.stop(kill: true)
+    raise e.message
+  }}
+  service.stop(kill: true)
+  result
+}
+
+let runCommitterRebaseHelpers(service: Service!): String! {
+  let url = service.endpoint(scheme: "git") + "/repo"
+  let fixture = committerRebaseFixture
+  # An unrelated remote and origin's push URL must not win over its fetch URL.
+  let configured = fixture.withExec(["sh", "-eu", "-c", """
+    git remote add upstream git://invalid.example/upstream
+    git remote add origin "$1"
+    git remote set-url --push origin git://invalid.example/push
+    git config --unset remote.origin.url
+    git config remote.origin.url "$1"
+    git config branch.main.remote origin
+  """, "fixture", url]).directory("/repo").asGit
+  let source = configured.tag("fork").asWorkspace
+  let onto = configured.branch("main").commitSHA
+  # Pin continuations before inspecting their workspaces: repeated lazy reads
+  # would execute the non-cacheable rebase/rebaseContinue operations again.
+  let rebased = committer.rebase(llm: llm.withWorkspace(source), source: source, onto: "main").sync.workspace
+  assert { rebased.git.head.commitSHA == onto }
+  assert { rebased.git.uncommitted.isEmpty }
+
+  # Explicit repo also works without an origin section (or any config).
+  [fixture, fixture.withNewFile("/repo/.git/config", "")].each { local =>
+    let bare = local.directory("/repo").asGit.tag("fork").asWorkspace
+    let missing = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+    assert { missing.contains("the checkout has no origin remote") }
+    let result = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main", repo: url).sync.workspace
+    assert { result.git.head.commitSHA == onto }
+  }
+
+  let origin = configured.tag("colliding").asWorkspace
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main").sync
+  let landed = stopped.workspace
+  # Reconstruct the expected continuation through existing public bookkeeping:
+  # LLM exposes the rebound workspace but not its rebound Committer object.
+  # Rebase itself above is end-to-end; continue below tests the public API with
+  # that real landed workspace, rather than copying any production helper.
+  let continuing = committer.withRebaseState(
+    origin: origin, remaining: [], stopped: origin.git.head.commitSHA,
+    stoppedHead: landed.git.head.commitSHA, onto: "main", ontoSha: onto,
+    oldHead: origin.git.head.commitSHA, branch: "feature",
+  )
+  let markedFiles = landed.withNewFile("aaa-clean.go", "=======\n")
+    .withNewFile("zzz-quoted.md", "  <<<<<<< indented, not a marker\n")
+  let marked = continuing.rebaseContinue(llm: stopped, source: markedFiles).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { marked.contains("conflict markers remain in shared.txt; resolve them first") }
+  let closingOnly = landed.withNewFile("shared.txt", ">>>>>>> theirs\n")
+  let closingError = continuing.rebaseContinue(llm: stopped, source: closingOnly).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { closingError.contains("conflict markers remain in shared.txt") }
+  let resolved = landed.withNewFile("shared.txt", "=======\n  <<<<<<< indented, not a marker\n")
+  let done = continuing.rebaseContinue(llm: stopped, source: resolved).sync.workspace
+  assert { done.git.uncommitted.isEmpty }
+  assert { done.file("shared.txt").contents == "=======\n  <<<<<<< indented, not a marker\n" }
+  # Empty pending patches pass marker validation and drop the stopped commit.
+  let clean = landed.withReset(commit: landed.git.head.commitSHA, hard: true)
+  let dropped = continuing.rebaseContinue(llm: stopped, source: clean).sync.workspace
+  assert { dropped.git.head.commitSHA == clean.git.head.commitSHA }
+  "Rebase helper checks passed."
+}
+
+let checkCommitterRebaseReplay: String! {
+  let service = committerRebaseService
+  let result = runCommitterRebaseReplay(service) rescue { e: Error => {
+    service.stop(kill: true)
+    raise e.message
+  }}
+  service.stop(kill: true)
+  result
+}
+
+let runCommitterRebaseReplay(service: Service!): String! {
+  let url = service.endpoint(scheme: "git") + "/repo"
+  let fixture = committerRebaseFixture.directory("/repo").asGit
+  let origin = fixture.branch("feature").asWorkspace
+  let upstream = fixture.branch("main")
+  # A clean replay proves that upstream's hash is adopted rather than copied.
+  let clean = fixture.tag("clean").asWorkspace
+  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", repo: url).sync.workspace
+  assert { applied.git.head.targetCommit.parentShas == [upstream.commitSHA] }
+  assert { applied.git.uncommitted.isEmpty }
+  assert { applied.file("ours.txt").contents == "o\n" }
+
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url).sync
+  let landed = stopped.workspace
+  assert { landed.git.head.targetCommit.parentShas == [upstream.commitSHA] }
+  assert { landed.git.head.targetCommit.message.trimSpace == "fixture: ours, clean" }
+  let merged = landed.file("shared.txt").contents
+  assert { merged.contains("<<<<<<<") and merged.contains(">>>>>>>") }
+  assert { !merged.contains("rejected hunk") }
+  assert { merged.contains("upstream\n") and merged.contains("ours\n") }
+  assert { landed.git.uncommitted.diffStats.{{path}}.map { s => s.path } == ["shared.txt"] }
+  assert { landed.file("upstream.txt").contents == "u\n" }
+  assert { landed.file("ours.txt").contents == "o\n" }
+  assert { !landed.directory("/").entries.contains("later.txt") }
+
+  let colliding = fixture.tag("colliding").commitSHA
+  # Seed the expected state using existing public bookkeeping, since the LLM
+  # only exposes its workspace, not the stateful tool object rebase installed.
+  let continuing = committer.withRebaseState(
+    origin: origin, remaining: [origin.git.head.commitSHA], stopped: colliding,
+    stoppedHead: landed.git.head.commitSHA, onto: "main", ontoSha: upstream.commitSHA,
+    oldHead: origin.git.head.commitSHA, branch: "feature",
+  )
+  let resolved = landed.withNewFile("shared.txt", "upstream+ours\n")
+  let done = continuing.rebaseContinue(llm: stopped, source: resolved).sync.workspace
+  let replayed = done.git.head.log(limit: 10, base: upstream).{{message, authorName, authorEmail, authoredDate}}
+  assert { replayed.length == 3 }
+  let original = fixture.commit(id: colliding).{{message, authorName, authorEmail, authoredDate}}
+  let resolution = replayed.filter { c => c.message == original.message }
+  assert { resolution.length == 1 }
+  assert { resolution.all { c => c.authorName == original.authorName and c.authorEmail == original.authorEmail and c.authoredDate == original.authoredDate } }
+  assert { done.git.uncommitted.isEmpty }
+  assert { done.file("shared.txt").contents == "upstream+ours\n" }
+  assert { done.file("later.txt").contents == "later\n" }
+  assert { done.compareCommitsFrom(source: origin).{{status}}.all { p => p.status != WorkspaceCommitPickStatus.PICKABLE } }
+  "Rebase replay checks passed."
+}
+
+let checkCommitterMessages(source: Workspace!): String! {
+  let fixture = source.git.head.asWorkspace.withNewFile("message-check-" + Random.string, "fixture\n")
+  let valid = "committer: enforce commit style\n\nKeep history readable."
+  assert { committerRecordedMessage(fixture, valid) == valid }
+  assert { committerRecordedMessage(fixture, valid.replace("\n", "\r\n")) == valid }
+  let fifty = "scope: " + "".padRight(43).replace(" ", "é")
+  assert { committerRecordedMessage(fixture, fifty + "\n\nDescription.") == fifty + "\n\nDescription." }
+  [
+    "",
+    "unscoped subject\n\nDescription.",
+    ": missing scope\n\nDescription.",
+    "scope: \n\nDescription.",
+    "scope:  extra space\n\nDescription.",
+    " scope: leading space\n\nDescription.",
+    "scope: trailing space \n\nDescription.",
+    fifty + "x\n\nDescription.",
+    "scope: missing body",
+    "scope: missing separator\nDescription.",
+    "scope: empty body\n\n \t\n",
+  ].each { invalid =>
+    let result = committerRecordedMessage(fixture, invalid) rescue { e: Error => e.message }
+    assert { result.contains("commit:") }
+  }
+
+  let eighty = ["123456789", "123456789", "123456789", "123456789", "123456789", "123456789", "123456789", "123456789"].join(" ") + "x"
+  assert { eighty.split("").length == 80 }
+  assert { committerRecordedBody(fixture, eighty) == eighty }
+  assert { committerRecordedBody(fixture, eighty + " next") == eighty + "\nnext" }
+  assert { committerRecordedBody(fixture, "short  line\nanother\n\nparagraph") == "short  line\nanother\n\nparagraph" }
+  let long = eighty + " next words"
+  [" ", "    ", "\t", "Signed-off-by: ", "Co-authored-by: "].each { prefix =>
+    assert { committerRecordedBody(fixture, prefix + long) == prefix + long }
+  }
+  ["- ", "* ", "+ ", "1. ", "12) "].each { prefix =>
+    let wrapped = committerRecordedBody(fixture, prefix + long)
+    assert { wrapped.hasPrefix(prefix) }
+    assert { wrapped.split("\n").all { line => line.split("").length <= 80 } }
+    assert { wrapped.split("\n").dropFirst.all { line => line.hasPrefix("".padRight(prefix.split("").length)) } }
+    assert { committerRecordedBody(fixture, wrapped) == wrapped }
+  }
+  ["```", "~~~~"].each { fence =>
+    let code = fence + "lang\n" + long + "\n\n  " + long + "\n" + fence
+    assert { committerRecordedBody(fixture, code + "\n" + long) == code + "\n" + eighty + "\nnext words" }
+  }
+  let nested = "````\n```\n" + long + "\n````"
+  assert { committerRecordedBody(fixture, nested) == nested }
+  assert { committerRecordedBody(fixture, "~~~\n" + long) == "~~~\n" + long }
+  let url = "https://example.com/" + "".padRight(90).replace(" ", "x")
+  assert { committerRecordedBody(fixture, "See " + url + " for details.") == "See\n" + url + "\nfor details." }
+  let wrapped = committerRecordedMessage(fixture, "scope: wrap prose\n\n" + long + "\n\n    " + long)
+  assert { committerRecordedMessage(fixture, wrapped) == wrapped }
+  "Commit-message checks passed."
+}
+
+# Inspect actual recorded messages, removing only the automatically added final
+# sign-off (not user-supplied trailers, indentation, or whitespace in the body).
+let committerRecordedMessage(source: Workspace!, message: String!): String! {
+  let recorded = committer.commit(source: source, message: message).git.head.targetCommit.message
+  assert { recorded.contains("\nSigned-off-by: ") }
+  recorded.replaceMatches(`\nSigned-off-by: [^\n]+\n?$`, with: "").trimRight("\n")
+}
+
+let committerRecordedBody(source: Workspace!, body: String!): String! {
+  committerRecordedMessage(source, "scope: wrap prose\n\n" + body).split("\n").dropFirst(2).join("\n")
+}
+
+let checkCommitterFiltering(source: Workspace!): String! {
+  # Returning a String never rebinds or exports the caller's workspace.
+  let root = "glob-check-" + Random.string
+  let fixture = source.git.head.asWorkspace
+    .withNewFile(root + "/edit.go", "before\n")
+    .withNewFile(root + "/delete.go", "remove\n")
+    .withNewFile(root + "/old.go", "rename\n")
+    .withNewFile(root + "/keep.txt", "keep\n")
+  let base = fixture.withCommit(
+    changes: fixture.git.uncommitted.filter(include: [root + "/**"]),
+    message: "fixture",
+    date: "2026-09-15T12:00:00Z",
+  )
+  let working = base
+    .withNewFile(root + "/edit.go", "after\n")
+    .withoutFile(root + "/delete.go")
+    .withoutFile(root + "/old.go")
+    .withNewFile(root + "/new.go", "rename\n")
+    .withNewFile(root + "/newdir/added.go", "added\n")
+    .withNewFile(root + "/space name.go", "space\n")
+    .withNewFile(root + "/quote\"name.go", "quote\n")
+    .withNewFile(root + "/keep.txt", "unselected\n")
+    .withNewFile(root + "/newdir/keep.txt", "unselected sibling\n")
+  let patterns = [root + "/**/*.go"]
+  let summary = committer.status(source: working, paths: patterns)
+  assert { summary.contains("edit.go") and summary.contains("newdir/added.go") }
+  assert { !summary.contains("keep.txt") }
+  let patch = committer.diff(source: working, paths: patterns)
+  assert { patch.contains("+after") and patch.contains("+added") }
+  assert { patch.contains("-remove") and !patch.contains("unselected") }
+  assert { committer.diff(source: working, paths: [root + "/**/*.rs"]).contains("No pending changes") }
+  assert { committer.diff(source: working, paths: [root + "/newdir/added.?o"]).contains("+added") }
+  assert { committer.diff(source: working, paths: [root + "/newdir/[a]dded.go"]).contains("+added") }
+  let message = "test: select glob changes\n\nExercise the public commit selection."
+  let selected = committer.commit(source: working, message: message, paths: patterns)
+  let remaining = selected.git.uncommitted.diffStats.{{path}}
+    .map { s => s.path }.filter { p => !p.hasSuffix("/") }
+  assert { remaining == [root + "/keep.txt", root + "/newdir/keep.txt"] }
+  assert { selected.directory("/").changes(from: working.directory("/")).isEmpty }
+  let shown = committer.show(source: selected, paths: [root + "/**/added.*"])
+  assert { shown.contains("+added") and !shown.contains("+after") }
+  assert { committer.show(source: selected, paths: [root + "/**/*.rs"]).contains("no changes under the given paths") }
+  let noMatch = committer.commit(source: working, message: message, paths: [root + "/**/*.rs"]).git.head.commitSHA rescue { e: Error => e.message }
+  assert { noMatch.contains("nothing to commit") }
+  ["old", "new"].each { side =>
+    let filtered = working.git.uncommitted
+      .filter(include: [root + "/" + side + ".go"]).diffStats.{{path, kind}}
+    let expectedKind = if (side == "old") { DiffStatKind.REMOVED } else { DiffStatKind.ADDED }
+    assert { filtered.map { s => s.path } == [root + "/" + side + ".go"] }
+    assert { filtered.all { s => s.kind == expectedKind } }
+  }
+  let splitRename = committer.commit(source: working, message: message, paths: [root + "/old.go"]).git.head.commitSHA rescue { e: Error => e.message }
+  assert { splitRename.contains("CONFLICT (rename/delete)") }
+  assert { committer.commit(source: working, message: message).git.uncommitted.isEmpty }
+  "Glob filtering and commit checks passed."
+}
+
+let checkCommitterRestore(source: Workspace!): String! {
+  let root = "restore-check-" + Random.string
+  let fixture = source.git.head.asWorkspace
+    .withNewFile(root + "/edit.go", "before\n")
+    .withNewFile(root + "/deleted.go", "restore me\n")
+    .withNewFile(root + "/old.go", "rename\n")
+    .withNewFile(root + "/keep.txt", "keep\n")
+  let base = fixture.withCommit(
+    changes: fixture.git.uncommitted,
+    message: "fixture",
+    date: "2026-09-15T12:00:00Z",
+  )
+  let working = base.withNewFile(root + "/edit.go", "after\n")
+    .withoutFile(root + "/deleted.go")
+    .withoutFile(root + "/old.go")
+    .withNewFile(root + "/new.go", "rename\n")
+    .withNewFile(root + "/nested/added.go", "added\n")
+    .withNewFile(root + "/keep.txt", "unselected\n")
+    .withNewFile(root + "/nested/keep.txt", "unselected addition\n")
+  let paths = [root + "/**/*.go"]
+  let previewed = committer.restore(source: working, paths: paths, preview: true)
+  assert { previewed.directory("/").changes(from: working.directory("/")).isEmpty }
+  assert { previewed.git.head.commitSHA == working.git.head.commitSHA }
+  let restored = committer.restore(source: working, paths: paths)
+  assert { restored.git.head.commitSHA == working.git.head.commitSHA }
+  assert { restored.git.directory.file("HEAD").contents == working.git.directory.file("HEAD").contents }
+  assert { restored.file(root + "/edit.go").contents == "before\n" }
+  assert { restored.file(root + "/deleted.go").contents == "restore me\n" }
+  assert { restored.file(root + "/old.go").contents == "rename\n" }
+  assert { restored.git.uncommitted.filter(include: paths).isEmpty }
+  assert { restored.file(root + "/keep.txt").contents == "unselected\n" }
+  assert { restored.file(root + "/nested/keep.txt").contents == "unselected addition\n" }
+  let oldOnly = committer.restore(source: working, paths: [root + "/old.go"])
+  assert { oldOnly.file(root + "/old.go").contents == "rename\n" }
+  assert { oldOnly.file(root + "/new.go").contents == "rename\n" }
+  let newOnly = committer.restore(source: working, paths: [root + "/new.go"])
+  assert { newOnly.directory("/").changes(from: working.withoutFile(root + "/new.go").directory("/")).isEmpty }
+  let tip = working.withCommit(
+    changes: working.git.uncommitted.filter(include: paths),
+    message: "fixture tip",
+    date: "2026-09-15T12:01:00Z",
+  )
+  let historical = committer.restore(source: tip, paths: paths, ref: base.git.head.commitSHA)
+  assert { historical.git.head.commitSHA == tip.git.head.commitSHA }
+  assert { historical.directory("/").changes(from: restored.directory("/")).isEmpty }
+  let abbreviated = committer.restore(source: tip, paths: paths, ref: base.git.head.commitSHA.split("").takeFirst(7).join(""))
+  assert { abbreviated.directory("/").changes(from: historical.directory("/")).isEmpty }
+  assert { committer.restore(source: restored, paths: paths).directory("/").changes(from: restored.directory("/")).isEmpty }
+  [[], [""], ["   "]].each { invalid =>
+    let error = committer.restore(source: working, paths: invalid).git.head.commitSHA rescue { e: Error => e.message }
+    assert { error.contains("specify nonempty path patterns") }
+  }
+  let missing = committer.restore(source: working, paths: [root + "/missing/**"]).git.head.commitSHA rescue { e: Error => e.message }
+  assert { missing.contains("no files match") }
+  let badCommit = committer.restore(source: working, paths: paths, ref: "not-a-real-ref").git.head.commitSHA rescue { e: Error => e.message }
+  assert { badCommit.contains("cannot resolve commit") }
+  let emptyCommit = committer.restore(source: working, paths: paths, ref: " ").git.head.commitSHA rescue { e: Error => e.message }
+  assert { emptyCommit.contains("specify a source commit") }
+  assert { committer.restore(source: working, paths: ["**"]).git.uncommitted.isEmpty }
+  let tools = committer.agent(llm.withWorkspace(source)).tools
+  assert { tools.contains("restore") }
+  ["checkMessages", "checkRebaseHelpers", "checkRebaseReplay", "checkFiltering", "checkRestore"].each { name =>
+    assert { !tools.contains(name) }
+  }
+  "Restore checks passed."
+}

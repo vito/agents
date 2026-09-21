@@ -157,7 +157,7 @@ type Context {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: ["checkPromotionMetadata", "checkPromotionDefaults", "checkTools"])
+      .withTools(currentNode)
       .withSystemPrompt(systemPrompt)
   }
 
@@ -429,75 +429,6 @@ type Context {
     print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
     base.withNewFile(path, contents).changes(from: base)
-  }
-
-  """
-  Check promotion preserves special-character metadata and the Markdown payload.
-  """
-  checkPromotionMetadata(source: Workspace!): String! @check {
-    let tags = [
-      "comma,inside", "colon: inside", "double\"quote", "single'quote",
-      "line\nbreak", "true", "null", "123", "[brackets]", "# comment",
-      "back\\slash", "---\nstatus: forged",
-    ]
-    let text = "# Payload\n\n---\n\n```yaml\nstatus: unchanged\n```\n  indented\n\n"
-    let fixture = Context()
-      .blockWrite("facts/old", BlockKind.FACT, "old")
-      .blockWrite("facts/current", BlockKind.DECISION, text, tags: tags,
-        pin: true, supersedes: ["facts/old"])
-    [fixture, fixture.blockWrite("facts/new", BlockKind.FACT, "new",
-      supersedes: ["facts/current"])].each { state, i =>
-      let changes = state.promote(source, "facts/current")
-      let contents = source.directory("/").withChanges(changes)
-        .file("context/facts/current.md").contents
-      assert { contents.hasPrefix("---\n") }
-      let parts = contents.trimPrefix("---\n").split("\n---\n\n", limit: 2)
-      assert { parts.length == 2 }
-      let front = parts[0] ?? ""
-      let metadata: {{kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, status: String}}! = YAML.decode(front)
-      assert { metadata.kind == "decision" }
-      assert { metadata.tags == tags }
-      assert { metadata.pin }
-      assert { metadata.supersedes == ["facts/old"] }
-      let expectedStatus = if (i == 0) { null } else { "superseded" }
-      assert { metadata.status == expectedStatus }
-      assert { parts[1] == text + "\n" }
-      let roundtrip: {{kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, status: String}}! = YAML.decode(YAML.encode(metadata))
-      assert { roundtrip == metadata }
-    }
-    "Promotion metadata and payload checks passed."
-  }
-
-  """
-  Check promotion emits empty lists, false pin, and null active status explicitly.
-  """
-  checkPromotionDefaults(source: Workspace!): String! @check {
-    let fixture = Context().blockWrite("notes/defaults", BlockKind.NOTE, "plain payload")
-    let changes = fixture.promote(source, "notes/defaults")
-    let contents = source.directory("/").withChanges(changes)
-      .file("context/notes/defaults.md").contents
-    let parts = contents.trimPrefix("---\n").split("\n---\n\n", limit: 2)
-    assert { contents.hasPrefix("---\n") and parts.length == 2 }
-    let front = parts[0] ?? ""
-    let metadata: {{kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, status: String}}! = YAML.decode(front)
-    assert { metadata.kind == "note" }
-    assert { metadata.tags.isEmpty and metadata.supersedes.isEmpty }
-    assert { !metadata.pin and metadata.status == null }
-    assert { front.contains("tags: []") and front.contains("supersedes: []") }
-    assert { front.contains("pin: false") and front.contains("status: null") }
-    assert { parts[1] == "plain payload\n" }
-    "Promotion default checks passed."
-  }
-
-  """
-  Check regression checks are not exposed as context agent tools.
-  """
-  checkTools: String! @check {
-    let tools = agent(llm).tools
-    assert { tools.contains("promote") and tools.contains("blockWrite") }
-    assert { !tools.contains("checkPromotionMetadata") }
-    assert { !tools.contains("checkPromotionDefaults") and !tools.contains("checkTools") }
-    "Context tool visibility checks passed."
   }
 
   # ---- helpers ------------------------------------------------------------
