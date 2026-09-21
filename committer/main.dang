@@ -163,7 +163,7 @@ type Committer {
     Commit to restore from: HEAD by default, or a short/full hash, branch, or tag.
     HEAD itself is never moved.
     """
-    sourceCommit: String! = "HEAD",
+    ref: String! = "HEAD",
     """
     Show the proposed changes without modifying the workspace.
     """
@@ -172,11 +172,11 @@ type Committer {
     if (paths.isEmpty or paths.any { p => p.trimSpace == "" }) {
       raise "restore: specify nonempty path patterns; use ** explicitly to restore everything"
     }
-    if (sourceCommit.trimSpace == "") {
-      raise "restore: specify a source commit, or omit sourceCommit to use HEAD"
+    if (ref.trimSpace == "") {
+      raise "restore: specify a source commit, or omit ref to use HEAD"
     }
     let before = source.snapshot
-    let sha = resolveSpec(before, sourceCommit, head(before).commitSHA)
+    let sha = resolveSpec(before, ref, head(before).commitSHA)
     let tree = repositoryHolding(before, sha).commit(id: sha).tree(discardGitDir: true)
     # Diff BOTH trees before filtering: filtering only the source tree misses
     # additions that need removal, and filtering only the workspace misses
@@ -1235,10 +1235,10 @@ type Committer {
       message: "fixture tip",
       date: "2026-09-15T12:01:00Z",
     )
-    let historical = restore(tip, paths, sourceCommit: head(base).commitSHA)
+    let historical = restore(tip, paths, ref: head(base).commitSHA)
     assert { head(historical).commitSHA == head(tip).commitSHA }
     assert { historical.directory("/").changes(from: restored.directory("/")).isEmpty }
-    let abbreviated = restore(tip, paths, sourceCommit: short(head(base).commitSHA))
+    let abbreviated = restore(tip, paths, ref: short(head(base).commitSHA))
     assert { abbreviated.directory("/").changes(from: historical.directory("/")).isEmpty }
     # A matching but unchanged selection succeeds, unlike a typo.
     assert { restore(restored, paths).directory("/").changes(from: restored.directory("/")).isEmpty }
@@ -1248,9 +1248,9 @@ type Committer {
     }
     let missing = restore(working, [root + "/missing/**"]).git.head.commitSHA rescue { e: Error => e.message }
     assert { missing.contains("no files match") }
-    let badCommit = restore(working, paths, sourceCommit: "not-a-real-ref").git.head.commitSHA rescue { e: Error => e.message }
+    let badCommit = restore(working, paths, ref: "not-a-real-ref").git.head.commitSHA rescue { e: Error => e.message }
     assert { badCommit.contains("cannot resolve commit") }
-    let emptyCommit = restore(working, paths, sourceCommit: " ").git.head.commitSHA rescue { e: Error => e.message }
+    let emptyCommit = restore(working, paths, ref: " ").git.head.commitSHA rescue { e: Error => e.message }
     assert { emptyCommit.contains("specify a source commit") }
     # Explicit whole-tree selection also restores files outside the fixture.
     assert { restore(working, ["**"]).git.uncommitted.isEmpty }
@@ -1794,7 +1794,7 @@ type Committer {
     - `diff` — those same changes as a full Git-style unified patch, when you
       need to read the actual hunks. Scope it with `paths`; an unscoped patch
       can be huge.
-    - `restore` — replace selected working-tree files from `sourceCommit`
+    - `restore` — replace selected working-tree files from `ref`
       (default HEAD) without moving HEAD. Required `paths` are globs like
       status/commit; selection covers both trees, so deleted files return and
       additions absent from the source are removed. Other files stay untouched.
