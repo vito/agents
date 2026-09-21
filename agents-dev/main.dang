@@ -43,12 +43,12 @@ type AgentsDev {
 
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: String! @check {
-    contributor.checkMountsOutsideToolbox
+    checkContributorMountsOutsideToolbox
   }
 
   """Check checkout selection, HEAD state, and kept edits on a local Git fixture."""
   contributorCheckoutRefs: String! @check {
-    contributor.checkCheckoutRefs
+    checkContributorCheckoutRefs
   }
 
   """Check public glob filtering and literal internal drift paths without model calls."""

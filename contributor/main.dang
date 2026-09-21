@@ -158,7 +158,7 @@ type Contributor {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: ["checkMountsOutsideToolbox", "checkCheckoutRefs"])
+      .withTools(currentNode)
       .withSystemPrompt(systemPrompt)
   }
 
@@ -738,19 +738,6 @@ type Contributor {
     source.withoutMount(mountPath(name.trimPrefix(mountRoot + "/")))
   }
 
-  # Mounts stay out of the gh toolbox's snapshot: a mounted checkout can be
-  # large, and gh never needs it.
-  checkMountsOutsideToolbox: String! {
-    let ws = directory
-      .withNewFile("tmp/body.md", "draft\n")
-      .asWorkspace
-      .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
-    assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
-    let seen = toolboxTree(ws).entries
-    assert { seen.contains("tmp/") and !seen.contains("mnt/") }
-    "mounts are excluded from the toolbox snapshot"
-  }
-
   """
   Switch this conversation to a checkout of a DIFFERENT git repository.
 
@@ -856,93 +843,9 @@ type Contributor {
     layered
   }
 
-  """
-  Check checkout selection, HEAD state, and kept edits on a local Git fixture.
-  """
-  checkCheckoutRefs: String! {
-    let fixture = container.from("alpine:3.22")
-      .withExec(["apk", "add", "--no-cache", "git"])
-      .withWorkdir("/repo")
-      .withExec(["sh", "-eu", "-c", """
-        git init -b main
-        git config user.name 'Checkout Test'
-        git config user.email checkout@example.com
-        export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
-        export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
-        printf 'base\n' > marker
-        printf 'remove\n' > delete.txt
-        git add .
-        git commit -m base
-        git tag v1
-        git tag -a v1-annotated -m release
-        git checkout -b feature
-        printf 'feature\n' > marker
-        git commit -am feature
-        git checkout main
-      """])
-      .directory("/repo").asGit
-    let baseSha = fixture.head.commitSHA
-    let featureSha = fixture.branch("feature").commitSHA
-    let source = fixture.head.asWorkspace
-      .withNewFile("marker", "pending\n")
-      .withNewFile("new.txt", "new\n")
-      .withNewFile("left.txt", "left behind\n")
-      .withoutFile("delete.txt")
-
-    # Empty ref, branches, tags of both kinds, and a SHA all go through the
-    # exact production helper.
-    let cases = [
-      {{ref: "", sha: baseSha, state: "branch main", head: "ref: refs/heads/main\n", marker: "base\n"}},
-      {{ref: "feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-      {{ref: "refs/heads/feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-      {{ref: "v1", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
-      {{ref: "v1-annotated", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
-      {{ref: baseSha, sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
-    ]
-    cases.each { c =>
-      let prepared = checkoutWorkspace(source, fixture, "fixture", c.ref)
-      assert { prepared.where.contains(c.sha + "; " + c.state) }
-      assert { prepared.workspace.git.head.commitSHA == c.sha }
-      assert { prepared.workspace.git.directory.file("HEAD").contents == c.head }
-      assert { prepared.workspace.file("marker").contents == c.marker }
-      assert { prepared.workspace.git.uncommitted.isEmpty }
-    }
-    ["feature", "v1", baseSha].each { ref =>
-      let prepared = checkoutWorkspace(source, fixture, "fixture", ref, keep: ["marker", "new.txt", "delete.txt"])
-      let target = prepared.workspace
-      let expectedHead = if (ref == "feature") { "ref: refs/heads/feature\n" } else { baseSha + "\n" }
-      assert { target.git.directory.file("HEAD").contents == expectedHead }
-      assert { target.file("marker").contents == "pending\n" }
-      assert { target.file("new.txt").contents == "new\n" }
-      assert { !target.directory("/").entries.contains("delete.txt") }
-      assert { !target.directory("/").entries.contains("left.txt") }
-      assert { target.git.uncommitted.diffStats.{{path}}.length == 3 }
-      assert { prepared.where.contains("3 pending file(s) kept:") }
-    }
-    let missing = checkoutWorkspace(source, fixture, "fixture", "no-such-ref").where rescue {
-      e: Error => e.message
-    }
-    assert { missing.contains("cannot check out fixture:") }
-    assert { !missing.contains("[traceparent:") }
-    let unknownSha = checkoutWorkspace(source, fixture, "fixture", "0000000000000000000000000000000000000001").where rescue {
-      e: Error => e.message
-    }
-    assert { unknownSha.contains("cannot check out fixture:") }
-    let noMatch = checkoutWorkspace(source, fixture, "fixture", "v1", keep: ["absent"]).where rescue {
-      e: Error => e.message
-    }
-    assert { noMatch.contains("nothing pending matches keep:") }
-    assert { source.file("left.txt").contents == "left behind\n" }
-    let tools = agent(llm.withWorkspace(source)).tools
-    assert { tools.contains("checkout") }
-    assert { !tools.contains("checkCheckoutRefs") and !tools.contains("checkMountsOutsideToolbox") }
-    "Checkout ref and keep checks passed."
-  }
-
   # ---- helpers ------------------------------------------------------------
 
-  # Resolve and prepare before rebinding the conversation. Keeping this
-  # independent of the LLM also lets checks exercise real Git refs locally.
+  # Resolve and prepare before rebinding the conversation.
   let checkoutWorkspace(
     source: Workspace!,
     repository: GitRepository!,
