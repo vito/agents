@@ -158,7 +158,7 @@ type Contributor {
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: ["checkMountsOutsideToolbox"])
+      .withTools(currentNode, except: ["checkMountsOutsideToolbox", "checkCheckoutRefs"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -763,9 +763,13 @@ type Contributor {
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
   tool you already hold (read, edit, status, diff, commit, push, ...) simply
-  operates on the new checkout from here on. When the target workspace
-  defines agents of its own, they are composed on top of your toolset,
-  except modules your originating workspace already provides.
+  operates on the new checkout from here on. Use `ref` for a branch, tag,
+  or commit SHA; omit it for the default branch. Branches stay attached,
+  while tags and SHAs use detached HEAD (name a branch explicitly to push).
+  The result reports the resolved SHA and branch/detached state.
+
+  When the target workspace defines agents of its own, they are composed on
+  top of your toolset, except modules your originating workspace provides.
 
   The switch is one-way for this conversation: your previous workspace is
   left behind, and there is no tool to switch back. Pending changes go with
@@ -789,7 +793,15 @@ type Contributor {
     """
     repo: String!,
     """
-    Branch to check out. Empty checks out the repository's default branch.
+    Branch, tag, or commit SHA to check out. Empty uses the repository's
+    default branch. Branches stay attached; tags and SHAs use detached HEAD.
+    Use a full SHA for a remote commit; abbreviated SHAs may not resolve.
+    Mutually exclusive with the compatibility `branch` argument.
+    """
+    ref: String! = "",
+    """
+    Compatibility alias for selecting a branch. Prefer `ref`; do not set
+    both. Empty leaves selection to `ref` or the repository's default branch.
     """
     branch: String! = "",
     """
@@ -811,54 +823,9 @@ type Contributor {
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): resolves a live remote and rebinds the conversation; a
     # later identical call must fetch the repo as it is then.
-    let ref = if (branch == "") {
-      git(repo).head
-    } else {
-      git(repo).branch(branch)
-    }
-    # Force the resolution HERE, inside the tool, so a typo'd URL or branch
-    # fails as this call instead of poisoning the continuation.
-    let sha = ref.commitSHA rescue {
-      e: Error => raise `cannot check out ${repo}: ${plainError(e.message)}`
-    }
-    let label = ref.name.trimPrefix("refs/heads/") rescue {
-      e: Error => "HEAD"
-    }
-
-    # Pending changes selected by `keep`, resolved against the OLD workspace
-    # before anything switches. An explicit selection that matches nothing
-    # is refused: silently dropping the very files the agent asked to keep is
-    # the loss this argument exists to prevent.
-    let kept = source.git.uncommitted.filter(include: keep)
-    let keptPaths = if (keep.isEmpty) {
-      []
-    } else {
-      kept.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") }
-    }
-    if (!keep.isEmpty and keptPaths.isEmpty) {
-      raise `nothing pending matches keep: ${keep.join(", ")} (status shows what is pending)`
-    }
-
-    # A changeset applies as an overlay — files replaced wholesale, deletions
-    # removed — so pending edits from one repository land in an unrelated
-    # tree without needing a common baseline: the file arrives as it is here.
-    let target = if (keptPaths.isEmpty) {
-      ref.asWorkspace
-    } else {
-      let carried = ref.asWorkspace.withChanges(kept)
-      # Force the overlay HERE too, for the same reason as the resolution:
-      # reading the target's pending changes back evaluates the apply.
-      carried.git.uncommitted.diffStats.{{path}}.length rescue {
-        e: Error => raise `cannot carry pending changes into ${repo}: ${plainError(e.message)}`
-      }
-      carried
-    }
-    let keptNote = if (keptPaths.isEmpty) {
-      ""
-    } else {
-      ` with ${toString(keptPaths.length)} pending file(s) kept: ${keptPaths.join(", ")}`
-    }
-    let where = `${repo}@${label} (${short(sha)})` + keptNote
+    let prepared = checkoutWorkspace(source, git(repo), repo, ref, branch, keep)
+    let target = prepared.workspace
+    let where = prepared.where
 
     let switched = llm.withWorkspace(target)
     if (!composeAgents) {
@@ -895,7 +862,172 @@ type Contributor {
     layered
   }
 
+  """
+  Check checkout selection, HEAD state, and kept edits on a local Git fixture.
+  """
+  checkCheckoutRefs: String! @check {
+    let fixture = container.from("alpine:3.22")
+      .withExec(["apk", "add", "--no-cache", "git"])
+      .withWorkdir("/repo")
+      .withExec(["sh", "-eu", "-c", """
+        git init -b main
+        git config user.name 'Checkout Test'
+        git config user.email checkout@example.com
+        export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+        export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+        printf 'base\n' > marker
+        printf 'remove\n' > delete.txt
+        git add .
+        git commit -m base
+        git tag v1
+        git tag -a v1-annotated -m release
+        git checkout -b feature
+        printf 'feature\n' > marker
+        git commit -am feature
+        git checkout main
+      """])
+      .directory("/repo").asGit
+    let baseSha = fixture.head.commitSHA
+    let featureSha = fixture.branch("feature").commitSHA
+    let source = fixture.head.asWorkspace
+      .withNewFile("marker", "pending\n")
+      .withNewFile("new.txt", "new\n")
+      .withNewFile("left.txt", "left behind\n")
+      .withoutFile("delete.txt")
+
+    # Empty ref, branches (including the compatibility spelling), tags of
+    # both kinds, and a SHA all go through the exact production helper.
+    let cases = [
+      {{ref: "", branch: "", sha: baseSha, state: "branch main", head: "ref: refs/heads/main\n", marker: "base\n"}},
+      {{ref: "feature", branch: "", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+      {{ref: "refs/heads/feature", branch: "", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+      {{ref: "", branch: "feature", sha: featureSha, state: "branch feature", head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+      {{ref: "v1", branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+      {{ref: "v1-annotated", branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+      {{ref: baseSha, branch: "", sha: baseSha, state: "detached HEAD", head: baseSha + "\n", marker: "base\n"}},
+    ]
+    cases.each { c =>
+      let prepared = checkoutWorkspace(source, fixture, "fixture", c.ref, c.branch)
+      assert { prepared.where.contains(c.sha + "; " + c.state) }
+      assert { prepared.workspace.git.head.commitSHA == c.sha }
+      assert { prepared.workspace.git.directory.file("HEAD").contents == c.head }
+      assert { prepared.workspace.file("marker").contents == c.marker }
+      assert { prepared.workspace.git.uncommitted.isEmpty }
+    }
+    ["feature", "v1", baseSha].each { ref =>
+      let prepared = checkoutWorkspace(source, fixture, "fixture", ref, keep: ["marker", "new.txt", "delete.txt"])
+      let target = prepared.workspace
+      let expectedHead = if (ref == "feature") { "ref: refs/heads/feature\n" } else { baseSha + "\n" }
+      assert { target.git.directory.file("HEAD").contents == expectedHead }
+      assert { target.file("marker").contents == "pending\n" }
+      assert { target.file("new.txt").contents == "new\n" }
+      assert { !target.directory("/").entries.contains("delete.txt") }
+      assert { !target.directory("/").entries.contains("left.txt") }
+      assert { target.git.uncommitted.diffStats.{{path}}.length == 3 }
+      assert { prepared.where.contains("3 pending file(s) kept:") }
+    }
+    # Reject conflicting selectors even if they name the same branch.
+    let both = checkoutWorkspace(source, fixture, "fixture", "main", "main").where rescue {
+      e: Error => e.message
+    }
+    assert { both.contains("mutually exclusive") }
+    let missing = checkoutWorkspace(source, fixture, "fixture", "no-such-ref").where rescue {
+      e: Error => e.message
+    }
+    assert { missing.contains("cannot check out fixture:") }
+    assert { !missing.contains("[traceparent:") }
+    let unknownSha = checkoutWorkspace(source, fixture, "fixture", "0000000000000000000000000000000000000001").where rescue {
+      e: Error => e.message
+    }
+    assert { unknownSha.contains("cannot check out fixture:") }
+    let noMatch = checkoutWorkspace(source, fixture, "fixture", "v1", keep: ["absent"]).where rescue {
+      e: Error => e.message
+    }
+    assert { noMatch.contains("nothing pending matches keep:") }
+    assert { source.file("left.txt").contents == "left behind\n" }
+    let tools = agent(llm.withWorkspace(source)).tools
+    assert { tools.contains("checkout") }
+    assert { !tools.contains("checkCheckoutRefs") and !tools.contains("checkMountsOutsideToolbox") }
+    "Checkout ref and keep checks passed."
+  }
+
   # ---- helpers ------------------------------------------------------------
+
+  # Resolve and prepare before rebinding the conversation. Keeping this
+  # independent of the LLM also lets checks exercise real Git refs locally.
+  let checkoutWorkspace(
+    source: Workspace!,
+    repository: GitRepository!,
+    repo: String!,
+    ref: String! = "",
+    branch: String! = "",
+    keep: [String!]! = [],
+  ): {{workspace: Workspace!, where: String!}}! {
+    if (ref != "" and branch != "") {
+      raise "checkout: `ref` and `branch` are mutually exclusive; pass only `ref` (preferred) or the compatibility `branch` argument"
+    }
+    let selected = if (branch != "") {
+      # Retain the old branch-only lookup for compatibility, including when
+      # a tag has the same name as the branch.
+      repository.branch(branch)
+    } else if (ref != "") {
+      repository.ref(ref)
+    } else {
+      repository.head
+    }
+    # Force resolution here, so an invalid URL or ref cannot poison the
+    # continuation. Preserve the resolved ref: replacing it with its SHA
+    # would detach branch checkouts too.
+    let resolved = selected.{{commitSHA, name}} rescue {
+      e: Error => raise `cannot check out ${repo}: ${plainError(e.message)}`
+    }
+    let state = if (resolved.name.hasPrefix("refs/heads/")) {
+      "branch " + resolved.name.trimPrefix("refs/heads/")
+    } else {
+      "detached HEAD"
+    }
+    let label = if (ref != "") { ref } else if (branch != "") { branch } else { "HEAD" }
+
+    # Pending changes selected by `keep`, resolved against the OLD workspace
+    # before anything switches. An explicit selection that matches nothing
+    # is refused: silently dropping the very files the agent asked to keep is
+    # the loss this argument exists to prevent.
+    let kept = source.git.uncommitted.filter(include: keep)
+    let keptPaths = if (keep.isEmpty) {
+      []
+    } else {
+      kept.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") }
+    }
+    if (!keep.isEmpty and keptPaths.isEmpty) {
+      raise `nothing pending matches keep: ${keep.join(", ")} (status shows what is pending)`
+    }
+
+    # A changeset applies as an overlay — files replaced wholesale, deletions
+    # removed — so pending edits from one repository land in an unrelated
+    # tree without needing a common baseline: the file arrives as it is here.
+    let target = if (keptPaths.isEmpty) {
+      selected.asWorkspace
+    } else {
+      let carried = selected.asWorkspace.withChanges(kept)
+      # Force the overlay HERE too, for the same reason as the resolution:
+      # reading the target's pending changes back evaluates the apply.
+      carried.git.uncommitted.diffStats.{{path}}.length rescue {
+        e: Error => raise `cannot carry pending changes into ${repo}: ${plainError(e.message)}`
+      }
+      carried
+    }
+    # A full SHA can resolve syntactically without identifying a fetchable
+    # object. Materialize the checkout before rebinding, not on a later read.
+    target.directory("/").entries rescue {
+      e: Error => raise `cannot check out ${repo}: ${plainError(e.message)}`
+    }
+    let keptNote = if (keptPaths.isEmpty) {
+      ""
+    } else {
+      ` with ${toString(keptPaths.length)} pending file(s) kept: ${keptPaths.join(", ")}`
+    }
+    {{workspace: target, where: `${repo}@${label} (${resolved.commitSHA}; ${state})` + keptNote}}
+  }
 
   # Shared toolbox for GitHub operations: git, gh, and jq, run from the root
   # of the workspace's checkout. The workspace's files are mounted so
@@ -1293,7 +1425,12 @@ type Contributor {
 
     `checkout` replaces this conversation's workspace with a fresh checkout
     of a git repository — the writable starting point for development,
-    PR review, or addressing feedback outside the current workspace. Your
+    PR review, or addressing feedback outside the current workspace. Pass
+    `ref` to select a branch, tag, or commit SHA; omit it for the default
+    branch. `branch` remains a compatibility alias for branch selection;
+    never set both. Branch refs keep their branch; tags and SHAs produce
+    detached HEAD, so publishing from them needs an explicit push branch.
+    Checkout reports the resolved SHA and branch/detached state. Your
     tools come along and operate on the new checkout, and any agents the
     target workspace itself defines are composed on top of them. The switch
     is one-way: your previous workspace is left behind, pending changes
