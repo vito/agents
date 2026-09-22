@@ -7,7 +7,7 @@
 # Messaging is event-driven, never blocking (hack/designs/agent-messaging.md):
 # spawn subscribes the chief to each worker's lifecycle, so completions and
 # failures arrive as attributed messages instead of being polled or awaited;
-# the chief steers by name — sendTo/status/read/interruptWorker/dismiss —
+# the chief steers by name — sendTo/status/read/interruptWorker —
 # and harvests work — logOf/diffOf/pull/pullConflicted/pullPending,
 # reaching each agent's own Workspace through its live snapshot. Spawned
 # workers get a frozen, pull-only roster view of the chief and peers already
@@ -31,14 +31,6 @@ type Staff {
   # Live worker handles; unique by name, by construction.
   let members: Map[Agent!]! = [:]
 
-  # Handles of workers dismissed in this session, kept so their work can still
-  # be harvested: dismiss drops the name from `members`, but the Agent
-  # tombstone stays readable for the rest of the session — and a dismissed
-  # worker's uncommitted WIP is exactly what pullPending exists to rescue.
-  # Only the harvest tools look here; steering tools resolve through member()
-  # so they can never address a corpse.
-  let tombstones: Map[Agent!]! = [:]
-
   # Tool configuration belongs to the originating workspace, not necessarily
   # the worktree the chief now edits (checkout preserves tools across switches).
   # Keep the source, not the partially composed base LLM or live tool state.
@@ -48,7 +40,7 @@ type Staff {
   # plumbing. Prompt constants are excluded too.
   # Workers bind only the dedicated PullTools object, never this full Staff.
   let plumbing = [
-    "withWorker", "withDismissed", "chiefLine", "pullTools",
+    "withWorker", "chiefLine", "pullTools",
     "withCompositionSource", "workerBase", "workerPrompt", "workerPromptFor"
   ]
 
@@ -99,7 +91,7 @@ type Staff {
   you are subscribed to its lifecycle: when it goes idle (with its final
   reply) or fails (with the error), the news arrives as an event message.
   Keep working; check on it with status/read, steer it with sendTo, harvest
-  it with the pull family, let it go with dismiss. The worker gets fresh tools
+  it with the pull family. The worker gets fresh tools
   from the workspace where staff was composed, bound to your current worktree,
   a pull-only view of the chief and workers already on staff, and askChief,
   its line back to you. It cannot spawn or steer workers. Tools layered onto
@@ -141,7 +133,7 @@ type Staff {
       raise `staff member name "chief" is reserved for the chief in worker pull rosters`
     }
     if (members.has(name)) {
-      raise `staff member "${name}" already exists — dismiss it first or pick another name`
+      raise `staff member "${name}" already exists — pick another name`
     }
     let base = workerBase(source, model)
     # Snapshot the peers that exist BEFORE this spawn and add the chief under
@@ -155,8 +147,7 @@ type Staff {
       # stays out of the tool schema.
       .withTools(Dagger.staff.chiefLine(boss: chief), except: ["boss"])
       .withSystemPrompt(workerPromptFor(name))
-      # spawn mints a unique agent instance per call, so a re-hired name can
-      # never collide with a dismissed predecessor's runtime.
+      # spawn mints a unique agent instance per call.
       .spawn(name: name)
     # Fire-and-forget: signal-with-start opens the worker's first turn.
     worker.send(task)
@@ -176,10 +167,6 @@ type Staff {
   the ID.
   """
   withWorker(name: String!, worker: Agent!): Staff! {
-    # A re-hired name starts clean: the predecessor's tombstone would
-    # otherwise shadow nothing but confuse the harvest tools' "dismissed this
-    # session" list.
-    self.tombstones = self.tombstones.without(name)
     self.members = self.members.with(name, worker)
     self
   }
@@ -584,11 +571,10 @@ type Staff {
   Take a worker's UNCOMMITTED work — everything it changed but never
   committed — re-anchored on your workspace's current content.
 
-  This is the other half of `pull`, and the tool that rescues a worker you
-  are about to dismiss. The worker started from a copy of your workspace, so
-  its pending patch usually contains edits you already have; those are
-  filtered out by comparing the two trees, and only files that genuinely
-  differ are applied.
+  This is the other half of `pull`. The worker started from a copy of your
+  workspace, so its pending patch usually contains edits you already have;
+  those are filtered out by comparing the two trees, and only files that
+  genuinely differ are applied.
 
   Fails rather than half-applying when the two of you edited the same part of
   the same file. `markers: true` applies what fits and leaves git-style
@@ -681,47 +667,6 @@ type Staff {
   }
 
   """
-  Stop a worker and remove it from the staff. Terminal: its runtime is
-  released (in-flight work may finish its step first) and the name frees up.
-
-  HARVEST FIRST. A worker's commits and edits live in ITS copy of the
-  workspace, not yours: `pull` what it committed and `pullPending` what it
-  did not, before letting it go. (Its workspace stays readable for the rest
-  of this session, but not beyond it.)
-  """
-  dismiss(
-    """
-    The worker's name.
-    """
-    name: String!,
-  ): Dagger.Staff! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): stopping the runtime is a side effect that must run.
-    let worker = member(name)
-    worker.stop
-    # The bookkeeping goes through a PURE call, exactly as spawn's does
-    # (withWorker), so it does not ride the chief's recorded chain as an
-    # effect. Loading that chain — which is what resuming a chief from its
-    # trace does (hack/designs/resume-from-trace.md §8) — would otherwise
-    # re-execute this @cache(Never) body and stop a worker that was just
-    # re-hydrated.
-    currentNode.{{... on Dagger.Staff!}}.withDismissed(name, worker)
-  }
-
-  """
-  An internal plumbing-only call so that we can separate the act of stopping a
-  worker from the act of recording its tombstone - otherwise replaying the LLM
-  ID will re-stop agents on every nested Staff.dismiss call in the ID.
-  """
-  withDismissed(name: String!, worker: Agent!): Staff! {
-    # Keep the handle: a stopped agent's snapshot — and the workspace bound to
-    # it — stays readable, so a forgotten pullPending is still recoverable
-    # until the session ends.
-    self.tombstones = self.tombstones.with(name, worker)
-    self.members = self.members.without(name)
-    self
-  }
-
-  """
   Mint the dedicated pull-only tool object workers receive. The receiver is a
   frozen Staff roster view assembled by spawn; wrapping it in a secondary type
   keeps every orchestration method structurally out of the worker's toolset.
@@ -756,29 +701,6 @@ type Staff {
     }
   }
 
-  # Address a worker for HARVESTING: live members first, then this session's
-  # tombstones. Steering tools deliberately keep using member(), so only the
-  # harvest family can resolve to a stopped worker.
-  let harvestTarget(name: String!): Agent! {
-    let live = members[name]
-    if (live != null) {
-      return live
-    }
-    let dismissed = tombstones[name]
-    if (dismissed != null) {
-      return dismissed
-    }
-    raise `no staff member named "${name}"; current members: ${memberNames}; dismissed this session: ${tombstoneNames}`
-  }
-
-  let tombstoneNames: String! {
-    if (tombstones.isEmpty) {
-      "(none)"
-    } else {
-      tombstones.keys.join(", ")
-    }
-  }
-
   # The worker's own copy of the workspace: Agent.snapshot is its last
   # committed conversation, and LLM.workspace the workspace bound to it.
   #
@@ -797,7 +719,7 @@ type Staff {
   # forcing point. Deliberate — reading a live member's snapshot does not
   # fail in practice, and locating it earlier beats a torn harvest.
   let workerWorkspace(name: String!): Workspace! {
-    harvestTarget(name).snapshot.sync.workspace
+    member(name).snapshot.sync.workspace
   }
 
   let repository(source: Workspace!): GitRepository! {
@@ -915,8 +837,7 @@ type Staff {
       tail of a worker's conversation. Use them to inspect progress, not to
       poll for completion — completions arrive as events.
     - `interruptWorker` preempts a worker mid-task (progress kept, parked
-      paused); a later sendTo resumes it. `dismiss` stops and removes a
-      worker for good.
+      paused); a later sendTo resumes it.
 
     MESSAGES ARE ATTRIBUTED. A worker's question arrives as a message
     headed "[message #N from agent ...]"; an event as "[event from agent
@@ -930,7 +851,7 @@ type Staff {
     arrive. A worker going idle means its turn ended — read the final reply
     in the event, then harvest or send follow-up work. A worker FAILING
     means its loop stopped — sendTo retries it from its last completed
-    step, dismiss lets it go. When you have nothing to do until workers
+    step. When you have nothing to do until workers
     respond, reply with a brief progress update and END YOUR TURN. This
     applies whether you are waiting on one worker or several. Their
     completion events and messages (including questions) will wake you;
@@ -949,7 +870,7 @@ type Staff {
 
     Each worker receives a pull-only view of `chief` plus the workers already
     present when it is spawned. It can inspect and take their committed or
-    pending work, but cannot spawn, steer, interrupt, or dismiss anyone. The
+    pending work, but cannot spawn, steer, or interrupt anyone. The
     roster is a capability snapshot: hire producers before consumers when a
     worker should pull directly from another worker; otherwise relay through
     your own workspace.
@@ -969,7 +890,7 @@ type Staff {
     SETTLE BEFORE THE FINAL HARVEST: these tools read the worker's last
     COMMITTED conversation step, so a mid-turn worker may hold work they
     cannot see yet. Wait for its idle event (or use `interruptWorker`)
-    before the harvest that matters, and harvest BEFORE `dismiss`.
+    before the harvest that matters.
 
     THE CONFLICT LOOP: `pull`, then read the CONFLICT block. Per entry,
     either commit or revert your own edits on the named paths and pull again
@@ -1009,7 +930,7 @@ type Staff {
     were spawned. Use `chief` for the chief and staff names for older workers.
     `logOf` and `diffOf` inspect their work; `pull`, `pullPending`, and
     `pullConflicted` take it into your workspace. You cannot spawn, steer, or
-    dismiss agents. The roster is a frozen capability snapshot, so agents
+    interrupt agents. The roster is a frozen capability snapshot, so agents
     hired after you are not visible directly; the chief can relay their work
     when needed.
 
@@ -1039,7 +960,7 @@ Pull-only access to another agent's workspace.
 
 Workers receive this narrow tool object instead of Staff itself, so they can
 inspect and take work without gaining orchestration capabilities such as spawn,
-steering, interruption, or dismissal.
+steering, or interruption.
 """
 type PullTools {
   # A frozen Staff roster containing the chief and workers that already existed

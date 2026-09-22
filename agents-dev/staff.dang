@@ -87,8 +87,8 @@ let testStaffFiltering(source: Workspace!): String! {
 
 let testStaffTools(source: Workspace!): String! {
   let tools = staff.agent(llm.withWorkspace(source)).tools
-  assert { tools.contains("spawn") and tools.contains("dismiss") }
-  assert { !tools.contains("withWorker") and !tools.contains("withDismissed") }
+  assert { tools.contains("spawn") }
+  assert { !tools.contains("withWorker") }
   assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
   assert { !tools.contains("checkComposition") }
   assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
@@ -156,8 +156,6 @@ let testStaffComposition: String! {
   let handle = worker.spawn(name: "composition-fixture")
   let roster = fixture.withWorker("fixture", handle)
   assert { roster.workerBase(target).tools.contains("originRead") }
-  let dismissed = roster.withDismissed("fixture", handle)
-  assert { dismissed.workerBase(target).tools.contains("originRead") }
   handle.stop
 
   # A destination with agent code is not implicitly trusted or composed.
