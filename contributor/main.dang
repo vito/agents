@@ -44,11 +44,10 @@
 #   commit → pushBranch(repo: "you/fork", branch: "fix-x") →
 #   `gh pr create --head you:fix-x`.
 #
-# - `mount` attaches ANOTHER repository's checkout to the workspace,
-#   read-only, under mnt/<name> (Workspace.withMountedDirectory): the
-#   agent's own read/grep/find then work on it, with their line offsets and
-#   limits, while the mount stays outside the pending changeset — never in
-#   status/diff, never committed or exported. Without it, agents reach for
+# - `mount` attaches ANOTHER repository's checkout to the workspace under
+#   mnt/<name> (Workspace.withMountedDirectory): the agent's file tools
+#   work on it, while the mount stays outside the pending changeset — never
+#   in status/diff, never committed or exported. Without it, agents reach for
 #   `gh api repos/../contents/..`, which hands back base64 they cannot
 #   read; that endpoint is denied so the cheap mistake has no path. The
 #   mount root is fixed at mnt/ so the gh toolbox can exclude it (a
@@ -110,7 +109,7 @@ let head(s: String!, lines: Int! = patchLines): String! {
 GitHub operations: run the `gh` CLI against the workspace's checkout, post
 agent-marked comments on issues and pull requests and edit them
 surgically, read pull request review threads with their diff context,
-mount other repositories into the workspace read-only, push to a fork, and
+mount other repositories into the workspace, push to a fork, and
 switch the conversation to a checkout of another repository.
 """
 type Contributor {
@@ -665,23 +664,22 @@ type Contributor {
   }
 
   """
-  Mount another git repository's checkout into the workspace, read-only, to
-  study it with your regular file tools.
+  Mount another git repository's checkout into the workspace to use it with
+  your regular file tools.
 
-  The tree appears under mnt/<name> and read, grep and find work on it like
-  on any other directory — with their usual line offsets and limits — but
-  it stays out of the pending changeset: never in status or diff, cannot be
-  edited, never committed or exported. Use this to explore more distant
-  dependencies, NOT the primary product being developed or reviewed.
+  The tree appears under mnt/<name> and your file tools work on it like on
+  any other directory, but it stays out of the pending changeset: never in
+  status or diff, never committed or exported. Use this to explore more
+  distant dependencies, NOT the primary product being developed or reviewed.
   For that, use `checkout` directly if fresh, or hire a subagent to checkout
   if you have ongoing work to preserve, even when starting with PR review
   or feedback. Do not read files through `gh api repos/.../contents/...`,
   which returns base64 and is refused. The engine fetches each (repo, ref)
   once and caches it, so mounting is cheap.
 
-  Mounting only reads. To work IN the other repository — edit, commit,
-  push — use `checkout` (one-way) or hand the errand to a worker. Mounts
-  belong to this workspace and do not follow a `checkout`.
+  To commit and push changes in the other repository, use `checkout`
+  (one-way) or hand the errand to a worker. Mounts belong to this workspace
+  and do not follow a `checkout`.
   """
   mount(
     source: Workspace!,
@@ -719,7 +717,7 @@ type Contributor {
     let dir = mountPath(if (name == "") { repoName(url) } else { name })
 
     let at = if (ref == "") { "" } else { `@${ref}` }
-    print(`Mounted ${repo}${at} (${short(sha)}) read-only at ${dir}/ — read, grep and find work on it; unmount with unmount("${Path(dir).name}") when done.`)
+    print(`Mounted ${repo}${at} (${short(sha)}) at ${dir}/ — your file tools work on it; unmount with unmount("${Path(dir).name}") when done.`)
 
     source.withMountedDirectory(dir, target.tree(discardGitDir: true))
   }
@@ -1227,10 +1225,10 @@ type Contributor {
     You have GitHub tools: `gh` runs the GitHub CLI; `comment` and
     `updateComment` post and edit agent-marked comments; `reviewComments`
     reads a pull request's review threads; `mount` attaches another
-    repository's checkout to your workspace, read-only; `pushBranch` pushes
+    repository's checkout to your workspace; `pushBranch` pushes
     to a fork; `checkout` switches this conversation to another repository.
 
-    Work on the primary product in a writable workspace, not a `mount` —
+    Work on the primary product in its own checkout, not a `mount` —
     this includes reviewing PRs and addressing review feedback, even when
     the task starts as investigation. If the current workspace already
     holds the target repository and branch, use it. Otherwise, a fresh
@@ -1255,20 +1253,19 @@ type Contributor {
     resolve against the configured remote (else the checkout's origin);
     pass `--repo owner/name` for another repository.
 
-    To explore a more distant dependency without working on it, `mount` it:
+    To explore a more distant dependency, `mount` it:
     mount(repo: "dagger/dagger") attaches its checkout under mnt/dagger,
-    and your regular read, grep and find work on it like on any other
-    files, offsets and limits included. Pass `ref` to pin a branch, tag or
-    commit. Never read files through `gh api .../contents/...` or blobs:
-    they come back base64-encoded, and the tool refuses them. A mount is
-    read-only and stays out of status, diff and commits, so exploring is
-    side-effect-free; `unmount` when done. Do not mount the primary product
-    just because the task begins with reading: use a writable checkout,
-    directly or in a worker, so review can lead to fixes.
+    and your regular file tools work on it like on any other directory.
+    Pass `ref` to pin a branch, tag or commit. Never read files through
+    `gh api .../contents/...` or blobs: they come back base64-encoded, and
+    the tool refuses them. A mount stays out of status, diff and commits;
+    `unmount` when done. Do not mount the primary product just because the
+    task begins with reading: use its own checkout, directly or in a
+    worker, so changes can be committed and pushed.
 
     To file an issue or open a pull request, write the body with your
-    editor to a scratch file (e.g. tmp/body.md; the workspace is mounted,
-    read-only in effect, so gh can read it) and pass `--body-file`. A
+    editor to a scratch file (e.g. tmp/body.md; the workspace is mounted
+    so gh can read it) and pass `--body-file`. A
     contribution is the ordinary flow made of reviewable steps: edit,
     review with the git tools, `commit`, `push` to a feature branch, then
     `gh pr create --title "..." --body-file tmp/pr.md` with a body written
