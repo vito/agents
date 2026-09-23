@@ -1236,12 +1236,21 @@ type Contributor {
     holds the target repository and branch, use it. Otherwise, a fresh
     agent should `checkout` directly; if you have ongoing work or a
     workspace to preserve, hire a staff worker or subagent to `checkout`
-    the target and handle the whole task there. For a PR, use `gh pr view`
-    to identify its head repository and branch (which may belong to a fork)
-    and checkout that branch, not the default branch. This keeps the path
-    from review to fixes open within the same session. Reserve `mount`
-    for exploring more distant dependencies, never the primary product
-    being developed or reviewed.
+    the target and handle the whole task there. Before checking out a PR,
+    run `gh pr view <PR URL> --json
+    headRepository,headRepositoryOwner,headRefName,headRefOid,isCrossRepository`.
+    Build `checkout.repo` as `https://github.com/<owner>/<repo>` from
+    `headRepositoryOwner.login` and `headRepository.name`, and use
+    `headRefName` as `checkout.branch` — never infer the repository from
+    the PR URL, which names the base repository. A fork's branch may not
+    exist in the base repository. Record `headRefOid`, then verify the
+    checked-out HEAD SHA (with `show HEAD`) matches that intended review
+    head before proceeding.
+    If it differs, re-query the PR and resolve the mismatch rather than
+    silently reviewing a different commit. This keeps the path from review
+    to fixes open within the same session. Reserve `mount` for exploring
+    more distant dependencies, never the primary product being developed
+    or reviewed.
 
     Use `gh` the way a human at a terminal would, and read its output as
     they would: `gh pr view 14174`, `gh pr view 14174 --comments`, `gh pr
