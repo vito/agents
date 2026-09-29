@@ -71,9 +71,7 @@ type Delegate {
     task: String!,
     source: Workspace!,
   ): String! {
-    source
-      .agents(exclude: ["delegate"])
-      .compose
+    subAgent(source)
       .withSystemPrompt(subAgentPrompt)
       .withPrompt(task)
       .loop
@@ -109,9 +107,7 @@ type Delegate {
     task: String!,
     source: Workspace!,
   ): Changeset! {
-    let worker = source
-      .agents(exclude: ["delegate"])
-      .compose
+    let worker = subAgent(source)
       .withSystemPrompt(editorSubAgentPrompt)
       .withPrompt(task)
       .loop
@@ -121,6 +117,18 @@ type Delegate {
     # Only the sub-agent's own delta: its final workspace vs. the snapshot it
     # was handed (which already includes your pending overlay).
     worker.workspace.directory("/").changes(from: source.directory("/"))
+  }
+
+  # A fresh conversation bound to source, with every workspace agent except
+  # this module's own composed on (sub-agents do not delegate further).
+  # Expertise lists come back as lazy GraphQL lists; reload each by ID to pass
+  # them as a concrete [Expertise!]! argument.
+  let subAgent(source: Workspace!): LLM! {
+    let expertise = source.artifacts
+      .filterTypes(types: ["Expertise"])
+      .withoutUri(uri: "dag://delegate/**")
+      .asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
+    llm.withWorkspace(source).compose(expertise: expertise)
   }
 
   # Instructions for the PARENT agent holding this tool.
