@@ -816,22 +816,31 @@ type Contributor {
     # composes is assumed to provide the same tools — only the target's OWN
     # agents are layered on. (Colliding tool names among what remains get
     # namespaced by the engine, never silently shadowed.)
-    let known = source.agents.list.{{name}}.map { a =>
-      a.name.split(":", 2).takeFirst.join("")
-    }.uniq
+    let known = source.artifacts
+      .filterTypes(types: ["Expertise"])
+      .items.{{moduleName}}.map { a => a.moduleName }.uniq
     # Reading the target's agents runs the target repo's module code, which
     # can fail for reasons that shouldn't strand the checkout (a broken
     # config, settings that need a host client): fall back to the plain
     # switch.
-    let group = target.agents(exclude: known)
-    let extras = group.list.{{name}}.map { a => a.name } rescue {
+    let selection = target.artifacts.filterTypes(types: ["Expertise"])
+    known.each { name =>
+      selection = selection.withoutUri(uri: "dag://" + name + "/**")
+    }
+    # Expertise lists come back as lazy GraphQL lists; reload each by ID to
+    # pass them as a concrete [Expertise!]! argument.
+    let selected = selection.asExpertise.{{ id }} rescue {
+      e: Error => return unlayered(switched, where, plainError(e.message))
+    }
+    let expertise = selected.map { node(id: _.id).{{ ... on Expertise! }} }
+    let extras = expertise.{{name}}.map { a => a.name } rescue {
       e: Error => return unlayered(switched, where, plainError(e.message))
     }
     if (extras.isEmpty) {
       print(`Checked out ${where}. Your tools now operate on this checkout; ` + "it contributes no additional agents.")
       return switched
     }
-    let layered = group.compose(base: switched)
+    let layered = switched.compose(expertise: expertise)
     # compose is lazy: force the composition HERE, so a failing target module
     # lands in this rescue instead of poisoning the continuation.
     layered.model rescue {
