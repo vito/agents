@@ -19,6 +19,12 @@ type AgentsDev {
     null
   }
 
+  """Check rebase replays only the commits after `from`, and rejects a `from` off the branch."""
+  committerRebaseFrom: Void @check {
+    print(checkCommitterRebaseFrom)
+    null
+  }
+
   """Check glob filtering and commits on a private frozen workspace."""
   committerFiltering(source: Workspace!): Void @check {
     print(checkCommitterFiltering(source))

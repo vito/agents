@@ -169,6 +169,41 @@ let runCommitterRebaseReplay(service: Service!): String! {
   "Rebase replay checks passed."
 }
 
+let checkCommitterRebaseFrom: String! {
+  let service = committerRebaseService
+  let result = runCommitterRebaseFrom(service) rescue { e: Error => {
+    service.stop(kill: true)
+    raise e.message
+  }}
+  service.stop(kill: true)
+  result
+}
+
+let runCommitterRebaseFrom(service: Service!): String! {
+  let url = service.endpoint(scheme: "git") + "/repo"
+  let fixture = committerRebaseFixture.directory("/repo").asGit
+  let origin = fixture.branch("feature").asWorkspace
+  let upstream = fixture.branch("main")
+  # `from: "clean"` treats the clean commit as a stale parent: only the
+  # commits after it replay, so the first one is the colliding commit.
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: "clean").sync
+  let landed = stopped.workspace
+  assert { landed.git.head.commitSHA == upstream.commitSHA }
+  assert { !landed.directory("/").entries.contains("ours.txt") }
+  assert { !landed.directory("/").entries.contains("later.txt") }
+  let merged = landed.file("shared.txt").contents
+  assert { merged.contains("<<<<<<<") and merged.contains(">>>>>>>") }
+  assert { merged.contains("upstream\n") and merged.contains("ours\n") }
+  assert { landed.git.uncommitted.diffStats.{{path}}.map { s => s.path } == ["shared.txt"] }
+
+  # A `from` off this branch must fail rather than replay from the fork point.
+  let offBranch = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: upstream.commitSHA).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { offBranch.contains("is not an ancestor of HEAD") }
+  let typo = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: "no-such-ref").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { typo.contains("cannot resolve from") }
+  "Rebase from checks passed."
+}
+
 let checkCommitterMessages(source: Workspace!): String! {
   let fixture = source.git.head.asWorkspace.withNewFile("message-check-" + Random.string, "fixture\n")
   let valid = "committer: enforce commit style\n\nKeep history readable."
