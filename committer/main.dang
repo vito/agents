@@ -35,13 +35,22 @@
 #     records it and carries on. The in-progress state rides on the module
 #     object, like `reset`'s saved workspaces, and reaches the next call
 #     through the returned LLM.
+#   * Refs by ADDRESS: `rebase(ref:)`, `cherryPick(from:)` and the `from:`
+#     of show/fileAt/restore take a GitRef, which the tool layer lifts from
+#     an address string — a git URL with a fragment, or a workspace artifact.
+#     Two collections make agent history addressable that way: staff's
+#     `members` (dag://staff/members/head?member=<name>) and this module's
+#     `saved` (dag://committer/saved/head?saved-workspace=<sha>), so commits
+#     that exist only in another agent's workspace, or that a reset orphaned,
+#     are reachable without pushing anything (vito/agents#21).
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, restore files, commit, reset, rebase, and push.
+history, restore files, commit, reset, cherry-pick, rebase, and push.
 """
 type Committer {
   # Keep the workspace being left so reset can restore pruned history too.
-  let saved: Map[Workspace!]! = [:]
+  # Exposed as the `saved` collection, keyed by the HEAD hash each was left at.
+  let savedWorkspaces: Map[Workspace!]! = [:]
 
   # An in-progress rebase, between a stop at a conflict and the continue,
   # skip, or abort that resumes it. `rebaseOrigin` is the frozen workspace
@@ -62,7 +71,7 @@ type Committer {
   let rebaseBranch: String! = ""
 
   let plumbing = [
-    "withSavedWorkspace", "withRebaseState", "withoutRebaseState"
+    "withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState"
   ]
 
   """
@@ -168,6 +177,14 @@ type Committer {
     Show the proposed changes without modifying the workspace.
     """
     preview: Boolean! = false,
+    """
+    Resolve `ref` in this git ref instead of the checkout: another agent's
+    commits (`dag://staff/members/head?member=<name>`), a workspace a reset
+    left behind (`dag://committer/saved/head?saved-workspace=<sha>`), or any
+    git ref address. With `ref` at its default, restores from that ref's own
+    commit.
+    """
+    from: GitRef = null,
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     if (paths.isEmpty or paths.any { p => p.trimSpace == "" }) {
       raise "restore: specify nonempty path patterns; use ** explicitly to restore everything"
@@ -176,8 +193,16 @@ type Committer {
       raise "restore: specify a source commit, or omit ref to use HEAD"
     }
     let before = source.snapshot
-    let sha = resolveSpec(before, ref, head(before).commitSHA)
-    let tree = repositoryHolding(before, sha).commit(id: sha).tree(discardGitDir: true)
+    let sha = if (from != null) {
+      resolveSpecIn(from, ref)
+    } else {
+      resolveSpec(before, ref, head(before).commitSHA)
+    }
+    let tree = if (from != null) {
+      from.asRepository.commit(id: sha).tree(discardGitDir: true)
+    } else {
+      repositoryHolding(before, sha).commit(id: sha).tree(discardGitDir: true)
+    }
     # Diff BOTH trees before filtering: filtering only the source tree misses
     # additions that need removal, and filtering only the workspace misses
     # deleted files that need restoration. withChanges applies exact contents,
@@ -320,13 +345,13 @@ type Committer {
     }
     let before = source.snapshot
     let previous = head(before).commitSHA
-    let matches = saved.keys.filter { sha =>
+    let matches = savedWorkspaces.keys.filter { sha =>
       want.split("").length >= 4 and sha.hasPrefix(want)
     }
     if (matches.length > 1) {
       raise `reset: ambiguous saved commit "${want}"; use a longer hash`
     }
-    let remembered = saved[matches.takeFirst.join("")]
+    let remembered = savedWorkspaces[matches.takeFirst.join("")]
     let target = if (remembered != null) {
       if (hard) {
         remembered.withReset(commit: remembered.git.head.commitSHA, hard: true)
@@ -349,7 +374,8 @@ type Committer {
       "Working tree preserved; review status / diff before committing again."
     }
     print(`Reset HEAD from ${previous} to ${sha}. ${note} `
-      + `To return to the workspace you left, reset to ${previous}.`)
+      + `To return to the workspace you left, reset to ${previous}; `
+      + `its commits stay reachable as dag://committer/saved/head?saved-workspace=${previous}.`)
     # A self-call gives the updated toolset an engine identity. Rebind both
     # it and the workspace through the continuation so the map persists.
     let tools = currentNode.{{... on Dagger.Committer!}}
@@ -357,23 +383,132 @@ type Committer {
     llm.withTools(tools, except: plumbing).withWorkspace(target)
   }
 
+  # ------------------------------------------------------------ cherry-pick
+  """
+  Cherry-pick commits from another git ref onto HEAD, keeping their
+  authorship, message and date.
+
+  `from` is any git ref by address: another agent's commits
+  (`dag://staff/members/head?member=<name>`), a workspace a reset left
+  behind (`dag://committer/saved/head?saved-workspace=<sha>`), or a git URL
+  with a fragment. Without `commits`, every commit on it that HEAD lacks is
+  taken, oldest first; fast-forwarding when possible, so hashes may change.
+
+  Applies ONLY what applies cleanly: commits already in HEAD, and commits
+  whose content is already present, are skipped, and a commit that conflicts
+  is reported rather than forced. Your pending edits survive, but a commit
+  touching a path you have edited is a conflict: commit or revert those
+  edits and try again. For a content conflict, `rebase(ref:)` onto the ref
+  instead — it lands each conflict in the tree with markers — or recreate
+  the change by hand from `show(commit:, from:)`.
+  """
+  cherryPick(
+    source: Workspace!,
+    """
+    The ref to take commits from, by address.
+    """
+    from: GitRef!,
+    """
+    Commits to pick, as full or short hashes reachable from `from`. They are
+    always applied in history order. Empty takes everything HEAD lacks.
+    """
+    commits: [String!]! = [],
+  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): the ref may point at a live agent's history, and a
+    # later identical call must plan against HEAD as it is then.
+    let theirs = from.asWorkspace
+    let picks = source.compareCommitsFrom(source: theirs, commits: commits, maxCommits: replayBound).{{
+      commit.{{sha, message}},
+      status,
+      reason,
+      conflictPaths
+    }} rescue {
+      e: Error => raise `cherryPick: planning against the ref failed: ${plainError(e.message)}`
+    }
+    if (picks.isEmpty) {
+      print("Nothing to cherry-pick: HEAD already has every commit on the ref.")
+      return source
+    }
+    let pickable = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
+    let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
+    let skipped = picks.length - pickable.length - conflicting.length
+    let conflictBlock = if (conflicting.isEmpty) {
+      ""
+    } else {
+      "\n\n" + `CONFLICT — ${toString(conflicting.length)} commit(s) NOT picked:` + "\n"
+        + conflicting.map { p =>
+          `  ${short(p.commit.sha)} ${subject(p.commit.message)}` + "\n"
+            + (if (p.conflictPaths.isEmpty) { "    " } else { `    ${p.conflictPaths.join(", ")}: ` })
+            + pickConflict(p.reason)
+        }.join("\n")
+    }
+    let skippedNote = if (skipped == 0) {
+      ""
+    } else {
+      "\n" + `(${toString(skipped)} already present, skipped)`
+    }
+    if (pickable.isEmpty) {
+      print("Nothing new to cherry-pick." + skippedNote + conflictBlock)
+      return source
+    }
+    let picked = source.withCommitsFrom(source: theirs, commits: pickable.map { p => p.commit.sha }, maxCommits: replayBound)
+    # Force the apply here, with the commits involved in hand, rather than
+    # later when the engine rebinds the workspace.
+    let newHead = head(picked).commitSHA rescue {
+      e: Error => raise `cherryPick: applying ${toString(pickable.length)} commit(s) failed: ${plainError(e.message)}`
+    }
+    print(`Cherry-picked ${toString(pickable.length)} commit(s); HEAD is now ${short(newHead)}:` + "\n"
+      + pickable.map { p => `  ${short(p.commit.sha)} ${subject(p.commit.message)}` }.join("\n")
+      + skippedNote + conflictBlock)
+    picked
+  }
+
   """
   Save a workspace for reset recovery. Internal bookkeeping, not an agent tool.
   """
   withSavedWorkspace(workspace: Workspace!): Committer! {
-    self.saved = saved.with(workspace.git.head.commitSHA, workspace)
+    self.savedWorkspaces = savedWorkspaces.with(workspace.git.head.commitSHA, workspace)
     self
+  }
+
+  """
+  The workspace `reset` saved under this HEAD hash. Collection plumbing:
+  Saved.get reaches the map through it, since `savedWorkspaces` is private.
+  """
+  savedWorkspace(sha: String!): Workspace! {
+    let remembered = savedWorkspaces[sha]
+    if (remembered == null) {
+      raise `no workspace was saved at ${sha}; saved hashes: ${savedWorkspaces.keys.join(", ")}`
+    }
+    remembered
+  }
+
+  """
+  The workspaces `reset` left behind, as a collection keyed by the HEAD hash
+  each was at when it was saved.
+
+  A reset orphans the commits it moved away from; each saved workspace keeps
+  them reachable. `dag://committer/saved/head?saved-workspace=<sha>` is a
+  saved workspace's HEAD as a GitRef: pass it to `show(from:)`,
+  `fileAt(from:)`, `restore(from:)` or `cherryPick(from:)` to read or reapply
+  those commits without resetting back.
+  """
+  saved: Saved! {
+    Saved(currentNode.{{... on Dagger.Committer!}}, savedWorkspaces.keys)
   }
 
   # ---------------------------------------------------------------- rebase
   """
-  Rebase this branch's commits onto the current tip of a remote branch,
-  stopping at each conflict for you to resolve.
+  Rebase this branch's commits onto another ref, stopping at each conflict
+  for you to resolve.
 
-  Fetches `onto` from the checkout's remote, rewinds to where this branch
-  forked from it, fast-forwards to the fetched tip, and replays your commits
-  on top — oldest first, authors and dates intact, merge commits left out,
-  commits already upstream dropped.
+  The target is either `onto`, a branch fetched from the checkout's remote,
+  or `ref`, any git ref by address — a git URL with a fragment, or a
+  workspace artifact such as another agent's commits
+  (`dag://staff/members/head?member=chief`). The rebase rewinds to where this
+  branch forked from the target, fast-forwards to its tip, and replays your
+  commits on top — oldest first, authors and dates intact, merge commits
+  left out, commits already on the target dropped.
 
   Pass `from` to replay only the commits after it — `git rebase --onto
   <onto> <from>` — when this branch was stacked on another branch that has
@@ -399,9 +534,9 @@ type Committer {
     source: Workspace!,
     """
     What to rebase onto, as it is now on the remote: a branch name such as
-    "main", a tag, or a commit sha.
+    "main", a tag, or a commit sha. Leave empty when passing `ref`.
     """
-    onto: String!,
+    onto: String! = "",
     """
     Git URL of the repository to fetch `onto` from. Empty uses the checkout's
     origin remote; name the upstream here to rebase a fork's branch onto it.
@@ -415,6 +550,12 @@ type Committer {
     replays everything since the fork point from `onto`.
     """
     from: String! = "",
+    """
+    The ref to rebase onto, instead of a remote branch: another agent's
+    commits as `dag://staff/members/head?member=<name>`, or any git ref
+    address such as "https://github.com/org/repo#main".
+    """
+    ref: GitRef = null,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): fetches a live remote tip and rewrites the workspace; a
     # later identical call must do both again.
@@ -422,8 +563,11 @@ type Committer {
       raise `rebase: a rebase is already in progress, stopped at ${short(rebaseStopped)}; ` + "finish it with rebaseContinue, or rebaseAbort to return to where you started"
     }
     let branch = onto.trimSpace
-    if (branch == "") {
-      raise "rebase: name the branch to rebase onto, e.g. onto: \"main\""
+    if (branch == "" and ref == null) {
+      raise "rebase: name the branch to rebase onto, e.g. onto: \"main\", or pass ref: with a git ref address"
+    }
+    if (branch != "" and ref != null) {
+      raise "rebase: pass either onto (a branch on the remote) or ref (a git ref address), not both"
     }
     if (!source.git.uncommitted.isEmpty) {
       raise "rebase: the working tree has pending changes; commit them first (status shows them)"
@@ -438,11 +582,21 @@ type Committer {
       e: Error => raise "rebase: " + noHistory(e.message)
     }
 
-    let url = remoteUrl(origin, repo)
-    let upstream = git(url).ref(name: branch)
-    let ontoSha = upstream.commitSHA rescue {
-      e: Error => raise `rebase: cannot fetch ${branch} from ${url}: ${plainError(e.message)}`
+    # The target: a ref given by address, or a branch fetched from the remote.
+    # Either way the rest of the rebase sees one GitRef and one label for it.
+    let upstream = if (ref != null) {
+      ref
+    } else {
+      git(remoteUrl(origin, repo)).ref(name: branch)
     }
+    let ontoSha = upstream.commitSHA rescue {
+      e: Error => if (ref != null) {
+        raise `rebase: cannot read the ref to rebase onto: ${plainError(e.message)}`
+      } else {
+        raise `rebase: cannot fetch ${branch} from ${remoteUrl(origin, repo)}: ${plainError(e.message)}`
+      }
+    }
+    let label = if (branch != "") { branch } else { refLabel(upstream, ontoSha) }
     # `from` narrows the replay to the commits after it, the way `git rebase
     # --onto <onto> <from>` does. It must be on this branch: anything else
     # would replay commits from the fork point instead, silently.
@@ -462,14 +616,14 @@ type Committer {
       }
       fromRef
     }
-    let replayLabel = if (since == "") { branch } else { since }
-    let newBase = rebasedBase(origin, upstream, branch)
+    let replayLabel = if (since == "") { label } else { since }
+    let newBase = rebasedBase(origin, upstream, label)
     # Our side of the fork, linearized the way `git rebase` does: merge
     # commits are not replayed, only the commits they brought in that
     # upstream does not already have. Asking the engine for "all new
     # commits" instead would select the merges too, and refuse them.
     let ours = head(origin).log(limit: replayBound, base: replayBase).{{sha, message, parentShas}} rescue {
-      e: Error => raise replayError(`listing this branch's commits since ${replayLabel}`, branch, e.message)
+      e: Error => raise replayError(`listing this branch's commits since ${replayLabel}`, label, e.message)
     }
     let linear = ours.filter { c => c.parentShas.length <= 1 }.map { c => c.sha }
     let merges = ours.filter { c => c.parentShas.length > 1 }
@@ -478,7 +632,7 @@ type Committer {
     } else {
       `Left out ${toString(merges.length)} merge commit(s), whose merged-in commits are replayed individually: ` + merges.map { c => `${short(c.sha)} ${subject(c.message)}` }.join(", ") + "."
     }
-    advance(llm, origin, newBase, linear, branch, ontoSha, oldHead, branchName, note)
+    advance(llm, origin, newBase, linear, label, ontoSha, oldHead, branchName, note)
   }
 
   """
@@ -837,15 +991,35 @@ type Committer {
     change really is; scope with `paths` instead of raising this too far.
     """
     maxLines: Int! = 400,
+    """
+    Resolve `commit` and `against` in this git ref instead of the checkout:
+    another agent's commits (`dag://staff/members/head?member=<name>`), a
+    workspace a reset left behind
+    (`dag://committer/saved/head?saved-workspace=<sha>`), or any git ref
+    address. With `commit` at its default, shows that ref's own commit.
+    """
+    from: GitRef = null,
   ): String! {
     # The first read of the workspace's git state: a checkout with no readable
     # history gives out here, with a plain answer instead of an engine error.
-    let headSha = head(source).commitSHA rescue {
-      e: Error => return noHistory(e.message)
+    let headSha = if (from != null) {
+      from.commitSHA
+    } else {
+      head(source).commitSHA rescue {
+        e: Error => return noHistory(e.message)
+      }
     }
-    let want = resolveSpec(source, commit, headSha)
+    let want = if (from != null) {
+      resolveSpecIn(from, commit)
+    } else {
+      resolveSpec(source, commit, headSha)
+    }
 
-    let repo = repositoryHolding(source, want)
+    let repo = if (from != null) {
+      from.asRepository
+    } else {
+      repositoryHolding(source, want)
+    }
     let target = repo.commit(id: want).{{
       sha,
       shortSha,
@@ -857,6 +1031,8 @@ type Committer {
     }}
     let baseSpec = if (against == null) {
       target.parentShas.takeFirst.join("")
+    } else if (from != null) {
+      resolveSpecIn(from, against ?? "")
     } else {
       resolveSpec(source, against ?? "", headSha)
     }
@@ -911,14 +1087,34 @@ type Committer {
     Maximum number of lines to print.
     """
     limit: Int! = 400,
+    """
+    Resolve `commit` in this git ref instead of the checkout: another agent's
+    commits (`dag://staff/members/head?member=<name>`), a workspace a reset
+    left behind (`dag://committer/saved/head?saved-workspace=<sha>`), or any
+    git ref address. With `commit` at its default, reads at that ref's own
+    commit.
+    """
+    from: GitRef = null,
   ): String! {
     # The first read of the workspace's git state: a checkout with no readable
     # history gives out here, with a plain answer instead of an engine error.
-    let headSha = head(source).commitSHA rescue {
-      e: Error => return noHistory(e.message)
+    let headSha = if (from != null) {
+      from.commitSHA
+    } else {
+      head(source).commitSHA rescue {
+        e: Error => return noHistory(e.message)
+      }
     }
-    let want = resolveSpec(source, commit, headSha)
-    let repo = repositoryHolding(source, want)
+    let want = if (from != null) {
+      resolveSpecIn(from, commit)
+    } else {
+      resolveSpec(source, commit, headSha)
+    }
+    let repo = if (from != null) {
+      from.asRepository
+    } else {
+      repositoryHolding(source, want)
+    }
     let target = repo.commit(id: want).{{shortSha, message, authoredDate}}
     let contents = repo.commit(id: want).tree(discardGitDir: true).file(path).contents rescue {
       e: Error => raise `${path} does not exist at ${target.shortSha}: ${plainError(e.message)}` + ` — it may have been added later, deleted, or renamed; log(paths: ["${path}"]) shows the commits that touched it`
@@ -1179,6 +1375,18 @@ type Committer {
     llm.withTools(tools, except: plumbing).withWorkspace(result)
   }
 
+  # How a ref given by address is named in rebase output: its ref name when
+  # it has a meaningful one, else its short commit hash.
+  let refLabel(ref: GitRef!, sha: String!): String! {
+    let name = ref.name rescue {
+      e: Error => ""
+    }
+    if (name == "" or name == "HEAD" or name.containsMatch(`^[0-9a-f]{40}$`)) {
+      return `ref ${short(sha)}`
+    }
+    name.trimPrefix("refs/heads/").trimPrefix("refs/tags/")
+  }
+
   # The branch a workspace's HEAD is on, or "" when detached (the ref name
   # is then the commit itself).
   let branchOf(source: Workspace!): String! {
@@ -1264,6 +1472,27 @@ type Committer {
           raise `cannot resolve commit "${spec}": ${plainError(e.message)}`
         }
       }
+    }
+  }
+
+  # Why a planned cherry-pick would not apply, in the tool's own words.
+  let pickConflict(reason: WorkspaceCommitPickReason): String! {
+    case (reason) {
+      WorkspaceCommitPickReason.DIRTY => "you have uncommitted edits on paths it touches; commit or revert them and pick again"
+      WorkspaceCommitPickReason.CONTENT => "its patch no longer applies to HEAD; rebase(ref:) onto the ref lands it with conflict markers"
+      else => "unknown reason"
+    }
+  }
+
+  # Resolve a spec inside a ref given by address: HEAD (or empty) is the ref's
+  # own commit; anything else is looked up in the ref's repository.
+  let resolveSpecIn(from: GitRef!, spec: String!): String! {
+    let want = spec.trimSpace
+    if (want == "" or want == "HEAD") {
+      return from.commitSHA
+    }
+    from.asRepository.ref(name: want).commitSHA rescue {
+      e: Error => raise `cannot resolve commit "${spec}" in the given ref: ${plainError(e.message)}`
     }
   }
 
@@ -1492,8 +1721,9 @@ type Committer {
       being left is still saved for recovery.
       Rewriting published history needs explicit authorization, not an
       automatic force push after a rejection.
-    - `rebase` — replay this branch's commits onto the current tip of a
-      remote branch (`onto: "main"`), keeping authors and dates. It stops at
+    - `rebase` — replay this branch's commits onto another ref, keeping
+      authors and dates: `onto: "main"` for a branch fetched from the
+      remote, or `ref:` for any ref by address (see below). It stops at
       the first commit that conflicts: the earlier ones are already on the
       new base, and the conflicting one is merged three-way into your
       working tree with <<<<<<< markers. Resolve them with your edit tools —
@@ -1506,6 +1736,10 @@ type Committer {
       For a branch stacked on a parent that was rewritten and merged, pass
       `from:` the old parent head to replay only the commits after it
       (`git rebase --onto <onto> <from>`).
+    - `cherryPick` — take commits from another ref (`from:`, by address)
+      onto HEAD with their authorship intact; without `commits` it takes
+      every commit HEAD lacks. Conflicting commits are reported, not forced:
+      rebase onto the ref instead, or recreate the change from `show`.
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
@@ -1518,6 +1752,16 @@ type Committer {
       it into a comparison between two commits.
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
+
+    REFS BY ADDRESS: `rebase(ref:)`, `cherryPick(from:)`, and the `from:`
+    argument of `show`, `fileAt` and `restore` take a git ref as an address
+    string — another agent's commits (`dag://staff/members/head?member=<name>`
+    when you have a staff), a workspace a `reset` left behind
+    (`dag://committer/saved/head?saved-workspace=<sha>`; `reset` prints the
+    address, and `saved` lists them), or a git URL with a fragment such as
+    "https://github.com/org/repo#main". This is how to rebase onto or take
+    commits that exist only in another agent's workspace, or reach commits a
+    reset orphaned, without pushing anything.
 
     The A/M/D/R marks in `status` describe each path relative to the last
     commit, not `git status`'s index model — there is no staging area here,
@@ -1542,4 +1786,69 @@ type Committer {
     remote. The reading tools re-read the current state on every call, so
     re-run them after making edits.
   """
+}
+
+"""
+The workspaces `reset` left behind, as a collection keyed by the HEAD hash
+each was at when it was saved. Selected by address as
+`dag://committer/saved?saved-workspace=<sha>`.
+"""
+type Saved @collection {
+  # The tool object holding the saved workspaces; private so Committer itself
+  # stays out of the collection's schema.
+  let committer: Dagger.Committer!
+
+  """
+  Full HEAD hashes of the saved workspaces, sorted.
+  """
+  shas: [String!]! @keys
+
+  new(committer: Dagger.Committer!, shas: [String!]!) {
+    self.committer = committer
+    self.shas = shas
+    self
+  }
+
+  """
+  The workspace saved at this HEAD hash.
+  """
+  at(sha: String!): SavedWorkspace! @get {
+    SavedWorkspace(sha, committer.savedWorkspace(sha))
+  }
+}
+
+"""
+A workspace as `reset` left it: its HEAD, and the pending edits it had.
+"""
+type SavedWorkspace {
+  """
+  The full HEAD hash the workspace was saved under.
+  """
+  sha: String!
+
+  # Private: a Workspace cannot be stored as a public field on a module object.
+  let saved: Workspace!
+
+  new(sha: String!, saved: Workspace!) {
+    self.sha = sha
+    self.saved = saved
+    self
+  }
+
+  """
+  The saved workspace, pending edits included; what `reset` to its hash
+  restores.
+  """
+  workspace: Workspace! {
+    saved
+  }
+
+  """
+  The saved HEAD as a GitRef — the artifact at
+  `dag://committer/saved/head?saved-workspace=<sha>`. Its history stays
+  reachable here after the reset that orphaned it.
+  """
+  head: GitRef! {
+    saved.git.head
+  }
 }
