@@ -204,6 +204,53 @@ let runCommitterRebaseFrom(service: Service!): String! {
   "Rebase from checks passed."
 }
 
+let checkCommitterRefs: String! {
+  let fixture = committerRebaseFixture.directory("/repo").asGit
+  let upstream = fixture.branch("main")
+  let ontoSha = upstream.commitSHA
+
+  # A ref given directly replaces the fetched remote branch: a clean replay
+  # adopts its hash rather than copying it.
+  let clean = fixture.tag("clean").asWorkspace
+  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, ref: upstream).sync.workspace
+  assert { applied.git.head.targetCommit.parentShas == [ontoSha] }
+  assert { applied.git.uncommitted.isEmpty }
+  assert { applied.file("ours.txt").contents == "o\n" }
+  let both = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", ref: upstream).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { both.contains("not both") }
+  let neither = committer.rebase(llm: llm.withWorkspace(clean), source: clean).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { neither.contains("pass ref:") }
+
+  # cherryPick takes what applies and reports what conflicts, by address.
+  let fork = fixture.tag("fork").asWorkspace
+  let picked = committer.cherryPick(source: fork, from: upstream)
+  assert { picked.git.head.commitSHA == ontoSha }
+  let feature = fixture.branch("feature").asWorkspace
+  let conflicted = committer.cherryPick(source: feature, from: upstream)
+  assert { conflicted.git.head.commitSHA == feature.git.head.commitSHA }
+  let again = committer.cherryPick(source: picked, from: upstream)
+  assert { again.git.head.commitSHA == ontoSha }
+
+  # show / fileAt / restore read another ref's history without fetching.
+  assert { committer.show(source: fork, from: upstream).contains("fixture: upstream change") }
+  assert { committer.show(source: fork, commit: "fork", from: upstream).contains("fixture: fork point") }
+  assert { committer.fileAt(source: fork, path: "shared.txt", from: upstream).contains("upstream") }
+  let restored = committer.restore(source: fork, paths: ["shared.txt"], from: upstream)
+  assert { restored.file("shared.txt").contents == "upstream\n" }
+  assert { restored.git.head.commitSHA == fork.git.head.commitSHA }
+
+  # Workspaces a reset leaves behind are a collection keyed by their HEAD.
+  let sha = feature.git.head.commitSHA
+  let remembering = committer.withSavedWorkspace(workspace: feature)
+  assert { committer.saved.keys == [] }
+  assert { remembering.saved.keys == [sha] }
+  let saved = remembering.saved.get(key: sha)
+  assert { saved.sha == sha and saved.head.commitSHA == sha }
+  assert { saved.workspace.file("later.txt").contents == "later\n" }
+  assert { committer.fileAt(source: fork, path: "later.txt", from: saved.head).contains("later") }
+  "Committer ref address checks passed."
+}
+
 let checkCommitterMessages(source: Workspace!): String! {
   let fixture = source.git.head.asWorkspace.withNewFile("message-check-" + Random.string, "fixture\n")
   let valid = "committer: enforce commit style\n\nKeep history readable."

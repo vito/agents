@@ -25,6 +25,12 @@ type AgentsDev {
     null
   }
 
+  """Check rebase, cherryPick, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
+  committerRefs: Void @check {
+    print(checkCommitterRefs)
+    null
+  }
+
   """Check glob filtering and commits on a private frozen workspace."""
   committerFiltering(source: Workspace!): Void @check {
     print(checkCommitterFiltering(source))
