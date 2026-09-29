@@ -375,6 +375,11 @@ type Committer {
   on top — oldest first, authors and dates intact, merge commits left out,
   commits already upstream dropped.
 
+  Pass `from` to replay only the commits after it — `git rebase --onto
+  <onto> <from>` — when this branch was stacked on another branch that has
+  since been rewritten and merged: the old parent head leaves the parent's
+  stale commits out of the replay.
+
   When a commit no longer applies cleanly the rebase STOPS: the commits
   before it are on the new base, and its changes are merged into your
   working tree three-way, with git-style conflict markers (<<<<<<<) where
@@ -402,6 +407,14 @@ type Committer {
     origin remote; name the upstream here to rebase a fork's branch onto it.
     """
     repo: String! = "",
+    """
+    Replay only the commits after this one (a sha or ref in this checkout's
+    history), like `git rebase --onto <onto> <from>`. Use it when the branch
+    was stacked on another branch that has since been rewritten and merged:
+    pass the old parent head so its stale commits are not replayed. Empty
+    replays everything since the fork point from `onto`.
+    """
+    from: String! = "",
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): fetches a live remote tip and rewrites the workspace; a
     # later identical call must do both again.
@@ -430,13 +443,33 @@ type Committer {
     let ontoSha = upstream.commitSHA rescue {
       e: Error => raise `rebase: cannot fetch ${branch} from ${url}: ${plainError(e.message)}`
     }
+    # `from` narrows the replay to the commits after it, the way `git rebase
+    # --onto <onto> <from>` does. It must be on this branch: anything else
+    # would replay commits from the fork point instead, silently.
+    let since = from.trimSpace
+    let replayBase = if (since == "") {
+      upstream
+    } else {
+      let fromRef = repository(origin).ref(name: since)
+      let fromSha = fromRef.commitSHA rescue {
+        e: Error => raise `rebase: cannot resolve from: "${since}" in this checkout: ${plainError(e.message)}`
+      }
+      let shared = head(origin).commonAncestor(other: fromRef).commitSHA rescue {
+        e: Error => raise `rebase: from: "${since}" shares no history with HEAD: ${plainError(e.message)}`
+      }
+      if (shared != fromSha) {
+        raise `rebase: from: "${since}" (${short(fromSha)}) is not an ancestor of HEAD (${short(oldHead)}); ` + "pass a commit on this branch, e.g. the old head of the branch it was stacked on"
+      }
+      fromRef
+    }
+    let replayLabel = if (since == "") { branch } else { since }
     let newBase = rebasedBase(origin, upstream, branch)
     # Our side of the fork, linearized the way `git rebase` does: merge
     # commits are not replayed, only the commits they brought in that
     # upstream does not already have. Asking the engine for "all new
     # commits" instead would select the merges too, and refuse them.
-    let ours = head(origin).log(limit: replayBound, base: upstream).{{sha, message, parentShas}} rescue {
-      e: Error => raise replayError(`listing this branch's commits since ${branch}`, branch, e.message)
+    let ours = head(origin).log(limit: replayBound, base: replayBase).{{sha, message, parentShas}} rescue {
+      e: Error => raise replayError(`listing this branch's commits since ${replayLabel}`, branch, e.message)
     }
     let linear = ours.filter { c => c.parentShas.length <= 1 }.map { c => c.sha }
     let merges = ours.filter { c => c.parentShas.length > 1 }
@@ -1470,6 +1503,9 @@ type Committer {
       stopped commit, `rebaseAbort` restores the pre-rebase workspace. Needs
       a clean tree; it does not push, and leaves HEAD detached — the finished
       rebase prints the `push(branch:, expectedRemoteSHA:)` call to publish.
+      For a branch stacked on a parent that was rewritten and merged, pass
+      `from:` the old parent head to replay only the commits after it
+      (`git rebase --onto <onto> <from>`).
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
