@@ -73,8 +73,14 @@ type Staff {
     let origin = compositionSource ?? source
     # Workers work; they don't orchestrate. Do not discover or run agent code
     # from a checkout merely because the chief now operates on that worktree.
-    let base = origin.agents(exclude: ["staff"])
-      .compose(base: llm.withWorkspace(source))
+    # Expertise lists come back as lazy GraphQL lists; reload each by ID to
+    # pass them as a concrete [Expertise!]! argument.
+    let expertise = origin.artifacts
+      .filterTypes(types: ["Expertise"])
+      .withoutUri(uri: "dag://staff/**")
+      .asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
+    let base = llm.withWorkspace(source)
+      .compose(expertise: expertise)
       .withWorkspace(source)
     if (model == null) {
       base
