@@ -73,6 +73,12 @@ type AgentsDev {
     null
   }
 
+  """Check the roster collection: keys, items, subsets, and its dimension in the workspace schema."""
+  staffMembers(source: Workspace!): Void @check {
+    print(testStaffMembers(source: source))
+    null
+  }
+
   """Check internal bookkeeping remains absent from the chief's tools."""
   staffTools(source: Workspace!): Void @check {
     print(testStaffTools(source: source))

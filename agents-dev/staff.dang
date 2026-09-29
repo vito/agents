@@ -85,6 +85,53 @@ let testStaffFiltering(source: Workspace!): String! {
   "Staff filtering checks passed."
 }
 
+let testStaffMembers(source: Workspace!): String! {
+  let base = source.git.head.asWorkspace
+  let root = "staff-members-check-" + Random.string
+  let edited = base.withNewFile(root + "/note.txt", "member\n")
+  let committed = edited.withCommit(
+    changes: edited.git.uncommitted,
+    message: "fixture: member commit",
+    date: "2026-09-15T12:00:00Z",
+  )
+  let idle = llm.withWorkspace(base).spawn(name: "members-idle")
+  let ahead = llm.withWorkspace(committed).spawn(name: "members-ahead")
+  let roster = staff.withWorker("idle", idle).withWorker("ahead", ahead);
+  {
+    # The engine projects a @collection to keys/list/get/subset.
+    let members = roster.members
+    assert { members.keys == ["ahead", "idle"] }
+    assert { members.list.{{name}}.map { m => m.name } == ["ahead", "idle"] }
+    let picked = members.get(key: "ahead")
+    assert { picked.name == "ahead" }
+    assert { picked.head.commitSHA == committed.git.head.commitSHA }
+    assert { picked.workspace.file(root + "/note.txt").contents == "member\n" }
+    assert { members.get(key: "idle").head.commitSHA == base.git.head.commitSHA }
+    assert { members.subset(keys: ["ahead"]).keys == ["ahead"] }
+    let missing = members.get(key: "nobody").name rescue { e: Error => e.message }
+    assert { missing.contains("nobody") }
+    # An empty roster is an empty collection, not an error.
+    assert { staff.members.keys == [] }
+
+    # A member's head is an artifact: the collection field on the module's
+    # main object contributes a `member` dimension to the workspace schema,
+    # and `head` is a GitRef path under it.
+    let selected = source.artifacts.filterPathPattern(pattern: "staff/members/**")
+    let dimensions = selected.dimensionDefinitions.{{identifier, name, itemType}}
+    assert { dimensions.any { d => d.identifier == "/staff/members" and d.name == "member" and d.itemType == "Member" } }
+    let paths = selected.pathDefinitions.{{uri, dimensions}}
+    assert { paths.any { p => p.uri == "dag://staff/members/head" and p.dimensions.contains("/staff/members") and p.dimensions.contains("type:GitRef") } }
+    null
+  } rescue { e: Error => {
+    idle.stop
+    ahead.stop
+    raise e.message
+  }}
+  idle.stop
+  ahead.stop
+  "Staff members collection checks passed."
+}
+
 let testStaffTools(source: Workspace!): String! {
   let tools = staff.agent(llm.withWorkspace(source)).tools
   assert { tools.contains("spawn") }

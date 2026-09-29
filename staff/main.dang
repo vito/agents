@@ -9,13 +9,17 @@
 # failures arrive as attributed messages instead of being polled or awaited;
 # the chief steers by name — sendTo/status/read/interruptWorker —
 # and harvests work — logOf/diffOf/pull/pullConflicted/pullPending,
-# reaching each agent's own Workspace through its live snapshot. Spawned
+# reaching each agent's own Workspace through its live snapshot. The roster
+# is also a COLLECTION (`members`): each agent's committed history is an
+# artifact, `dag://staff/members/head?member=<name>`, so any tool taking a
+# GitRef (committer's rebase, cherryPick, show, restore ...) can target
+# another agent's commits by address instead of by staff-specific verb. Spawned
 # workers get a frozen, pull-only roster view of the chief and peers already
 # present when they start, plus a private line home (askChief) that delivers
 # the question and returns immediately; the chief answers mid-turn with
 # sendTo(replyTo:), and the engine refuses any wait that would deadlock.
 #
-# State: `members` holds live Agent handles in module state, evolved by tools
+# State: `agents` holds live Agent handles in module state, evolved by tools
 # returning Staff! (the modules/editor pattern — engine-object handles in
 # Dang state serialize as IDs and just work). The worker's ask channel is
 # minted via a real self-call (Dagger.staff.chiefLine): the result of a
@@ -29,7 +33,7 @@ steer and observe them while they run, and collect their results.
 """
 type Staff {
   # Live worker handles; unique by name, by construction.
-  let members: Map[Agent!]! = [:]
+  let agents: Map[Agent!]! = [:]
 
   # Tool configuration belongs to the originating workspace, not necessarily
   # the worktree the chief now edits (checkout preserves tools across switches).
@@ -40,7 +44,7 @@ type Staff {
   # plumbing. Prompt constants are excluded too.
   # Workers bind only the dedicated PullTools object, never this full Staff.
   let plumbing = [
-    "withWorker", "chiefLine", "pullTools",
+    "withWorker", "chiefLine", "pullTools", "memberAgent",
     "withCompositionSource", "workerBase", "workerPrompt", "workerPromptFor"
   ]
 
@@ -138,7 +142,7 @@ type Staff {
     if (name == "chief") {
       raise `staff member name "chief" is reserved for the chief in worker pull rosters`
     }
-    if (members.has(name)) {
+    if (agents.has(name)) {
       raise `staff member "${name}" already exists — pick another name`
     }
     let base = workerBase(source, model)
@@ -173,7 +177,7 @@ type Staff {
   the ID.
   """
   withWorker(name: String!, worker: Agent!): Staff! {
-    self.members = self.members.with(name, worker)
+    self.agents = self.agents.with(name, worker)
     self
   }
 
@@ -219,10 +223,10 @@ type Staff {
   status: String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): projects live lifecycle state — and with no args, a
     # cached result would pin this to its first answer forever.
-    if (members.isEmpty) {
+    if (agents.isEmpty) {
       "(none)"
     } else {
-      members.map { name, agent => `${name}: ${toString(agent.state)}` }.values.join("\n")
+      agents.map { name, agent => `${name}: ${toString(agent.state)}` }.values.join("\n")
     }
   }
 
@@ -682,6 +686,29 @@ type Staff {
   }
 
   """
+  The roster as a collection, one member per staff name: the chief under
+  `chief` in a worker's view, workers under their staff names.
+
+  Each member's committed history is an artifact — `dag://staff/members/head?member=<name>`
+  is that agent's HEAD as a GitRef — so git tools that take a ref, such as
+  committer's `rebase(ref:)`, `cherryPick(from:)`, `show(from:)` or
+  `restore(from:)`, can target another agent's commits by address.
+  """
+  members: Members! {
+    # Map keys come back sorted, so the collection's key order is stable
+    # across roster mutations.
+    Members(currentNode.{{... on Dagger.Staff!}}, agents.keys)
+  }
+
+  """
+  The live Agent handle behind a staff name. Collection plumbing: Members.get
+  reaches the roster through it, since `agents` is private state.
+  """
+  memberAgent(name: String!): Agent! {
+    member(name)
+  }
+
+  """
   Mint a worker's line back to its chief. Used by spawn via a self-call (a
   module-call result has the engine identity withTools needs); not part of
   the chief's or the workers' toolset.
@@ -692,7 +719,7 @@ type Staff {
 
   # Address a member by name, with a helpful miss.
   let member(name: String!): Agent! {
-    let member = members[name]
+    let member = agents[name]
     if (member == null) {
       raise `no staff member named "${name}"; current members: ${memberNames}`
     }
@@ -700,10 +727,10 @@ type Staff {
   }
 
   let memberNames: String! {
-    if (members.isEmpty) {
+    if (agents.isEmpty) {
       "(none)"
     } else {
-      members.keys.join(", ")
+      agents.keys.join(", ")
     }
   }
 
@@ -893,6 +920,12 @@ type Staff {
       lands that commit as uncommitted edits with conflict markers, which
       you resolve and commit yourself.
 
+    Each member's committed history is also addressable as a git ref:
+    `dag://staff/members/head?member=<name>`. Pass that address to any tool
+    that takes a GitRef — e.g. committer's `rebase(ref:)` to rebase your own
+    commits onto a worker's, `cherryPick(from:)`, `show(from:)`, or
+    `restore(from:)` — instead of pushing branches around.
+
     SETTLE BEFORE THE FINAL HARVEST: these tools read the worker's last
     COMMITTED conversation step, so a mid-turn worker may hold work they
     cannot see yet. Wait for its idle event (or use `interruptWorker`)
@@ -935,7 +968,10 @@ type Staff {
     You also have pull-only access to work from agents that existed when you
     were spawned. Use `chief` for the chief and staff names for older workers.
     `logOf` and `diffOf` inspect their work; `pull`, `pullPending`, and
-    `pullConflicted` take it into your workspace. You cannot spawn, steer, or
+    `pullConflicted` take it into your workspace. Their committed history is
+    also addressable as a git ref, `dag://staff/members/head?member=<name>`,
+    for any tool taking a GitRef — `rebase(ref:)` puts your commits on top of
+    the chief's when it asks you to. You cannot spawn, steer, or
     interrupt agents. The roster is a frozen capability snapshot, so agents
     hired after you are not visible directly; the chief can relay their work
     when needed.
@@ -962,6 +998,84 @@ type Staff {
 }
 
 """
+The staff roster as a collection: staff names as keys, each agent's git
+history as the item. Selected by address as `dag://staff/members?member=<name>`.
+"""
+type Members @collection {
+  # The roster the keys were read from; private so Staff itself stays out of
+  # the collection's schema.
+  let staff: Dagger.Staff!
+
+  """
+  Staff names, sorted: `chief` for the chief in a worker's view, workers
+  under the names they were spawned with.
+  """
+  names: [String!]! @keys
+
+  new(staff: Dagger.Staff!, names: [String!]!) {
+    self.staff = staff
+    self.names = names
+    self
+  }
+
+  """
+  The member with this staff name.
+  """
+  member(name: String!): Member! @get {
+    Member(name, staff.memberAgent(name))
+  }
+}
+
+"""
+One staff member: an agent and the workspace it works in, reached through its
+last committed conversation step.
+"""
+type Member {
+  """
+  The staff name the chief and peers address this agent by.
+  """
+  name: String!
+
+  # The live handle; private so the Agent API stays off the artifact tree.
+  let agent: Agent!
+
+  new(name: String!, agent: Agent!) {
+    self.name = name
+    self.agent = agent
+    self
+  }
+
+  """
+  The agent's lifecycle state (IDLE, RUNNING, PAUSED, FAILED, STOPPED).
+  """
+  state: AgentState! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): projects live runtime state.
+    agent.state
+  }
+
+  """
+  The agent's workspace as of its last committed step: HEAD plus any
+  uncommitted edits.
+  """
+  workspace: Workspace! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): the snapshot advances as the agent runs. `sync` pins the
+    # read to one snapshot, as workerWorkspace does for the harvest tools.
+    agent.snapshot.sync.workspace
+  }
+
+  """
+  The agent's committed history: the HEAD of its workspace, as a GitRef. This
+  is the artifact at `dag://staff/members/head?member=<name>` — pass that
+  address to any tool taking a GitRef to rebase onto, cherry-pick from, or
+  inspect this agent's commits.
+  """
+  head: GitRef! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): the snapshot advances as the agent runs.
+    workspace.git.head
+  }
+}
+
+"""
 Pull-only access to another agent's workspace.
 
 Workers receive this narrow tool object instead of Staff itself, so they can
@@ -977,6 +1091,15 @@ type PullTools {
   new(staff: Dagger.Staff!) {
     self.staff = staff
     self
+  }
+
+  """
+  The roster as a collection: `chief` and the workers that existed when you
+  were spawned. `dag://staff/members/head?member=<name>` addresses a member's
+  committed history as a GitRef for tools that take one.
+  """
+  members: Dagger.StaffMembers! {
+    staff.members
   }
 
   """
