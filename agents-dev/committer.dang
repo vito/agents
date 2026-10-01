@@ -231,6 +231,41 @@ let checkCommitterRefs: String! {
   let again = committer.cherryPick(source: picked, from: upstream)
   assert { again.git.head.commitSHA == ontoSha }
 
+  # log(from:) is the plan: the ref's commits HEAD lacks, oldest first, each
+  # annotated with what cherryPick would do, and conflicts pointing at the
+  # markers route.
+  let plan = committer.log(source: fork, from: upstream)
+  assert { plan.contains("1 commit(s) on the ref that HEAD lacks") and plan.contains("1 new") }
+  assert { plan.contains("[new]") and plan.contains("fixture: upstream change") }
+  let stack = committer.log(source: fork, from: fixture.branch("feature"))
+  assert { stack.contains("3 new") }
+  let order = stack.split("\n").filter { l => l.contains("fixture:") }.map { l => l.trimSpace }
+  assert { order == ["fixture: ours, clean", "fixture: ours, colliding", "fixture: after the conflict"] }
+  assert { committer.log(source: fork, from: fixture.branch("feature"), limit: 1).contains("2 older commit(s) not shown") }
+  assert { committer.log(source: picked, from: upstream).contains("HEAD already has every commit") }
+  let conflictPlan = committer.log(source: feature, from: upstream)
+  assert { conflictPlan.contains("CONFLICT") and conflictPlan.contains("shared.txt") }
+  assert { conflictPlan.contains("markers: true") }
+  let combined = committer.log(source: fork, from: upstream, paths: ["shared.txt"]) rescue { e: Error => e.message }
+  assert { combined.contains("do not combine with from") }
+
+  # cherryPick(markers: true) is `git cherry-pick -n`: one commit, applied as
+  # uncommitted edits with conflict markers where it no longer fits.
+  let marked = committer.cherryPick(source: feature, from: upstream, commits: [ontoSha], markers: true)
+  assert { marked.git.head.commitSHA == feature.git.head.commitSHA }
+  let markedShared = marked.file("shared.txt").contents
+  assert { markedShared.contains("<<<<<<<") and markedShared.contains(">>>>>>>") }
+  assert { markedShared.contains("upstream") and markedShared.contains("ours") }
+  assert { marked.file("upstream.txt").contents == "u\n" }
+  let cleanMarked = committer.cherryPick(source: fork, from: upstream, commits: [ontoSha.split("").takeFirst(7).join("")], markers: true)
+  assert { cleanMarked.git.head.commitSHA == fork.git.head.commitSHA }
+  assert { cleanMarked.file("shared.txt").contents == "upstream\n" }
+  assert { cleanMarked.git.uncommitted.diffStats.{{path}}.map { s => s.path } == ["shared.txt", "upstream.txt"] }
+  [[], [ontoSha, fixture.tag("fork").commitSHA]].each { invalid =>
+    let refused = committer.cherryPick(source: feature, from: upstream, commits: invalid, markers: true).git.head.commitSHA rescue { e: Error => e.message }
+    assert { refused.contains("exactly one commit") }
+  }
+
   # show / fileAt / restore read another ref's history without fetching.
   assert { committer.show(source: fork, from: upstream).contains("fixture: upstream change") }
   assert { committer.show(source: fork, commit: "fork", from: upstream).contains("fixture: fork point") }

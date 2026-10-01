@@ -7,28 +7,18 @@ let testStaffFiltering(source: Workspace!): String! {
     .withNewFile(root + "/nested/keep.txt", "unselected\n")
   let worker = llm.withWorkspace(working).spawn(name: "filter-fixture")
   let fixture = staff.withWorker("fixture", worker)
-  let patch = fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.go"])
+  let patch = fixture.pendingOf(name: "fixture", paths: [root + "/**/*.go"])
   assert { patch.contains("+one") and patch.contains("+two") }
   assert { !patch.contains("keep.txt") }
-  assert { fixture.diffOf(source: base, name: "fixture", paths: [root + "/**/*.rs"]).contains("no uncommitted changes") }
-  let committed = working.withCommit(
-    changes: working.git.uncommitted.filter(include: [root + "/**"]),
-    message: "fixture",
-    date: "2026-09-15T12:00:00Z",
-  )
-  let committedWorker = llm.withWorkspace(committed).spawn(name: "committed-filter-fixture")
-  let committedFixture = staff.withWorker("fixture", committedWorker)
-  let committedPatch = committedFixture.diffOf(
-    source: base, name: "fixture", paths: [root + "/**/*.go"], commit: committed.git.head.commitSHA,
-  )
-  assert { committedPatch.contains("+one") and committedPatch.contains("+two") }
-  assert { !committedPatch.contains("unselected") }
+  let none = fixture.pendingOf(name: "fixture", paths: [root + "/**/*.rs"])
+  assert { none.contains("no uncommitted changes") }
+  # The escape hatch points committed work at its address, not at a verb.
+  assert { none.contains("dag://staff/members/head?member=fixture") }
   worker.stop
-  committedWorker.stop
 
-  # Exercise literal drift filtering through pullPending. All other pending
+  # Exercise literal drift filtering through salvagePending. All other pending
   # changes are already present in the chief: interpreting a filename as a glob
-  # would try to reapply those additions and fail (or pull the wrong files).
+  # would try to reapply those additions and fail (or take the wrong files).
   let seeded = base
     .withNewFile(root + "/old name.txt", "rename\n")
     .withNewFile(root + "/delete me.txt", "remove\n")
@@ -57,24 +47,24 @@ let testStaffFiltering(source: Workspace!): String! {
       }
       let tree = after.directory("/")
       let chief = after.withChanges(tree.withoutDirectory(root).withDirectory(root, siblings).changes(from: tree))
-      let selected = literalFixture.pullPending(source: chief, name: "fixture")
+      let selected = literalFixture.salvagePending(source: chief, name: "fixture")
       assert { selected.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [root + "/" + name] }
       assert { selected.asPatch.contents.contains("+added") }
       assert { chief.directory("/").withChanges(selected).changes(from: after.directory("/")).isEmpty }
     }
     let withoutDir = after.withoutDirectory(root + "/a")
-    let directoryDelta = literalFixture.pullPending(source: withoutDir, name: "fixture")
+    let directoryDelta = literalFixture.salvagePending(source: withoutDir, name: "fixture")
     assert { directoryDelta.diffStats.{{path}}.map { s => s.path }.filter { p => !p.hasSuffix("/") } == [root + "/a/inside.txt", root + "/a/nested/leaf.txt"] }
-    assert { literalFixture.pullPending(source: after, name: "fixture").isEmpty }
-    assert { literalFixture.pullPending(source: before, name: "fixture").asPatch.contents == after.git.uncommitted.asPatch.contents }
+    assert { literalFixture.salvagePending(source: after, name: "fixture").isEmpty }
+    assert { literalFixture.salvagePending(source: before, name: "fixture").asPatch.contents == after.git.uncommitted.asPatch.contents }
     let undeleted = after.withNewFile(root + "/delete me.txt", "remove\n")
-    assert { literalFixture.pullPending(source: undeleted, name: "fixture").removedPaths == [root + "/delete me.txt"] }
+    assert { literalFixture.salvagePending(source: undeleted, name: "fixture").removedPaths == [root + "/delete me.txt"] }
     let oldOnly = after.withNewFile(root + "/old name.txt", "rename\n")
-    assert { literalFixture.pullPending(source: oldOnly, name: "fixture").removedPaths == [root + "/old name.txt"] }
+    assert { literalFixture.salvagePending(source: oldOnly, name: "fixture").removedPaths == [root + "/old name.txt"] }
     let newOnly = after.withoutFile(root + "/new name.txt")
-    assert { literalFixture.pullPending(source: newOnly, name: "fixture").addedPaths == [root + "/new name.txt"] }
+    assert { literalFixture.salvagePending(source: newOnly, name: "fixture").addedPaths == [root + "/new name.txt"] }
     let unrenamed = newOnly.withNewFile(root + "/old name.txt", "rename\n")
-    let renamed = literalFixture.pullPending(source: unrenamed, name: "fixture")
+    let renamed = literalFixture.salvagePending(source: unrenamed, name: "fixture")
     assert { renamed.diffStats.{{kind}}.map { s => s.kind } == [DiffStatKind.RENAMED] }
     null
   } rescue { e: Error => {
@@ -116,11 +106,23 @@ let testStaffMembers(source: Workspace!): String! {
     # A member's head is an artifact: the collection field on the module's
     # main object contributes a `member` dimension to the workspace schema,
     # and `head` is a GitRef path under it.
-    let selected = source.artifacts.filterPathPattern(pattern: "staff/members/**")
+    let selected = source.artifacts.filterPathPattern(pattern: "staff/**")
     let dimensions = selected.dimensionDefinitions.{{identifier, name, itemType}}
     assert { dimensions.any { d => d.identifier == "/staff/members" and d.name == "member" and d.itemType == "Member" } }
     let paths = selected.pathDefinitions.{{uri, dimensions}}
     assert { paths.any { p => p.uri == "dag://staff/members/head" and p.dimensions.contains("/staff/members") and p.dimensions.contains("type:GitRef") } }
+    # Exactly one `members` tree: the worker's Peers is minted by a function
+    # with a required argument, so it adds no second `member` dimension (no
+    # staff/pull-tools/members) that would make the address ambiguous.
+    assert { dimensions.filter { d => d.name == "member" }.map { d => d.identifier } == ["/staff/members"] }
+    assert { !paths.any { p => p.uri.contains("pull-tools") or p.uri.contains("peers") } }
+
+    # In a chief's scope the address resolves against its live roster, even
+    # though the chief does not get `members` as a tool.
+    let scope = llm.withWorkspace(base).withTools(roster, except: ["members"]).artifacts(include: ["staff/members"])
+    assert { scope.dimensionKeys(dimension: "member") == ["ahead", "idle"] }
+    let head = scope.filterUri(uri: "dag://staff/members/head?member=ahead").one.value.{{... on GitRef!}}
+    assert { head.commitSHA == committed.git.head.commitSHA }
     null
   } rescue { e: Error => {
     idle.stop
@@ -132,9 +134,82 @@ let testStaffMembers(source: Workspace!): String! {
   "Staff members collection checks passed."
 }
 
+let testStaffPeers(source: Workspace!): String! {
+  let base = source.git.head.asWorkspace
+  let root = "staff-peers-check-" + Random.string
+  let edited = base.withNewFile(root + "/chief.txt", "chief\n")
+  let chiefWorkspace = edited.withCommit(
+    changes: edited.git.uncommitted,
+    message: "fixture: chief commit",
+    date: "2026-09-15T12:00:00Z",
+  )
+  let early = llm.withWorkspace(base).spawn(name: "peers-early")
+  let late = llm.withWorkspace(base.withNewFile(root + "/late.txt", "unfinished\n")).spawn(name: "peers-late")
+  # The chief's conversation binds its Staff, as Staff.agent does; the
+  # roster a worker sees is read from there.
+  let hiredEarly = staff.withWorker("early", early)
+  let chief = llm.withWorkspace(chiefWorkspace).withTools(hiredEarly, except: ["members"]).spawn(name: "peers-chief")
+  let peers = staff.peers(chief: chief, name: "early");
+  {
+    # The worker itself is left out; the chief is always there.
+    assert { peers.members.keys == ["chief"] }
+    let own = peers.members.get(key: "early").name rescue { e: Error => e.message }
+    assert { own.contains("early") }
+
+    # The chief hires `late` after `early` was spawned: its next committed
+    # step binds the grown roster. Reseeding stands in for that step without
+    # a model call. The SAME Peers object now sees the new worker.
+    chief.reseed(conversation: llm.withWorkspace(chiefWorkspace).withTools(hiredEarly.withWorker("late", late), except: ["members"]))
+    assert { peers.members.keys == ["chief", "late"] }
+    assert { peers.members.get(key: "chief").head.commitSHA == chiefWorkspace.git.head.commitSHA }
+    assert { peers.members.get(key: "late").head.commitSHA == base.git.head.commitSHA }
+
+    # A worker's scope resolves the same addresses through its bound Peers,
+    # bound as spawn binds it: `members` is not a tool, yet still a tree.
+    let scope = llm.withWorkspace(base).withTools(peers, except: ["members"]).artifacts(include: ["staff/members"])
+    assert { scope.dimensionKeys(dimension: "member") == ["chief", "late"] }
+    let head = scope.filterUri(uri: "dag://staff/members/head?member=chief").one.value.{{... on GitRef!}}
+    assert { head.commitSHA == chiefWorkspace.git.head.commitSHA }
+
+    # The escape hatches reach any member, chief included.
+    let pending = peers.pendingOf(name: "late")
+    assert { pending.contains(root + "/late.txt") and pending.contains("+unfinished") }
+    assert { peers.pendingOf(name: "chief").contains("no uncommitted changes") }
+    assert { peers.salvagePending(source: base, name: "late").addedPaths.filter { p => !p.hasSuffix("/") } == [root + "/late.txt"] }
+
+    # Workers get the roster and escape hatches, never orchestration. Bound
+    # as spawn binds it: the roster is reached by address, not as a tool.
+    let tools = llm.withWorkspace(base).withTools(peers, except: ["members"]).tools
+    ["pendingOf", "salvagePending"].each { name =>
+      assert { tools.contains("## " + name + "\n") }
+    }
+    ["spawn", "sendTo", "interruptWorker", "logOf", "pullPending", "members"].each { name =>
+      assert { !tools.contains("## " + name + "\n") }
+    }
+    null
+  } rescue { e: Error => {
+    early.stop
+    late.stop
+    chief.stop
+    raise e.message
+  }}
+  early.stop
+  late.stop
+  chief.stop
+  "Staff peers checks passed."
+}
+
 let testStaffTools(source: Workspace!): String! {
+  # LLM.tools renders one "## <name>" heading per tool.
   let tools = staff.agent(llm.withWorkspace(source)).tools
-  assert { tools.contains("spawn") }
+  ["spawn", "sendTo", "status", "read", "interruptWorker", "pendingOf", "salvagePending"].each { name =>
+    assert { tools.contains("## " + name + "\n") }
+  }
+  # Git operations live in git tools, by address; the roster is reached by
+  # address too; bookkeeping stays out.
+  ["logOf", "diffOf", "pull", "pullConflicted", "pullPending", "pullTools", "peers", "members", "memberAgent", "memberOf"].each { name =>
+    assert { !tools.contains("## " + name + "\n") }
+  }
   assert { !tools.contains("withWorker") }
   assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
   assert { !tools.contains("checkComposition") }

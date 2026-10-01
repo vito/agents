@@ -25,7 +25,7 @@ type AgentsDev {
     null
   }
 
-  """Check rebase, cherryPick, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
+  """Check log(from:), cherryPick (markers too), rebase, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
   committerRefs: Void @check {
     print(checkCommitterRefs)
     null
@@ -73,19 +73,25 @@ type AgentsDev {
     null
   }
 
-  """Check public glob filtering and literal internal drift paths without model calls."""
+  """Check the escape hatches' glob filtering and literal internal drift paths without model calls."""
   staffFiltering(source: Workspace!): Void @check {
     print(testStaffFiltering(source: source))
     null
   }
 
-  """Check the roster collection: keys, items, subsets, and its dimension in the workspace schema."""
+  """Check the roster collection: keys, items, subsets, and one unambiguous `member` dimension."""
   staffMembers(source: Workspace!): Void @check {
     print(testStaffMembers(source: source))
     null
   }
 
-  """Check internal bookkeeping remains absent from the chief's tools."""
+  """Check a worker's live roster sees later hires, resolves addresses, and reaches the escape hatches."""
+  staffPeers(source: Workspace!): Void @check {
+    print(testStaffPeers(source: source))
+    null
+  }
+
+  """Check the chief's tools: orchestration and escape hatches, no git or bookkeeping."""
   staffTools(source: Workspace!): Void @check {
     print(testStaffTools(source: source))
     null
