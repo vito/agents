@@ -7,24 +7,30 @@
 # Messaging is event-driven, never blocking (hack/designs/agent-messaging.md):
 # spawn subscribes the chief to each worker's lifecycle, so completions and
 # failures arrive as attributed messages instead of being polled or awaited;
-# the chief steers by name — sendTo/status/read/interruptWorker —
-# and harvests work — logOf/diffOf/pull/pullConflicted/pullPending,
-# reaching each agent's own Workspace through its live snapshot. The roster
-# is also a COLLECTION (`members`): each agent's committed history is an
-# artifact, `dag://staff/members/head?member=<name>`, so any tool taking a
-# GitRef (committer's rebase, cherryPick, show, restore ...) can target
-# another agent's commits by address instead of by staff-specific verb. Spawned
-# workers get a frozen, pull-only roster view of the chief and peers already
-# present when they start, plus a private line home (askChief) that delivers
-# the question and returns immediately; the chief answers mid-turn with
-# sendTo(replyTo:), and the engine refuses any wait that would deadlock.
+# the chief steers by name — sendTo/status/read/interruptWorker.
+#
+# Staff does no git. The roster is a COLLECTION (`members`): each agent's
+# committed history is an artifact, `dag://staff/members/head?member=<name>`,
+# so whatever git tools the agent has that take a GitRef can inspect,
+# cherry-pick or rebase onto another agent's commits by address. Uncommitted
+# work has no git ref, so two escape hatches reach it by name: pendingOf
+# (monitor) and salvagePending (recover), reading the agent's Workspace
+# through its last committed conversation step.
+#
+# Workers bind `Peers` instead of Staff: the same `members` tree and escape
+# hatches, but no orchestration. Its roster is LIVE — derived on each read
+# from the chief's last committed step, whose bound Staff holds the current
+# roster — so a worker sees peers hired after it. Plus a private line home
+# (askChief) that delivers the question and returns immediately; the chief
+# answers mid-turn with sendTo(replyTo:), and the engine refuses any wait
+# that would deadlock.
 #
 # State: `agents` holds live Agent handles in module state, evolved by tools
 # returning Staff! (the modules/editor pattern — engine-object handles in
-# Dang state serialize as IDs and just work). The worker's ask channel is
-# minted via a real self-call (Dagger.staff.chiefLine): the result of a
-# module call has engine identity, which withTools needs — a locally
-# constructed Dang object does not.
+# Dang state serialize as IDs and just work). The worker's tool objects are
+# minted via real self-calls (Dagger.staff.peers, Dagger.staff.chiefLine):
+# the result of a module call has engine identity, which withTools needs — a
+# locally constructed Dang object does not.
 #
 # Registered in dagger.toml; can also be loaded directly with `dagger -m ./staff`.
 """
@@ -40,11 +46,12 @@ type Staff {
   # Keep the source, not the partially composed base LLM or live tool state.
   let compositionSource: Workspace = null
 
-  # Public for self-calls, not chief tools: roster bookkeeping and worker
-  # plumbing. Prompt constants are excluded too.
-  # Workers bind only the dedicated PullTools object, never this full Staff.
+  # Public for self-calls or the artifact tree, not chief tools: roster
+  # bookkeeping and worker plumbing, and the `members` collection, which is
+  # reached by address rather than as a tool. Prompt constants are excluded
+  # too. Workers bind only the dedicated Peers object, never this full Staff.
   let plumbing = [
-    "withWorker", "chiefLine", "pullTools", "memberAgent",
+    "withWorker", "chiefLine", "peers", "memberAgent", "members",
     "withCompositionSource", "workerBase", "workerPrompt", "workerPromptFor"
   ]
 
@@ -100,16 +107,17 @@ type Staff {
   Returns immediately — the worker runs its opening turn asynchronously, and
   you are subscribed to its lifecycle: when it goes idle (with its final
   reply) or fails (with the error), the news arrives as an event message.
-  Keep working; check on it with status/read, steer it with sendTo, harvest
-  it with the pull family. The worker gets fresh tools
-  from the workspace where staff was composed, bound to your current worktree,
-  a pull-only view of the chief and workers already on staff, and askChief,
-  its line back to you. It cannot spawn or steer workers. Tools layered onto
-  the chief later are not automatically inherited.
+  Keep working; check on it with status/read, steer it with sendTo, and take
+  its commits from `dag://staff/members/head?member=<name>` with your git
+  tools. The worker gets fresh tools from the workspace where staff was
+  composed, bound to your current worktree, the staff roster (`chief` and
+  its peers, by address), and askChief, its line back to you. It cannot
+  spawn or steer workers. Tools layered onto the chief later are not
+  automatically inherited.
 
-  The chief is always available to that pull-only view under the reserved
-  target name `chief`; existing workers keep their staff names. The roster is
-  a snapshot: workers hired later are not added retroactively.
+  The worker's roster is live: it lists the chief under the reserved name
+  `chief` and every worker in your roster as of your last completed step, so
+  workers hired later show up too.
 
   Its copy is a sandbox: whatever it edits, breaks or commits stays there
   until you harvest it, and reaches neither you nor any other worker. So
@@ -127,7 +135,7 @@ type Staff {
     The worker's opening task. Make it self-contained: the worker starts
     with none of your conversation context. Ask for the work itself — it can
     edit, run checks and commit in its own copy — and tell it to commit what
-    it finishes, so you can pull the result with its authorship.
+    it finishes, so you can take the result with its authorship.
     """
     task: String!,
     """
@@ -140,19 +148,19 @@ type Staff {
     # @cache(Never): composes, starts, and messages a real agent runtime —
     # side effects that must actually run, never replay from cache.
     if (name == "chief") {
-      raise `staff member name "chief" is reserved for the chief in worker pull rosters`
+      raise `staff member name "chief" is reserved for the chief in worker rosters`
     }
     if (agents.has(name)) {
       raise `staff member "${name}" already exists — pick another name`
     }
     let base = workerBase(source, model)
-    # Snapshot the peers that exist BEFORE this spawn and add the chief under
-    # a stable reserved alias. PullTools exposes only the five harvest methods,
-    # so future Staff orchestration methods cannot leak into workers by accident.
-    let roster = currentNode.{{... on Dagger.Staff!}}.withWorker("chief", chief)
-    let pulls = roster.pullTools
     let worker = base
-      .withTools(pulls)
+      # Peers holds the chief's handle and derives the roster from it on
+      # every read, so workers hired after this one show up too. It exposes
+      # only the roster and the escape hatches, so future Staff orchestration
+      # methods cannot leak into workers by accident. Its `members` tree is
+      # reached by address, so it is not a tool.
+      .withTools(Dagger.staff.peers(chief: chief, name: name), except: ["members"])
       # The line home, minted via a real self-call; the boss handle itself
       # stays out of the tool schema.
       .withTools(Dagger.staff.chiefLine(boss: chief), except: ["boss"])
@@ -268,96 +276,18 @@ type Staff {
   }
 
   """
-  List a worker's commits, oldest first, each annotated with what
-  `pull` would do with it: new, already had, redundant, or CONFLICT with the
-  reason and the paths that obstruct it.
+  Escape hatch for a worker's UNCOMMITTED edits. For committed work, use git
+  tools with `dag://staff/members/head?member=<name>`.
 
-  This is the plan, not a diff: no per-file stats, because forcing them for a
-  worker's whole stack to render a log is not worth it. For one commit's
-  actual changes use `diffOf(name, commit:)`.
+  Monitor: show what a worker has changed but not committed — a per-file
+  summary followed by a Git-compatible unified diff. No git ref reaches
+  uncommitted work, so this is how to look at it before the worker commits.
 
   Reads the worker's LAST COMMITTED conversation step, so a mid-turn worker
-  may hold work this cannot see yet; wait for its idle event or use
-  `interruptWorker` first when it matters.
+  may hold edits this cannot see yet. Pass `paths` to scope the patch; a
+  worker's whole diff can be enormous.
   """
-  logOf(
-    source: Workspace!,
-    """
-    The worker's name.
-    """
-    name: String!,
-    """
-    Maximum number of commits to show, counting back from the newest. The
-    header line counts the whole integration plan (bounded to 100 commits;
-    larger histories fail rather than being silently truncated).
-    """
-    limit: Int! = 10,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): reads the worker's live snapshot, which is not part of
-    # this call's arguments — logOf(name: "scout") twice must not replay the
-    # first plan.
-    if (limit < 1) {
-      raise "limit must be positive"
-    }
-    let theirs = workerWorkspace(name)
-    # One batched selection: the plan forces here, and a failure here is a
-    # genuine error worth surfacing raw rather than rescuing into prose.
-    let picks = source.compareCommitsFrom(source: theirs).{{
-      commit.{{sha, committedDate, authorName, message}},
-      status,
-      reason,
-      conflictPaths
-    }}
-    if (picks.isEmpty) {
-      return `Worker "${name}" has no new commits relative to your workspace.` + "\n\n"
-        + `Inspect any uncommitted work with diffOf(name: "${name}") `
-        + `and take it with pullPending(name: "${name}").`
-    }
-
-    let newOnes = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
-    let had = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKED }
-    let redundant = picks.filter { p => p.status == WorkspaceCommitPickStatus.REDUNDANT }
-    let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
-    let header = `${toString(picks.length)} commit(s) from worker "${name}": `
-      + `${toString(newOnes.length)} new, ${toString(had.length)} already had, `
-      + `${toString(redundant.length)} redundant, ${toString(conflicting.length)} conflicting`
-
-    let shown = picks.takeLast(limit)
-    let entries = shown.map { p =>
-      let annotation = `[${pickLabel(p.status, p.reason)}${pathNote(p.conflictPaths)}]`
-      let head = `${short(p.commit.sha)}  ${p.commit.committedDate}  ${p.commit.authorName}  ${annotation}`
-      let body = p.commit.message.split("\n").map { line => "    " + line }.join("\n")
-      head + "\n" + body
-    }
-
-    let omitted = picks.length - shown.length
-    let truncation = if (omitted > 0) {
-      "\n\n" + `(${toString(omitted)} older commit(s) not shown; raise limit to see them)`
-    } else {
-      ""
-    }
-    let recovery = if (conflicting.isEmpty) {
-      ""
-    } else {
-      "\n\n" + conflicting.map { p =>
-        `${short(p.commit.sha)}: ${conflictRecovery(p.reason, name, short(p.commit.sha))}`
-      }.join("\n")
-    }
-
-    header + "\n\n" + entries.join("\n\n") + truncation + recovery
-  }
-
-  """
-  Show what a worker changed, as a Git-compatible unified diff.
-
-  With `commit`, that commit's metadata, message and patch — the
-  detail `logOf` deliberately omits. Without it, the worker's UNCOMMITTED
-  work: a per-file summary followed by the patch.
-
-  Pass `paths` to scope the patch; a worker's whole diff can be enormous.
-  """
-  diffOf(
-    source: Workspace!,
+  pendingOf(
     """
     The worker's name.
     """
@@ -367,230 +297,33 @@ type Staff {
     or "**/*.go"). Empty shows everything.
     """
     paths: [String!]! = [],
-    """
-    A commit to show instead of the uncommitted work, as a full or
-    short sha from logOf. Omit to show the uncommitted work.
-    """
-    commit: String = null,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
-    let theirs = workerWorkspace(name)
-
-    if (commit != null) {
-      let c = repository(theirs).commit(id: commit).{{
-        sha,
-        authoredDate,
-        authorName,
-        authorEmail,
-        message,
-        parentShas
-      }}
-      let mergeNote = if (c.parentShas.length > 1) {
-        "\n(merge commit: patch shown against its first parent)"
-      } else {
-        ""
-      }
-      let meta =
-        `commit ${c.sha}` + "\n"
-          + `Author: ${c.authorName} <${c.authorEmail}>` + "\n"
-          + `Date:   ${c.authoredDate}` + mergeNote + "\n\n"
-          + c.message.split("\n").map { line => "    " + line }.join("\n")
-      let scoped = commitChanges(theirs, c.sha).filter(include: paths).asPatch.contents
-      if (scoped == "") {
-        if (paths.isEmpty) {
-          return meta + "\n\n(this commit has no file changes)"
-        }
-        return meta + "\n\n(no changes under the given paths)"
-      }
-      return meta + "\n\n" + scoped
-    }
-
-    let changes = theirs.git.uncommitted.filter(include: paths)
-    let scopedStats = changes.diffStats.{{kind, addedLines, removedLines, path}}
-    if (scopedStats.isEmpty) {
-      return `Worker "${name}" has no uncommitted changes`
-        + (if (paths.isEmpty) { "." } else { " under the given paths." })
-        + "\n\n" + `What it committed is in logOf(name: "${name}").`
-    }
-    let summary = scopedStats.map { s =>
-      `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
-    }.join("\n")
-    let scoped = changes.asPatch.contents
-    let patchBlock = if (scoped == "") { "" } else { "\n\n" + scoped }
-    `Uncommitted work in worker "${name}":` + "\n\n" + summary + patchBlock
+    pendingReport(workerWorkspace(name), name, paths)
   }
 
   """
-  Take a worker's commits into your own workspace, keeping the
-  worker's authorship, message and date.
+  Escape hatch for a worker's UNCOMMITTED edits. For committed work, use git
+  tools with `dag://staff/members/head?member=<name>`.
 
-  Plans first and applies ONLY what applies cleanly: commits you already
-  have, and commits whose content is already present, are skipped, and a
-  commit that conflicts is reported rather than forced — with the recovery
-  route for its reason. Run it again after resolving; already-pulled commits
-  are recognised.
+  Recover: take everything a worker changed but never committed as your own
+  pending edits, re-anchored on your workspace's current content. The
+  worker's authorship is lost — asking it to commit is the regular route;
+  this is for work that cannot wait for that, or a worker that cannot
+  finish.
 
-  Fast-forwards when possible, otherwise cherry-picks; commit hashes may
-  change. Uncommitted worker edits are left for pullPending. Integration is
-  bounded to 100 commits in either differing history and fails above that.
-
-  Reads the worker's LAST COMMITTED conversation step, so wait for its idle
-  event (or use `interruptWorker`) before the harvest that matters.
-  """
-  pull(
-    source: Workspace!,
-    """
-    The worker's name.
-    """
-    name: String!,
-    """
-    Cherry-pick these commits, as full or short shas from logOf. They are
-    always applied in the worker's stack order. Empty takes everything new.
-    """
-    commits: [String!]! = [],
-  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): reads the worker's live snapshot, which is not part of
-    # this call's arguments.
-    let theirs = workerWorkspace(name)
-    let picks = source.compareCommitsFrom(source: theirs, commits: commits).{{
-      commit.{{sha, message}},
-      status,
-      reason,
-      conflictPaths
-    }}
-    if (picks.isEmpty) {
-      print(`Worker "${name}" has no new commits to pull. `
-        + `Its uncommitted work is a pullPending(name: "${name}") away.`)
-      return source
-    }
-
-    let pickable = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
-    let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
-    let skipped = picks.filter { p =>
-      p.status == WorkspaceCommitPickStatus.PICKED
-        or p.status == WorkspaceCommitPickStatus.REDUNDANT
-    }
-    let conflictBlock = if (conflicting.isEmpty) {
-      ""
-    } else {
-      "\n\n" + `CONFLICT — ${toString(conflicting.length)} commit(s) NOT pulled:` + "\n"
-        + conflicting.map { p =>
-          `  ${short(p.commit.sha)} ${subject(p.commit.message)}` + "\n"
-            + `    ${conflictReason(p.reason)}${pathNote(p.conflictPaths)}` + "\n"
-            + `    -> ${conflictRecovery(p.reason, name, short(p.commit.sha))}`
-        }.join("\n")
-    }
-    let skippedNote = if (skipped.isEmpty) {
-      ""
-    } else {
-      "\n" + `(${toString(skipped.length)} already present, skipped)`
-    }
-
-    if (pickable.isEmpty) {
-      print(`Nothing new to pull from worker "${name}".` + skippedNote + conflictBlock)
-      return source
-    }
-
-    let integrated = source.withCommitsFrom(source: theirs, commits: pickable.map { p => p.commit.sha })
-    # Force the apply HERE, inside the module: without this the failure would
-    # land outside, when the engine rebinds the Workspace, stripped of which
-    # worker and how many commits were involved. The rescue only enriches —
-    # returning `source` instead would report a pull that never happened.
-    integrated.git.head.commitSHA rescue {
-      e: Error => raise `pulling ${toString(pickable.length)} commit(s) from worker "${name}" failed: ${e.message}`
-    }
-    print(`Pulled ${toString(pickable.length)} commit(s) from worker "${name}":` + "\n"
-      + pickable.map { p => `  ${short(p.commit.sha)} ${subject(p.commit.message)}` }.join("\n")
-      + skippedNote + conflictBlock)
-    integrated
-  }
-
-  """
-  Recover ONE conflicting commit that `pull` refused: apply its patch to your
-  tree with conflict markers where it no longer fits, landing the result as
-  UNCOMMITTED edits for you to resolve.
-
-  Deliberately not a mode of `pull`: a commit must never be recorded with
-  conflict markers inside it, so the resolution lands in your working tree
-  and the commit that records it is yours. The original message is printed
-  for you to reuse — the worker's authorship is lost by construction, which
-  is why `pull` is always worth trying first.
-  """
-  pullConflicted(
-    source: Workspace!,
-    """
-    The worker's name.
-    """
-    name: String!,
-    """
-    The commit to take, as a full or short sha from logOf.
-    """
-    commit: String!,
-  ): Changeset! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): reads the worker's live snapshot, which is not part of
-    # this call's arguments.
-    let theirs = workerWorkspace(name)
-    let target = repository(theirs).commit(id: commit).{{sha, message, parentShas}}
-    let sha = target.sha
-    if (target.parentShas.length > 1) {
-      raise `commit ${short(sha)} is a merge commit; inspect its first-parent diff with diffOf and integrate it manually`
-    }
-    let message = target.message
-    let patch = commitChanges(theirs, sha).asPatch.contents
-    if (patch == "") {
-      raise `commit ${short(sha)} in worker "${name}" records no file changes to apply`
-    }
-
-    # Advisory, not a refusal: if the commit would apply cleanly, pull keeps
-    # the worker's authorship and this does not.
-    let planned = source.compareCommitsFrom(source: theirs, commits: [sha]).{{status}}
-    let clean = planned.any { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
-
-    let base = source.directory("/")
-    let delta = base
-      .withPatch(patch, onConflict: PatchConflict.LEAVE_CONFLICT_MARKERS)
-      .changes(from: base)
-    # Force the apply here; a swallowed failure would silently discard the
-    # commit's work.
-    #
-    # Conflict markers only rescue a hunk that no longer matches; git refuses
-    # outright to create a file your tree already has, which is exactly the
-    # shape of a DIRTY conflict over an added path. Say so, since the remedy
-    # is the other branch of the conflict loop, not a retry.
-    delta.isEmpty rescue {
-      e: Error => raise `applying commit ${short(sha)} from worker "${name}" to your tree failed: ${e.message}`
-        + ` — if that is your own uncommitted work on those paths, commit or revert it and `
-        + `pull(name: "${name}", commits: ["${short(sha)}"]) instead`
-    }
-
-    let note = if (clean) {
-      "\n\n" + `NOTE: this commit applies cleanly — pull(name: "${name}", commits: ["${short(sha)}"]) `
-        + `would take it with ${name}'s authorship intact. Prefer that unless you meant to make it yours.`
-    } else {
-      ""
-    }
-    print(`Applied commit ${short(sha)} from worker "${name}" as uncommitted edits. `
-      + `Search for conflict markers (<<<<<<<), resolve them, then commit it yourself.` + "\n\n"
-      + "Original message, to reuse:" + "\n"
-      + message.split("\n").map { line => "    " + line }.join("\n") + note)
-    delta
-  }
-
-  """
-  Take a worker's UNCOMMITTED work — everything it changed but never
-  committed — re-anchored on your workspace's current content.
-
-  This is the other half of `pull`. The worker started from a copy of your
-  workspace, so its pending patch usually contains edits you already have;
-  those are filtered out by comparing the two trees, and only files that
-  genuinely differ are applied.
-
-  Fails rather than half-applying when the two of you edited the same part of
-  the same file. `markers: true` applies what fits and leaves git-style
+  The worker started from a copy of your workspace, so its pending patch
+  usually contains edits you already have; those are filtered out by
+  comparing the two trees, and only files that genuinely differ are applied.
+  Fails rather than half-applying when the two of you edited the same part
+  of the same file. `markers: true` applies what fits and leaves git-style
   conflict markers for you to resolve.
+
+  Reads the worker's LAST COMMITTED conversation step: wait for its idle
+  event (or use `interruptWorker`) first when it matters.
   """
-  pullPending(
+  salvagePending(
     source: Workspace!,
     """
     The worker's name.
@@ -604,59 +337,7 @@ type Staff {
   ): Changeset! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): reads the worker's live snapshot, which is not part of
     # this call's arguments.
-    let theirs = workerWorkspace(name)
-    let base = source.directory("/")
-
-    # Re-anchoring, and the reason the naive version fails in the COMMON
-    # case: the worker inherited your pending edits at spawn, so its patch
-    # contains hunks you already have, and withPatch is a plain `git apply`
-    # with no 3-way — it rejects an already-applied hunk. Restrict the patch
-    # to the files where the two trees genuinely differ. Partial overlap
-    # INSIDE a file still fails; that is what markers: true is for.
-    # Keep both names of a rename: filtering one side intentionally yields
-    # only an addition or deletion. Drop absent old paths so an empty name
-    # does not select the whole tree.
-    let driftStats = theirs.directory("/").changes(from: base).diffStats.{{path, oldPath}}
-    let drift = driftStats.map { s => s.path }
-      + driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
-    if (drift.isEmpty) {
-      print(`Worker "${name}" has nothing your workspace does not already have.`)
-      return base.changes(from: base)
-    }
-
-    let pending = scopeLiteralChanges(theirs.git.uncommitted, drift).asPatch.contents
-    if (pending == "") {
-      print(`Worker "${name}" has no uncommitted work to take. `
-        + `What it committed is in logOf(name: "${name}").`)
-      return base.changes(from: base)
-    }
-
-    let onConflict = if (markers) {
-      PatchConflict.LEAVE_CONFLICT_MARKERS
-    } else {
-      PatchConflict.FAIL
-    }
-    let delta = base.withPatch(pending, onConflict: onConflict).changes(from: base)
-    # Force the apply here; a swallowed failure would silently discard the
-    # worker's uncommitted work.
-    delta.isEmpty rescue {
-      e: Error => raise `taking worker "${name}"'s uncommitted work failed: ${e.message}`
-        + (
-          if (markers) {
-            ""
-          } else {
-            ` — you and ${name} edited the same part of the same file; retry with markers: true to resolve it by hand`
-          }
-        )
-    }
-
-    let marked = if (markers) {
-      " Search for conflict markers (<<<<<<<) and resolve them."
-    } else {
-      ""
-    }
-    print(`Took worker "${name}"'s uncommitted work as your own pending edits.` + marked)
-    delta
+    salvage(source, workerWorkspace(name), name, markers)
   }
 
   """
@@ -677,22 +358,23 @@ type Staff {
   }
 
   """
-  Mint the dedicated pull-only tool object workers receive. The receiver is a
-  frozen Staff roster view assembled by spawn; wrapping it in a secondary type
-  keeps every orchestration method structurally out of the worker's toolset.
+  Mint the tool object a worker receives: the roster and the escape hatches,
+  no orchestration. Takes the chief's handle, from which the roster is read
+  live; `name` is the worker's own staff name, left out of its roster.
+
+  The required argument is load-bearing: it keeps this off the artifact
+  tree, so `dag://staff/members` has exactly one meaning.
   """
-  pullTools: PullTools! {
-    PullTools(currentNode.{{... on Dagger.Staff!}})
+  peers(chief: Agent!, name: String! = ""): Peers! {
+    Peers(chief, name)
   }
 
   """
-  The roster as a collection, one member per staff name: the chief under
-  `chief` in a worker's view, workers under their staff names.
+  The roster as a collection, one member per worker, under its staff name.
 
   Each member's committed history is an artifact — `dag://staff/members/head?member=<name>`
-  is that agent's HEAD as a GitRef — so git tools that take a ref, such as
-  committer's `rebase(ref:)`, `cherryPick(from:)`, `show(from:)` or
-  `restore(from:)`, can target another agent's commits by address.
+  is that agent's HEAD as a GitRef — so any git tool that takes a ref can
+  inspect, cherry-pick or rebase onto another agent's commits by address.
   """
   members: Members! {
     # Map keys come back sorted, so the collection's key order is stable
@@ -739,116 +421,14 @@ type Staff {
   #
   # `sync` is load-bearing, not decoration. Dang forces a lazy chain once per
   # SELECTION off it, not once per `let` binding — and Agent.snapshot is
-  # DoNotCache, so every field a harvest tool reads off an unpinned `theirs`
+  # DoNotCache, so every field an escape hatch reads off an unpinned `theirs`
   # re-executes snapshot and lands on a DIFFERENT live snapshot as the worker
-  # steps. diffOf alone reads four; the resulting patch could mix trees.
-  # LLM.sync returns ID! @expectedType(LLM), which Dang forces at the call
-  # site and re-hydrates through node(id:) (hack/designs/async-agents.md §9),
-  # so the read happens exactly once and every later selection replays the
-  # lookup instead.
-  #
-  # The flip side: this FORCES, where the old chain only built a query, so a
-  # snapshot failure now surfaces here rather than at the harvest tool's own
-  # forcing point. Deliberate — reading a live member's snapshot does not
-  # fail in practice, and locating it earlier beats a torn harvest.
+  # steps; the resulting patch could mix trees. LLM.sync returns ID!
+  # @expectedType(LLM), which Dang forces at the call site and re-hydrates
+  # through node(id:) (hack/designs/async-agents.md §9), so the read happens
+  # exactly once and every later selection replays the lookup instead.
   let workerWorkspace(name: String!): Workspace! {
     member(name).snapshot.sync.workspace
-  }
-
-  let repository(source: Workspace!): GitRepository! {
-    source.git.head.asRepository
-  }
-
-  # Native commit changes handle root commits and first-parent merge diffs.
-  let commitChanges(source: Workspace!, sha: String!): Changeset! {
-    repository(source).commit(id: sha).changes
-  }
-
-  # Only pullPending's computed drift paths need literal matching. Public
-  # diff filters accept native globs and bypass this escaping entirely.
-  let scopeLiteralChanges(changes: Changeset!, paths: [String!]!): Changeset! {
-    if (paths.isEmpty or paths.any { p => Path(p) == Path(".") }) {
-      return changes
-    }
-    let include = paths.map { p =>
-      Path(p).string
-        .replace("\\", "\\\\")
-        .replace("*", "\\*")
-        .replace("?", "\\?")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-        .replace("!", "[!]")
-        .rewriteMatches(`\s`) { m => "[" + m.string + "]" }
-    }
-    changes.filter(include: include)
-  }
-
-  # The enum params are declared NULLABLE so the module keeps compiling
-  # whichever nullability a projected record hands back (committer's
-  # renderKind does the same), and every case gets a trailing else arm.
-  let pickLabel(
-    status: WorkspaceCommitPickStatus,
-    reason: WorkspaceCommitPickReason,
-  ): String! {
-    case (status) {
-      WorkspaceCommitPickStatus.PICKABLE => "new"
-      WorkspaceCommitPickStatus.PICKED => "already had"
-      WorkspaceCommitPickStatus.REDUNDANT => "redundant"
-      WorkspaceCommitPickStatus.CONFLICT => "CONFLICT: " + conflictReason(reason)
-      else => "?"
-    }
-  }
-
-  let conflictReason(reason: WorkspaceCommitPickReason): String! {
-    case (reason) {
-      WorkspaceCommitPickReason.DIRTY => "you have uncommitted edits on paths it touches"
-      WorkspaceCommitPickReason.CONTENT => "its patch no longer applies to your tree"
-      else => "unknown reason"
-    }
-  }
-
-  let conflictRecovery(
-    reason: WorkspaceCommitPickReason,
-    name: String!,
-    sha: String!,
-  ): String! {
-    case (reason) {
-      WorkspaceCommitPickReason.DIRTY => `commit or revert your edits on those paths and pull again (keeps ${name}'s authorship), `
-        + `or pullConflicted(name: "${name}", commit: "${sha}") to take it as your own edits`
-
-      WorkspaceCommitPickReason.CONTENT => `pullConflicted(name: "${name}", commit: "${sha}") lands it as uncommitted edits with `
-        + `conflict markers; resolve them and commit it yourself`
-
-      else => `inspect it with diffOf(name: "${name}", commit: "${sha}")`
-    }
-  }
-
-  let short(sha: String!): String! {
-    sha.split("", 8).takeFirst(7).join("")
-  }
-
-  let subject(message: String!): String! {
-    message.split("\n", 2).takeFirst.join("")
-  }
-
-  let pathNote(paths: [String!]!): String! {
-    if (paths.isEmpty) {
-      ""
-    } else {
-      " " + paths.join(", ")
-    }
-  }
-
-  # Nullable: the projected record's fields inherit nullability from the
-  # nullable `changes` field they were selected through.
-  let renderKind(kind: DiffStatKind): String! {
-    case (kind) {
-      DiffStatKind.ADDED => "A"
-      DiffStatKind.MODIFIED => "M"
-      DiffStatKind.REMOVED => "D"
-      DiffStatKind.RENAMED => "R"
-      else => "?"
-    }
   }
 
   # Instructions for the CHIEF agent holding these tools.
@@ -901,41 +481,30 @@ type Staff {
     COMMIT what it finishes: a commit is the clean handoff, and uncommitted
     work is only the fallback.
 
-    Each worker receives a pull-only view of `chief` plus the workers already
-    present when it is spawned. It can inspect and take their committed or
-    pending work, but cannot spawn, steer, or interrupt anyone. The
-    roster is a capability snapshot: hire producers before consumers when a
-    worker should pull directly from another worker; otherwise relay through
-    your own workspace.
+    HARVESTING IS GIT, BY ADDRESS. Each member's committed history is
+    addressable as `dag://staff/members/head?member=<name>`. Pass that
+    address to any tool that takes a GitRef to inspect a worker's commits,
+    cherry-pick them into your workspace, or rebase your own commits onto
+    them — nothing needs pushing. FindArtifacts lists these addresses, and
+    FindArtifacts(dimension: "member") the names.
 
-    Harvesting is how their work reaches you:
+    Each worker sees the same roster — `chief` for you, staff names for its
+    peers — and can inspect and take their work the same way, but cannot
+    spawn, steer, or interrupt anyone. Its roster is live as of your last
+    completed step, so workers you hire later show up for earlier ones too.
 
-    - `logOf` lists a worker's commits, each annotated with what
-      `pull` would do with it; `diffOf` shows one commit's patch, or the
-      worker's uncommitted work.
-    - `pull` takes the commits that apply cleanly, keeping the worker's
-      authorship, message and date; `pullPending` takes the uncommitted
-      remainder, re-anchored on your current tree.
-    - `pullConflicted` is the recovery route for a commit `pull` refused: it
-      lands that commit as uncommitted edits with conflict markers, which
-      you resolve and commit yourself.
+    ESCAPE HATCHES for UNCOMMITTED work, which no git ref reaches — for
+    monitoring and recovery, not the regular route:
 
-    Each member's committed history is also addressable as a git ref:
-    `dag://staff/members/head?member=<name>`. Pass that address to any tool
-    that takes a GitRef — e.g. committer's `rebase(ref:)` to rebase your own
-    commits onto a worker's, `cherryPick(from:)`, `show(from:)`, or
-    `restore(from:)` — instead of pushing branches around.
+    - `pendingOf` shows a worker's uncommitted edits as a diff.
+    - `salvagePending` takes them as your own pending edits, re-anchored on
+      your tree; the worker's authorship is lost. Prefer asking the worker
+      to commit.
 
-    SETTLE BEFORE THE FINAL HARVEST: these tools read the worker's last
-    COMMITTED conversation step, so a mid-turn worker may hold work they
-    cannot see yet. Wait for its idle event (or use `interruptWorker`)
-    before the harvest that matters.
-
-    THE CONFLICT LOOP: `pull`, then read the CONFLICT block. Per entry,
-    either commit or revert your own edits on the named paths and pull again
-    (DIRTY — that keeps the worker's authorship), or `pullConflicted`,
-    resolve the markers and commit it yourself (CONTENT). `logOf` after
-    every round shows what is left.
+    SETTLE BEFORE THE FINAL HARVEST: a member's address and the escape
+    hatches read the worker's last COMMITTED conversation step, so a
+    mid-turn worker may hold work they cannot see yet. Wait for its idle
+    event (or use `interruptWorker`) before the harvest that matters.
   """
 
   # Instructions for each WORKER. Public so tests (and the curious) can read
@@ -965,16 +534,16 @@ type Staff {
     pending edits. Say in your final report what you changed and which
     commits carry it.
 
-    You also have pull-only access to work from agents that existed when you
-    were spawned. Use `chief` for the chief and staff names for older workers.
-    `logOf` and `diffOf` inspect their work; `pull`, `pullPending`, and
-    `pullConflicted` take it into your workspace. Their committed history is
-    also addressable as a git ref, `dag://staff/members/head?member=<name>`,
-    for any tool taking a GitRef — `rebase(ref:)` puts your commits on top of
-    the chief's when it asks you to. You cannot spawn, steer, or
-    interrupt agents. The roster is a frozen capability snapshot, so agents
-    hired after you are not visible directly; the chief can relay their work
-    when needed.
+    THE STAFF'S WORK IS ADDRESSABLE. Each member's committed history is a
+    git ref, `dag://staff/members/head?member=<name>` — `chief` for the
+    chief, staff names for your peers. Pass it to any tool that takes a
+    GitRef to inspect, cherry-pick, or rebase onto that work — e.g. put your
+    commits on top of the chief's when it asks you to. FindArtifacts lists
+    these addresses, and FindArtifacts(dimension: "member") the names. The
+    roster is live as of the chief's last completed step, so peers hired
+    after you show up too. Uncommitted work has no git ref: `pendingOf`
+    (monitor) and `salvagePending` (recover) are escape hatches for a
+    member's uncommitted edits. You cannot spawn, steer, or interrupt agents.
 
     You have one line home: `askChief` delivers a question to the chief and
     returns immediately with the question's ref. The answer arrives later as
@@ -987,10 +556,10 @@ type Staff {
   The exact system prompt spawn composes into a worker with the given staff
   name: workerPrompt plus a closing line carrying the name, so a worker can
   refer to itself the way the chief and its peers address it (attribution
-  headers, the roster, and pull targets all use this name). Public for the
-  same reason as workerPrompt: recordings that replay a worker's
-  conversation must match this text byte for byte, so the interpolation is
-  part of the constant's contract rather than a private spawn detail.
+  headers and the roster use this name). Public for the same reason as
+  workerPrompt: recordings that replay a worker's conversation must match
+  this text byte for byte, so the interpolation is part of the constant's
+  contract rather than a private spawn detail.
   """
   workerPromptFor(name: String!): String! {
     workerPrompt + "\n\n" + `Your staff name is "${name}": the chief and your peers address you by it, and message attribution headers use it.`
@@ -1007,8 +576,7 @@ type Members @collection {
   let staff: Dagger.Staff!
 
   """
-  Staff names, sorted: `chief` for the chief in a worker's view, workers
-  under the names they were spawned with.
+  Staff names, sorted: workers under the names they were spawned with.
   """
   names: [String!]! @keys
 
@@ -1022,7 +590,7 @@ type Members @collection {
   The member with this staff name.
   """
   member(name: String!): Member! @get {
-    Member(name, staff.memberAgent(name))
+    Member(name, agent: staff.memberAgent(name))
   }
 }
 
@@ -1037,11 +605,15 @@ type Member {
   name: String!
 
   # The live handle; private so the Agent API stays off the artifact tree.
-  let agent: Agent!
+  let agent: Agent = null
+  # Or, in a worker's roster, the same member as the chief's live roster
+  # holds it: a worker reaches the chief's collection, not its handles.
+  let via: Dagger.StaffMember = null
 
-  new(name: String!, agent: Agent!) {
+  new(name: String!, agent: Agent = null, via: Dagger.StaffMember = null) {
     self.name = name
     self.agent = agent
+    self.via = via
     self
   }
 
@@ -1050,7 +622,11 @@ type Member {
   """
   state: AgentState! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): projects live runtime state.
-    agent.state
+    let handle = agent
+    if (handle == null) {
+      return delegate.state
+    }
+    handle.state
   }
 
   """
@@ -1059,8 +635,21 @@ type Member {
   """
   workspace: Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): the snapshot advances as the agent runs. `sync` pins the
-    # read to one snapshot, as workerWorkspace does for the harvest tools.
-    agent.snapshot.sync.workspace
+    # read to one snapshot, as workerWorkspace does for the escape hatches.
+    let handle = agent
+    if (handle == null) {
+      return delegate.workspace
+    }
+    handle.snapshot.sync.workspace
+  }
+
+  # The chief's own entry for a member reached through a worker's roster.
+  let delegate: Dagger.StaffMember! {
+    let other = via
+    if (other == null) {
+      raise `staff member "${name}" has no agent`
+    }
+    other
   }
 
   """
@@ -1076,114 +665,87 @@ type Member {
 }
 
 """
-Pull-only access to another agent's workspace.
+A worker's view of the staff: the roster and the escape hatches for
+uncommitted work.
 
 Workers receive this narrow tool object instead of Staff itself, so they can
-inspect and take work without gaining orchestration capabilities such as spawn,
-steering, or interruption.
+inspect and take any member's work without gaining orchestration
+capabilities such as spawn, steering, or interruption.
 """
-type PullTools {
-  # A frozen Staff roster containing the chief and workers that already existed
-  # when this worker was spawned. Private so the full Staff object never enters
-  # the tool schema.
-  let staff: Dagger.Staff!
+type Peers {
+  # The chief's live handle. Private so the Agent API never enters the tool
+  # schema; the roster is derived from it on every read.
+  let chief: Agent!
+  # This worker's own staff name, left out of its roster.
+  let name: String!
 
-  new(staff: Dagger.Staff!) {
-    self.staff = staff
+  new(chief: Agent!, name: String!) {
+    self.chief = chief
+    self.name = name
     self
   }
 
   """
-  The roster as a collection: `chief` and the workers that existed when you
-  were spawned. `dag://staff/members/head?member=<name>` addresses a member's
-  committed history as a GitRef for tools that take one.
+  The staff roster as a collection: `chief`, and the workers in the chief's
+  roster as of its last completed step — including workers hired after you.
+  `dag://staff/members/head?member=<name>` addresses a member's committed
+  history as a GitRef for tools that take one.
   """
-  members: Dagger.StaffMembers! {
-    staff.members
+  members: PeerMembers! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): the chief's roster grows as it spawns workers; a cached
+    # result would freeze it at the first read.
+    #
+    # The chief's last committed step is its conversation, whose bound Staff
+    # holds the live roster; LLM.artifacts reaches that tool object's
+    # `members` collection at its current value. `sync` pins one snapshot.
+    # A chief without staff tools (e.g. a hand-built fixture) has no roster
+    # beyond itself; `chief` stays reachable either way.
+    let roster: Dagger.StaffMembers = chief.snapshot.sync
+      .artifacts(include: ["staff/members"])
+      .filterUri(uri: "dag+staff-members://staff/members")
+      .one.value.{{... on Dagger.StaffMembers!}} rescue {
+        e: Error => null
+      }
+    let workers = if (roster == null) { [] } else { roster.keys }
+    PeerMembers(chief, roster, ["chief"] + workers.filter { n => n != name })
   }
 
   """
-  List an agent's commits, oldest first, and show which can be pulled.
+  Escape hatch for an agent's UNCOMMITTED edits. For committed work, use git
+  tools with `dag://staff/members/head?member=<name>`.
 
-  Use `chief` for the chief agent; workers keep their staff names.
+  Monitor: show what a member — `chief` or a peer — has changed but not
+  committed, as a per-file summary followed by a Git-compatible unified
+  diff. Reads its last committed conversation step.
   """
-  logOf(
-    source: Workspace!,
+  pendingOf(
     """
-    The source agent's name.
-    """
-    name: String!,
-    """
-    Maximum number of commits to show, counting back from the newest.
-    """
-    limit: Int! = 10,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    staff.logOf(source: source, name: name, limit: limit)
-  }
-
-  """
-  Show an agent's commit or uncommitted work as a unified diff.
-  """
-  diffOf(
-    source: Workspace!,
-    """
-    The source agent's name.
+    The member's name: `chief`, or a peer's staff name.
     """
     name: String!,
     """
     Glob patterns to include (e.g. "src/**" or "**/*.go"), relative to the
-    source workspace root. Empty shows everything.
+    workspace root. Empty shows everything.
     """
     paths: [String!]! = [],
-    """
-    A commit to show. Omit to show uncommitted work.
-    """
-    commit: String = null,
   ): String! @cache(policy: FunctionCachePolicy.Never) {
-    staff.diffOf(source: source, name: name, paths: paths, commit: commit)
+    # @cache(Never): reads a live snapshot, which is not part of this call's
+    # arguments.
+    pendingReport(members.member(name).workspace, name, paths)
   }
 
   """
-  Pull an agent's commits into your workspace, preserving authorship.
-  """
-  pull(
-    source: Workspace!,
-    """
-    The source agent's name.
-    """
-    name: String!,
-    """
-    Commits to pull, as full or short SHAs from logOf. Empty takes all new.
-    """
-    commits: [String!]! = [],
-  ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
-    staff.pull(source: source, name: name, commits: commits)
-  }
+  Escape hatch for an agent's UNCOMMITTED edits. For committed work, use git
+  tools with `dag://staff/members/head?member=<name>`.
 
+  Recover: take a member's uncommitted work as your own pending edits,
+  re-anchored on your workspace's current content; its authorship is lost.
+  Fails when you both edited the same part of a file, unless `markers: true`.
   """
-  Apply one conflicting commit as uncommitted edits with conflict markers.
-  """
-  pullConflicted(
+  salvagePending(
     source: Workspace!,
     """
-    The source agent's name.
-    """
-    name: String!,
-    """
-    The commit to take, as a full or short SHA from logOf.
-    """
-    commit: String!,
-  ): Changeset! @cache(policy: FunctionCachePolicy.Never) {
-    staff.pullConflicted(source: source, name: name, commit: commit)
-  }
-
-  """
-  Take an agent's uncommitted work as edits in your workspace.
-  """
-  pullPending(
-    source: Workspace!,
-    """
-    The source agent's name.
+    The member's name: `chief`, or a peer's staff name.
     """
     name: String!,
     """
@@ -1191,7 +753,52 @@ type PullTools {
     """
     markers: Boolean! = false,
   ): Changeset! @cache(policy: FunctionCachePolicy.Never) {
-    staff.pullPending(source: source, name: name, markers: markers)
+    # @cache(Never): reads a live snapshot, which is not part of this call's
+    # arguments.
+    salvage(source, members.member(name).workspace, name, markers)
+  }
+}
+
+"""
+A worker's roster as a collection: `chief` and its peers by staff name.
+Selected by address as `dag://staff/members?member=<name>`, like the chief's.
+"""
+type PeerMembers @collection {
+  # Private so the Agent API and the chief's Staff stay out of the
+  # collection's schema.
+  let chief: Agent!
+  # The chief's live roster; null when its conversation binds no Staff.
+  let roster: Dagger.StaffMembers
+
+  """
+  `chief`, then the chief's workers, sorted, except yourself.
+  """
+  names: [String!]! @keys
+
+  new(chief: Agent!, roster: Dagger.StaffMembers, names: [String!]!) {
+    self.chief = chief
+    self.roster = roster
+    self.names = names
+    self
+  }
+
+  """
+  The member with this staff name.
+  """
+  member(name: String!): Member! @get {
+    if (!names.contains(name)) {
+      raise `no staff member named "${name}" in your roster; current members: ${names.join(", ")}`
+    }
+    if (name == "chief") {
+      return Member("chief", agent: chief)
+    }
+    let live = roster
+    if (live == null) {
+      raise `no staff member named "${name}": the chief has no roster`
+    }
+    # A local Member wrapping the chief's entry, not that entry itself: the
+    # item type names the collection's dimension, which must stay `member`.
+    Member(name, via: live.get(key: name))
   }
 }
 
@@ -1225,5 +832,114 @@ type ChiefLine {
     `question ${msg.ref} delivered to the chief. The answer will arrive as `
       + `a "[reply from agent ...]" message — keep working, or end your turn `
       + `to wait for it.`
+  }
+}
+
+# ------------------------------------------------------------ escape hatches
+# Shared by the chief's Staff and a worker's Peers; `theirs` is the member's
+# workspace as of one pinned snapshot.
+
+# pendingOf: a member's uncommitted work as a summary plus patch.
+let pendingReport(theirs: Workspace!, name: String!, paths: [String!]!): String! {
+  let changes = theirs.git.uncommitted.filter(include: paths)
+  let scopedStats = changes.diffStats.{{kind, addedLines, removedLines, path}}
+  if (scopedStats.isEmpty) {
+    return `"${name}" has no uncommitted changes`
+      + (if (paths.isEmpty) { "." } else { " under the given paths." })
+      + "\n\n" + `What it committed is at dag://staff/members/head?member=${name}, `
+      + "for any tool that takes a GitRef."
+  }
+  let summary = scopedStats.map { s =>
+    `${renderKind(s.kind)}  +${toString(s.addedLines)}  -${toString(s.removedLines)}  ${s.path}`
+  }.join("\n")
+  let scoped = changes.asPatch.contents
+  let patchBlock = if (scoped == "") { "" } else { "\n\n" + scoped }
+  `Uncommitted work in "${name}"'s workspace:` + "\n\n" + summary + patchBlock
+}
+
+# salvagePending: a member's uncommitted work, re-anchored on `source`.
+let salvage(source: Workspace!, theirs: Workspace!, name: String!, markers: Boolean!): Changeset! {
+  let base = source.directory("/")
+
+  # Re-anchoring, and the reason the naive version fails in the COMMON
+  # case: the worker inherited your pending edits at spawn, so its patch
+  # contains hunks you already have, and withPatch is a plain `git apply`
+  # with no 3-way — it rejects an already-applied hunk. Restrict the patch
+  # to the files where the two trees genuinely differ. Partial overlap
+  # INSIDE a file still fails; that is what markers: true is for.
+  # Keep both names of a rename: filtering one side intentionally yields
+  # only an addition or deletion. Drop absent old paths so an empty name
+  # does not select the whole tree.
+  let driftStats = theirs.directory("/").changes(from: base).diffStats.{{path, oldPath}}
+  let drift = driftStats.map { s => s.path }
+    + driftStats.map { s => s.oldPath ?? "" }.filter { p => p != "" }
+  if (drift.isEmpty) {
+    print(`"${name}" has nothing your workspace does not already have.`)
+    return base.changes(from: base)
+  }
+
+  let pending = scopeLiteralChanges(theirs.git.uncommitted, drift).asPatch.contents
+  if (pending == "") {
+    print(`"${name}" has no uncommitted work to take. What it committed is at `
+      + `dag://staff/members/head?member=${name}, for any tool that takes a GitRef.`)
+    return base.changes(from: base)
+  }
+
+  let onConflict = if (markers) {
+    PatchConflict.LEAVE_CONFLICT_MARKERS
+  } else {
+    PatchConflict.FAIL
+  }
+  let delta = base.withPatch(pending, onConflict: onConflict).changes(from: base)
+  # Force the apply here; a swallowed failure would silently discard the
+  # worker's uncommitted work.
+  delta.isEmpty rescue {
+    e: Error => raise `taking "${name}"'s uncommitted work failed: ${e.message}`
+      + (
+        if (markers) {
+          ""
+        } else {
+          ` — you and ${name} edited the same part of the same file; retry with markers: true to resolve it by hand`
+        }
+      )
+  }
+
+  let marked = if (markers) {
+    " Search for conflict markers (<<<<<<<) and resolve them."
+  } else {
+    ""
+  }
+  print(`Took "${name}"'s uncommitted work as your own pending edits.` + marked)
+  delta
+}
+
+# Only salvage's computed drift paths need literal matching. Public diff
+# filters accept native globs and bypass this escaping entirely.
+let scopeLiteralChanges(changes: Changeset!, paths: [String!]!): Changeset! {
+  if (paths.isEmpty or paths.any { p => Path(p) == Path(".") }) {
+    return changes
+  }
+  let include = paths.map { p =>
+    Path(p).string
+      .replace("\\", "\\\\")
+      .replace("*", "\\*")
+      .replace("?", "\\?")
+      .replace("[", "\\[")
+      .replace("]", "\\]")
+      .replace("!", "[!]")
+      .rewriteMatches(`\s`) { m => "[" + m.string + "]" }
+  }
+  changes.filter(include: include)
+}
+
+# Nullable: the projected record's fields inherit nullability from the
+# nullable `changes` field they were selected through.
+let renderKind(kind: DiffStatKind): String! {
+  case (kind) {
+    DiffStatKind.ADDED => "A"
+    DiffStatKind.MODIFIED => "M"
+    DiffStatKind.REMOVED => "D"
+    DiffStatKind.RENAMED => "R"
+    else => "?"
   }
 }

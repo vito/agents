@@ -1,7 +1,11 @@
-"""Exercise staff harvesting without model calls or writes to the user's checkout.
+"""Exercise staff's escape hatches without model calls or writes to the user's checkout.
 
 Run from the agents repository: dagger-dev run python3 staff/tests/integration.py
 Requires an engine with both Agent and frozen Workspace Git APIs.
+
+Committed work is harvested with git tools by address
+(dag://staff/members/head?member=<name>); agents-dev's committer checks cover
+that. This script covers the uncommitted half: pendingOf and salvagePending.
 """
 
 import base64
@@ -56,20 +60,15 @@ def roster(ws):
                  '{ id } } }', agent=agent)["staff"]["withWorker"]["id"]
 
 
-def harvest(staff, ws, field, args="", selection=""):
+def pending_of(staff, args=""):
+    return query('query($staff: ID!) { node(id: $staff) { ... on Staff { '
+                 'pendingOf(name: "worker"' + args + ') } } }', staff=staff)["node"]["pendingOf"]
+
+
+def salvage(staff, ws, selection, args=""):
     return query('query($staff: ID!, $ws: ID!) { node(id: $staff) { ... on Staff { '
-                 + field + '(source: $ws, name: "worker"' + args + ') ' + selection
-                 + ' } } }', staff=staff, ws=ws)["node"][field]
-
-
-def expect_error(fragment, action):
-    try:
-        action()
-    except RuntimeError as error:
-        if fragment is not None:
-            assert fragment in str(error), str(error)
-    else:
-        raise AssertionError(f"expected error containing {fragment!r}")
+                 'salvagePending(source: $ws, name: "worker"' + args + ') ' + selection
+                 + ' } } }', staff=staff, ws=ws)["node"]["salvagePending"]
 
 
 def main():
@@ -90,64 +89,39 @@ def main():
         base = query('query($path: String!) { host { directory(path: $path) '
                      '{ asGit { head { asWorkspace { id } } } } } }', path=fixture)["host"]["directory"]["asGit"]["head"]["asWorkspace"]["id"]
         worker = commit(edit(base, "file.txt", "worker\n"), "worker change")
-        worker_sha = workspace_field(worker, "git { head { commitSHA } }")["git"]["head"]["commitSHA"]
-        staff = roster(worker)
 
-        log = harvest(staff, base, "logOf")
-        assert worker_sha[:7] in log and "1 new" in log, log
-        assert "staged" not in log, log
-        patch = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha[:7]))
-        assert "-base" in patch and "+worker" in patch and "worker change" in patch, patch
-        assert f"commit {worker_sha}\n" in patch, patch
-        assert harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha)) == patch
-        root_patch = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(root_sha))
-        assert "+base" in root_patch and "root fixture" in root_patch, root_patch
-        scoped = harvest(staff, base, "diffOf", ', commit: ' + json.dumps(worker_sha) + ', paths: ["other.txt"]')
-        assert "no changes under the given paths" in scoped, scoped
-        expect_error("limit must be positive", lambda: harvest(staff, base, "logOf", ", limit: 0"))
-        # Commit validation belongs to the engine; do not pin its error wording.
-        for invalid in ("", "not-a-sha"):
-            expect_error(None, lambda: harvest(staff, base, "pull", ', commits: ' + json.dumps([invalid]), '{ id }'))
-            expect_error(None, lambda: harvest(staff, base, "diffOf", ', commit: ' + json.dumps(invalid)))
-            expect_error(None, lambda: harvest(staff, base, "pullConflicted", ', commit: ' + json.dumps(invalid), '{ id }'))
+        # Committed-only work: nothing pending, and the hatch points at the address.
+        committed_staff = roster(worker)
+        clean = pending_of(committed_staff)
+        assert "no uncommitted changes" in clean, clean
+        assert "dag://staff/members/head?member=worker" in clean, clean
+        assert salvage(committed_staff, worker, "{ isEmpty }")["isEmpty"]
 
-        pulled = harvest(staff, base, "pull", selection="{ id git { head { commitSHA } } }")
-        assert pulled["git"]["head"]["commitSHA"] == worker_sha, pulled
-        again = harvest(staff, pulled["id"], "pull", selection="{ git { head { commitSHA } } }")
-        assert again["git"]["head"]["commitSHA"] == worker_sha, again
-        no_new = harvest(staff, pulled["id"], "logOf")
-        assert "no new commits" in no_new, no_new
-
-        chief = commit(edit(base, "chief.txt", "chief\n"), "chief change")
-        divergent = harvest(staff, chief, "pull", ', commits: ' + json.dumps([worker_sha[:7]]), '{ id }')["id"]
-        assert workspace_field(divergent, 'file(path: "/file.txt") { contents }')["file"]["contents"] == "worker\n"
-        assert workspace_field(divergent, 'file(path: "/chief.txt") { contents }')["file"]["contents"] == "chief\n"
-        duplicate = harvest(staff, divergent, "pull", selection="{ id }")["id"]
-        assert workspace_field(duplicate, "git { head { commitSHA } }") == workspace_field(divergent, "git { head { commitSHA } }")
-
-        conflict = commit(edit(base, "file.txt", "chief conflict\n"), "chief conflict")
-        assert "CONFLICT" in harvest(staff, conflict, "logOf")
-        refused = harvest(staff, conflict, "pull", selection="{ git { head { commitSHA } } }")
-        assert refused == workspace_field(conflict, "git { head { commitSHA } }")
-        recovered = harvest(staff, conflict, "pullConflicted", ', commit: ' + json.dumps(worker_sha[:7]), '{ asPatch { contents } }')
-        assert "<<<<<<<" in recovered["asPatch"]["contents"], recovered
-
-        pending_staff = roster(edit(worker, "pending.txt", "unfinished\n"))
-        committed_only = harvest(pending_staff, base, "pull", selection="{ id git { uncommitted { isEmpty } } }")
-        assert committed_only["git"]["uncommitted"]["isEmpty"], committed_only
-        pending_diff = harvest(pending_staff, worker, "diffOf")
+        pending_staff = roster(edit(edit(worker, "pending.txt", "unfinished\n"), "file.txt", "worker pending\n"))
+        pending_diff = pending_of(pending_staff)
         assert "pending.txt" in pending_diff and "+unfinished" in pending_diff, pending_diff
-        pending = harvest(pending_staff, worker, "pullPending", selection="{ asPatch { contents } }")
+        assert "no uncommitted changes" in pending_of(pending_staff, ', paths: ["other/**"]')
+        pending = salvage(pending_staff, worker, "{ asPatch { contents } }")
         assert "+unfinished" in pending["asPatch"]["contents"], pending
-        empty = harvest(staff, worker, "pullPending", selection="{ isEmpty }")
-        assert empty["isEmpty"], empty
-        dirty = edit(base, "local.txt", "keep my uncommitted work\n")
-        with_dirty = harvest(staff, dirty, "pull", selection="{ id }")["id"]
-        assert workspace_field(with_dirty, 'file(path: "/local.txt") { contents }')["file"]["contents"] == "keep my uncommitted work\n"
-        assert workspace_field(with_dirty, "git { uncommitted { diffStats { path } } }")["git"]["uncommitted"]["diffStats"] == [{"path": "local.txt"}]
+        assert "+worker pending" in pending["asPatch"]["contents"], pending
+        # Overlapping edits fail unless markers are asked for.
+        conflict = edit(worker, "file.txt", "mine\n")
+        expect_error("markers: true", lambda: salvage(pending_staff, conflict, "{ isEmpty }"))
+        marked = salvage(pending_staff, conflict, "{ asPatch { contents } }", ", markers: true")
+        assert "<<<<<<<" in marked["asPatch"]["contents"], marked
         assert git("rev-parse", "HEAD") == root_sha
         assert git("status", "--porcelain") == ""
-    print("PASS: log, root/ordinary/scoped diffs, validation, fast-forward/cherry-pick, duplicate/conflicting pulls, conflict recovery and pending edits")
+    print("PASS: pendingOf summaries/scoping, salvagePending re-anchoring, conflicts and markers")
+
+
+def expect_error(fragment, action):
+    try:
+        action()
+    except RuntimeError as error:
+        if fragment is not None:
+            assert fragment in str(error), str(error)
+    else:
+        raise AssertionError(f"expected error containing {fragment!r}")
 
 
 if __name__ == "__main__":

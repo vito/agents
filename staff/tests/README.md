@@ -1,4 +1,4 @@
-# Harvesting regression checks
+# Escape-hatch regression checks
 
 From the agents repository, run:
 
@@ -8,19 +8,16 @@ dagger-dev run python3 staff/tests/integration.py
 
 The engine must provide both the asynchronous Agent API and the frozen
 Workspace Git API. The script serves the current staff module and exercises
-its public harvesting methods with real agent handles and frozen workspaces.
-It never starts an agent turn or calls a model, pushes, or exports. The only
-host Git commits are in an automatically cleaned-up temporary fixture.
+its escape hatches for UNCOMMITTED work — `pendingOf` and `salvagePending` —
+with real agent handles and frozen workspaces. It never starts an agent turn
+or calls a model, pushes, or exports. The only host Git commits are in an
+automatically cleaned-up temporary fixture.
 
-Coverage includes commit-plan metadata, root/ordinary/scoped patches, input
-validation, fast-forward and divergent cherry-pick integration, duplicate
-pulls, conflict refusal/recovery, and ordinary uncommitted work. Expected
-validation failures appear as error spans even when the script passes.
+Coverage includes pending summaries and path scoping, the pointer to a
+member's address when nothing is pending, re-anchored salvage, and overlap
+failures with and without conflict markers. Expected validation failures
+appear as error spans even when the script passes.
 
-Staff uses real Git history, not a separate staged-commit list. Integration
-keeps the engine's 100-commit default bound; full and abbreviated SHAs are
-resolved by the engine without a module-side history scan. Commit patches
-use GitCommit.changes, against the first parent (or an empty tree for root
-commits). Merge commits can be inspected, but conflict recovery refuses
-to flatten them implicitly.
-There is no separate `unmanaged`/gitignored-file harvesting path.
+Committed work is not staff's concern: each member's history is the GitRef
+at `dag://staff/members/head?member=<name>`, harvested with git tools. The
+agents-dev `committer-refs` and `staff-*` checks cover that path.
