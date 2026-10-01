@@ -230,6 +230,20 @@ let checkCommitterRefs: String! {
   assert { conflicted.git.head.commitSHA == feature.git.head.commitSHA }
   let again = committer.cherryPick(source: picked, from: upstream)
   assert { again.git.head.commitSHA == ontoSha }
+  # Off a sibling branch the pick is not a fast-forward: the commit that lands
+  # is new, and log(base:) — what cherryPick reports — lists exactly it.
+  let sibling = fixture.tag("clean").asWorkspace
+  let siblingSha = sibling.git.head.commitSHA
+  # One selection, so the never-cached pick runs once for every read.
+  let replayed = committer.cherryPick(source: sibling, from: upstream).git.head.{{
+    sha: commitSHA,
+    targetCommit.{{parentShas}},
+    reported: log(limit: 1000, base: sibling.git.head).{{sha, message}}
+  }}
+  assert { replayed.sha != ontoSha }
+  assert { replayed.targetCommit.parentShas == [siblingSha] }
+  assert { replayed.reported.map { c => c.sha } == [replayed.sha] }
+  assert { replayed.reported.map { c => c.message.trimSpace } == ["fixture: upstream change"] }
 
   # log(from:) is the plan: the ref's commits HEAD lacks, oldest first, each
   # annotated with what cherryPick would do, and conflicts pointing at the
