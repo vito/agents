@@ -36,13 +36,15 @@
 #     object, like `reset`'s saved workspaces, and reaches the next call
 #     through the returned LLM.
 #   * Refs by ADDRESS: `rebase(ref:)`, `cherryPick(from:)` and the `from:`
-#     of show/fileAt/restore take a GitRef, which the tool layer lifts from
-#     an address string — a git URL with a fragment, or a workspace artifact.
-#     Two collections make agent history addressable that way: staff's
-#     `members` (dag://staff/members/head?member=<name>) and this module's
-#     `saved` (dag://committer/saved/head?saved-workspace=<sha>), so commits
-#     that exist only in another agent's workspace, or that a reset orphaned,
-#     are reachable without pushing anything (vito/agents#21).
+#     of log/show/fileAt/restore take a GitRef, which the tool layer lifts
+#     from an address string — a git URL with a fragment, or any artifact
+#     that is a GitRef, such as another agent's history when a module exposes
+#     it, or this module's `saved` collection
+#     (dag://committer/saved/head?saved-workspace=<sha>). Commits that exist
+#     only in another agent's workspace, or that a reset orphaned, are
+#     reachable without pushing anything (vito/agents#21). `log(from:)` plans
+#     a harvest, `cherryPick(from:)` takes it, and `cherryPick(markers:
+#     true)` lands a conflicting commit as uncommitted edits to resolve.
 """
 Git operations on this workspace: review pending changes, read the checkout's
 history, restore files, commit, reset, cherry-pick, rebase, and push.
@@ -178,11 +180,11 @@ type Committer {
     """
     preview: Boolean! = false,
     """
-    Resolve `ref` in this git ref instead of the checkout: another agent's
-    commits (`dag://staff/members/head?member=<name>`), a workspace a reset
-    left behind (`dag://committer/saved/head?saved-workspace=<sha>`), or any
-    git ref address. With `ref` at its default, restores from that ref's own
-    commit.
+    Resolve `ref` in this git ref instead of the checkout: any GitRef
+    address, including other agents' histories (FindArtifacts lists them) and
+    workspaces a reset left behind
+    (`dag://committer/saved/head?saved-workspace=<sha>`). With `ref` at its
+    default, restores from that ref's own commit.
     """
     from: GitRef = null,
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
@@ -388,19 +390,25 @@ type Committer {
   Cherry-pick commits from another git ref onto HEAD, keeping their
   authorship, message and date.
 
-  `from` is any git ref by address: another agent's commits
-  (`dag://staff/members/head?member=<name>`), a workspace a reset left
-  behind (`dag://committer/saved/head?saved-workspace=<sha>`), or a git URL
-  with a fragment. Without `commits`, every commit on it that HEAD lacks is
-  taken, oldest first; fast-forwarding when possible, so hashes may change.
+  `from` is any GitRef address, including other agents' histories
+  (FindArtifacts lists them), a workspace a reset left behind
+  (`dag://committer/saved/head?saved-workspace=<sha>`), or a git URL with a
+  fragment. Without `commits`, every commit on it that HEAD lacks is taken,
+  oldest first; fast-forwarding when possible, so hashes may change.
+  `log(from:)` shows the plan first.
 
   Applies ONLY what applies cleanly: commits already in HEAD, and commits
   whose content is already present, are skipped, and a commit that conflicts
   is reported rather than forced. Your pending edits survive, but a commit
   touching a path you have edited is a conflict: commit or revert those
-  edits and try again. For a content conflict, `rebase(ref:)` onto the ref
-  instead — it lands each conflict in the tree with markers — or recreate
-  the change by hand from `show(commit:, from:)`.
+  edits and try again.
+
+  For a commit that still conflicts, `markers: true` with exactly that one
+  commit is `git cherry-pick -n`: it applies the commit as UNCOMMITTED edits,
+  with conflict markers where it no longer fits, and prints the original
+  message to reuse. Resolve the markers and commit it yourself — the
+  authorship becomes yours, which is why a plain cherryPick is always worth
+  trying first.
   """
   cherryPick(
     source: Workspace!,
@@ -413,9 +421,20 @@ type Committer {
     always applied in history order. Empty takes everything HEAD lacks.
     """
     commits: [String!]! = [],
+    """
+    Apply exactly one commit (in `commits`) as uncommitted edits, leaving
+    conflict markers where it no longer applies, instead of committing it.
+    """
+    markers: Boolean! = false,
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): the ref may point at a live agent's history, and a
     # later identical call must plan against HEAD as it is then.
+    if (markers) {
+      if (commits.length != 1) {
+        raise "cherryPick: markers: true takes exactly one commit, e.g. commits: [\"<sha>\"]; log(from:) lists them"
+      }
+      return pickWithMarkers(source, from, commits[0] ?? "")
+    }
     let theirs = from.asWorkspace
     let picks = source.compareCommitsFrom(source: theirs, commits: commits, maxCommits: replayBound).{{
       commit.{{sha, message}},
@@ -439,7 +458,8 @@ type Committer {
         + conflicting.map { p =>
           `  ${short(p.commit.sha)} ${subject(p.commit.message)}` + "\n"
             + (if (p.conflictPaths.isEmpty) { "    " } else { `    ${p.conflictPaths.join(", ")}: ` })
-            + pickConflict(p.reason)
+            + pickConflict(p.reason) + "\n"
+            + `    -> ${pickRecovery(p.reason, short(p.commit.sha))}`
         }.join("\n")
     }
     let skippedNote = if (skipped == 0) {
@@ -457,7 +477,7 @@ type Committer {
     let newHead = head(picked).commitSHA rescue {
       e: Error => raise `cherryPick: applying ${toString(pickable.length)} commit(s) failed: ${plainError(e.message)}`
     }
-    print(`Cherry-picked ${toString(pickable.length)} commit(s); HEAD is now ${short(newHead)}:` + "\n"
+    print(`Cherry-picked ${toString(pickable.length)} commit(s); HEAD is now ${short(newHead)}. Picked, by their hashes on the ref:` + "\n"
       + pickable.map { p => `  ${short(p.commit.sha)} ${subject(p.commit.message)}` }.join("\n")
       + skippedNote + conflictBlock)
     picked
@@ -503,12 +523,11 @@ type Committer {
   for you to resolve.
 
   The target is either `onto`, a branch fetched from the checkout's remote,
-  or `ref`, any git ref by address — a git URL with a fragment, or a
-  workspace artifact such as another agent's commits
-  (`dag://staff/members/head?member=chief`). The rebase rewinds to where this
-  branch forked from the target, fast-forwards to its tip, and replays your
-  commits on top — oldest first, authors and dates intact, merge commits
-  left out, commits already on the target dropped.
+  or `ref`, any GitRef address — a git URL with a fragment, or an artifact
+  such as another agent's history (FindArtifacts lists them). The rebase
+  rewinds to where this branch forked from the target, fast-forwards to its
+  tip, and replays your commits on top — oldest first, authors and dates
+  intact, merge commits left out, commits already on the target dropped.
 
   Pass `from` to replay only the commits after it — `git rebase --onto
   <onto> <from>` — when this branch was stacked on another branch that has
@@ -551,9 +570,9 @@ type Committer {
     """
     from: String! = "",
     """
-    The ref to rebase onto, instead of a remote branch: another agent's
-    commits as `dag://staff/members/head?member=<name>`, or any git ref
-    address such as "https://github.com/org/repo#main".
+    The ref to rebase onto, instead of a remote branch: any GitRef address,
+    including other agents' histories (FindArtifacts lists them), or a git
+    URL with a fragment such as "https://github.com/org/repo#main".
     """
     ref: GitRef = null,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
@@ -854,17 +873,24 @@ type Committer {
   Use it to learn how this repository writes commit messages (`full: true`
   prints the bodies), or — with `paths` — to find out who last touched a file
   and why. For one commit's actual patch, use `show`.
+
+  With `from`, it lists another ref's commits instead: the ones HEAD lacks,
+  oldest first, each annotated with what `cherryPick(from:)` would do with
+  it — new, already had, redundant, or CONFLICT with the reason and the
+  paths that obstruct it. This is the plan for taking work from another
+  history, such as another agent's.
   """
   log(
     source: Workspace!,
     """
-    Maximum number of commits to show, newest first.
+    Maximum number of commits to show, newest first. With `from`, counts back
+    from the newest commit of the plan.
     """
     limit: Int! = 20,
     """
     Only show commits touching these Git path patterns, relative to the
     repository root (e.g. "src/**" or "**/*.go"), like `git log -- <paths>`.
-    Empty includes all paths.
+    Empty includes all paths. Not combined with `from`.
     """
     paths: [String!]! = [],
     """
@@ -873,14 +899,29 @@ type Committer {
     reports how many were searched. The pattern is matched against the WHOLE
     message, body included — a commit can match on something its one-line
     subject never mentions, so pass `full: true` to see where the hit is — and
-    `^` anchors to the start of the message, not to each line.
+    `^` anchors to the start of the message, not to each line. Not combined
+    with `from`.
     """
     grep: String = null,
     """
     Print the full message body of every commit, not just the subject.
     """
     full: Boolean! = false,
-  ): String! {
+    """
+    List the commits on this git ref that HEAD lacks, annotated for
+    cherryPick: any GitRef address, including other agents' histories
+    (FindArtifacts lists them).
+    """
+    from: GitRef = null,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): with `from`, the ref may point at a live agent's
+    # history; a later identical call must plan against it as it is then.
+    if (from != null) {
+      if (!paths.isEmpty or grep != null) {
+        raise "log: paths and grep do not combine with from; from lists every commit HEAD lacks"
+      }
+      return logFrom(source, from, limit, full)
+    }
     # One PAST `limit` when there is no grep to widen the walk: the footer's
     # "there is more below" can only be honest if the walk was allowed to find
     # one more commit than the listing prints. `takeFirst(limit)` below drops it
@@ -993,10 +1034,10 @@ type Committer {
     maxLines: Int! = 400,
     """
     Resolve `commit` and `against` in this git ref instead of the checkout:
-    another agent's commits (`dag://staff/members/head?member=<name>`), a
-    workspace a reset left behind
-    (`dag://committer/saved/head?saved-workspace=<sha>`), or any git ref
-    address. With `commit` at its default, shows that ref's own commit.
+    any GitRef address, including other agents' histories (FindArtifacts
+    lists them) and workspaces a reset left behind
+    (`dag://committer/saved/head?saved-workspace=<sha>`). With `commit` at
+    its default, shows that ref's own commit.
     """
     from: GitRef = null,
   ): String! {
@@ -1088,11 +1129,11 @@ type Committer {
     """
     limit: Int! = 400,
     """
-    Resolve `commit` in this git ref instead of the checkout: another agent's
-    commits (`dag://staff/members/head?member=<name>`), a workspace a reset
-    left behind (`dag://committer/saved/head?saved-workspace=<sha>`), or any
-    git ref address. With `commit` at its default, reads at that ref's own
-    commit.
+    Resolve `commit` in this git ref instead of the checkout: any GitRef
+    address, including other agents' histories (FindArtifacts lists them)
+    and workspaces a reset left behind
+    (`dag://committer/saved/head?saved-workspace=<sha>`). With `commit` at
+    its default, reads at that ref's own commit.
     """
     from: GitRef = null,
   ): String! {
@@ -1478,10 +1519,148 @@ type Committer {
   # Why a planned cherry-pick would not apply, in the tool's own words.
   let pickConflict(reason: WorkspaceCommitPickReason): String! {
     case (reason) {
-      WorkspaceCommitPickReason.DIRTY => "you have uncommitted edits on paths it touches; commit or revert them and pick again"
-      WorkspaceCommitPickReason.CONTENT => "its patch no longer applies to HEAD; rebase(ref:) onto the ref lands it with conflict markers"
+      WorkspaceCommitPickReason.DIRTY => "you have uncommitted edits on paths it touches"
+      WorkspaceCommitPickReason.CONTENT => "its patch no longer applies to HEAD"
       else => "unknown reason"
     }
+  }
+
+  # The way forward for a conflicting commit, as the call to make. The ref
+  # is the one already passed as `from`; its address is not recoverable here.
+  let pickRecovery(reason: WorkspaceCommitPickReason, sha: String!): String! {
+    case (reason) {
+      WorkspaceCommitPickReason.DIRTY => "commit or revert your edits on those paths and cherryPick again (keeps the author), "
+        + `or cherryPick(from: <the same ref>, commits: ["${sha}"], markers: true) to take it as your own edits`
+
+      WorkspaceCommitPickReason.CONTENT => `cherryPick(from: <the same ref>, commits: ["${sha}"], markers: true) lands it as `
+        + "uncommitted edits with conflict markers; resolve them and commit it yourself"
+
+      else => `inspect it with show(commit: "${sha}", from: <the same ref>)`
+    }
+  }
+
+  let pickLabel(status: WorkspaceCommitPickStatus, reason: WorkspaceCommitPickReason): String! {
+    case (status) {
+      WorkspaceCommitPickStatus.PICKABLE => "new"
+      WorkspaceCommitPickStatus.PICKED => "already had"
+      WorkspaceCommitPickStatus.REDUNDANT => "redundant"
+      WorkspaceCommitPickStatus.CONFLICT => "CONFLICT: " + pickConflict(reason)
+      else => "?"
+    }
+  }
+
+  # log(from:): the commits on `from` that HEAD lacks, oldest first, each
+  # annotated with what cherryPick would do with it. The plan, not a diff:
+  # no per-file stats, because forcing them for a whole stack to render a
+  # listing is not worth it; show(commit:, from:) has one commit's patch.
+  let logFrom(source: Workspace!, from: GitRef!, limit: Int!, full: Boolean!): String! {
+    if (limit < 1) {
+      raise "log: limit must be positive"
+    }
+    let theirs = from.asWorkspace
+    let picks = source.compareCommitsFrom(source: theirs, maxCommits: replayBound).{{
+      commit.{{sha, authoredDate, authorName, message}},
+      status,
+      reason,
+      conflictPaths
+    }} rescue {
+      e: Error => raise `log: planning against the ref failed: ${plainError(e.message)}`
+    }
+    if (picks.isEmpty) {
+      return rebaseBanner + "HEAD already has every commit on the ref: nothing to cherry-pick."
+    }
+    let newOnes = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
+    let had = picks.filter { p => p.status == WorkspaceCommitPickStatus.PICKED }
+    let redundant = picks.filter { p => p.status == WorkspaceCommitPickStatus.REDUNDANT }
+    let conflicting = picks.filter { p => p.status == WorkspaceCommitPickStatus.CONFLICT }
+    let header = `${toString(picks.length)} commit(s) on the ref that HEAD lacks, oldest first: `
+      + `${toString(newOnes.length)} new, ${toString(had.length)} already had, `
+      + `${toString(redundant.length)} redundant, ${toString(conflicting.length)} conflicting`
+    let shown = picks.takeLast(limit)
+    let entries = shown.map { p =>
+      let paths = if (p.conflictPaths.isEmpty) { "" } else { " " + p.conflictPaths.join(", ") }
+      let line = `${short(p.commit.sha)}  ${when(p.commit.authoredDate)}  ${p.commit.authorName}  [${pickLabel(p.status, p.reason)}${paths}]`
+      if (full) {
+        line + "\n" + indent(clampLines(
+          p.commit.message.trimSpace,
+          messageLines,
+          `(message truncated — show(commit: "${short(p.commit.sha)}", from: <the same ref>) for all of it)`,
+        ))
+      } else {
+        line + "\n" + indent(subject(p.commit.message))
+      }
+    }
+    let omitted = picks.length - shown.length
+    let truncation = if (omitted > 0) {
+      "\n\n" + `(${toString(omitted)} older commit(s) not shown; raise limit to see them)`
+    } else {
+      ""
+    }
+    let recovery = if (conflicting.isEmpty) {
+      ""
+    } else {
+      "\n\n" + conflicting.map { p => `${short(p.commit.sha)}: ${pickRecovery(p.reason, short(p.commit.sha))}` }.join("\n")
+    }
+    let next = if (newOnes.isEmpty) {
+      ""
+    } else {
+      "\n\n" + "cherryPick(from: <the same ref>) takes the new ones, authorship intact; show(commit:, from:) reads one first."
+    }
+    rebaseBanner + header + "\n\n" + entries.join("\n\n") + truncation + recovery + next
+  }
+
+  # cherryPick(markers: true): land one commit of `from` on the working tree
+  # as uncommitted edits — `git cherry-pick -n` — with conflict markers
+  # where it no longer fits. Deliberately never a commit: a commit must not
+  # be recorded with markers inside it, so the resolution is the agent's own.
+  let pickWithMarkers(source: Workspace!, from: GitRef!, spec: String!): Workspace! {
+    if (spec.trimSpace == "") {
+      raise "cherryPick: name the commit to apply with markers, e.g. commits: [\"<sha>\"]"
+    }
+    let sha = resolveSpecIn(from, spec)
+    let theirs = from.asWorkspace
+    let target = from.asRepository.commit(id: sha).{{message, authorName, parentShas}}
+    if (target.parentShas.length > 1) {
+      raise `cherryPick: ${short(sha)} is a merge commit; inspect its first-parent diff with show(commit: "${short(sha)}", from:) and integrate it by hand`
+    }
+    if (target.parentShas.isEmpty) {
+      raise `cherryPick: ${short(sha)} is a root commit with no parent to merge from; restore(from:) its files instead`
+    }
+    let planned = source.compareCommitsFrom(source: theirs, commits: [sha], maxCommits: replayBound).{{status}} rescue {
+      e: Error => raise `cherryPick: planning against the ref failed: ${plainError(e.message)}`
+    }
+    if (planned.isEmpty or planned.any { p => p.status == WorkspaceCommitPickStatus.PICKED }) {
+      print(`HEAD already has ${short(sha)}; nothing to apply.`)
+      return source
+    }
+    # Advisory, not a refusal: a commit that applies cleanly is better taken
+    # by a plain cherryPick, which keeps its authorship.
+    let clean = planned.any { p => p.status == WorkspaceCommitPickStatus.PICKABLE }
+    # The same three-way landing a stopped rebase uses: hunks land where the
+    # code has moved to, with markers showing both sides.
+    let landed = landConflict(theirs, source, sha)
+    if (landed == null) {
+      raise `cherryPick: commit ${short(sha)} could not be applied to your tree, not even with conflict markers `
+        + "(git refuses to create a file your tree already has — if that is your own uncommitted work, commit or revert it and "
+        + `cherryPick(from: <the same ref>, commits: ["${short(sha)}"]) instead; otherwise recreate it from show(commit: "${short(sha)}", from:))`
+    }
+    let marked = conflictedFiles(landed.git.uncommitted.asPatch.contents)
+    let todo = if (marked.isEmpty) {
+      "It applied without conflicts: review it with diff, then commit it yourself."
+    } else {
+      `Conflict markers in ${marked.join(", ")}: between <<<<<<< and ======= is your side, `
+        + "between ======= and >>>>>>> is the commit's. Resolve them, then commit it yourself."
+    }
+    let note = if (clean) {
+      "\n\n" + `NOTE: this commit applies cleanly — cherryPick(from: <the same ref>, commits: ["${short(sha)}"]) without markers `
+        + `would commit it with ${target.authorName}'s authorship intact. Prefer that unless you meant to make it yours.`
+    } else {
+      ""
+    }
+    print(`Applied ${short(sha)} "${subject(target.message)}" as UNCOMMITTED edits; HEAD unchanged. ` + todo + "\n\n"
+      + "Original message, to reuse:" + "\n"
+      + indent(target.message.trimSpace) + note)
+    landed
   }
 
   # Resolve a spec inside a ref given by address: HEAD (or empty) is the ref's
@@ -1738,15 +1917,17 @@ type Committer {
       (`git rebase --onto <onto> <from>`).
     - `cherryPick` — take commits from another ref (`from:`, by address)
       onto HEAD with their authorship intact; without `commits` it takes
-      every commit HEAD lacks. Conflicting commits are reported, not forced:
-      rebase onto the ref instead, or recreate the change from `show`.
+      every commit HEAD lacks. Conflicting commits are reported, not forced;
+      `markers: true` with one commit applies it as uncommitted edits with
+      conflict markers instead (see HARVESTING below).
     - `push` — publish committed history to the checkout's remote. Pending
       changes are not pushed: commit first. A rejected push (the remote
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
       hatch, for when overwriting the remote is genuinely intended.
     - `log` — commits newest first. Pass `paths` to see who last touched a
       file and why, `grep` to search commit messages, and `full: true` to
-      print full message bodies.
+      print full message bodies. With `from:`, it lists another ref's
+      commits that HEAD lacks instead, annotated for cherryPick.
     - `show` — one commit in full: metadata, message, per-file stats and the
       patch. Takes "HEAD", a short hash from `log`, or a tag; `against` turns
       it into a comparison between two commits.
@@ -1754,14 +1935,33 @@ type Committer {
       you deleted or seeing what a file looked like before a change.
 
     REFS BY ADDRESS: `rebase(ref:)`, `cherryPick(from:)`, and the `from:`
-    argument of `show`, `fileAt` and `restore` take a git ref as an address
-    string — another agent's commits (`dag://staff/members/head?member=<name>`
-    when you have a staff), a workspace a `reset` left behind
+    argument of `log`, `show`, `fileAt` and `restore` take a git ref as an
+    address string — any GitRef address, including other agents' histories
+    (FindArtifacts lists them), a workspace a `reset` left behind
     (`dag://committer/saved/head?saved-workspace=<sha>`; `reset` prints the
     address, and `saved` lists them), or a git URL with a fragment such as
-    "https://github.com/org/repo#main". This is how to rebase onto or take
-    commits that exist only in another agent's workspace, or reach commits a
-    reset orphaned, without pushing anything.
+    "https://github.com/org/repo#main". This is how to read, take, or rebase
+    onto commits that exist only in another agent's workspace, or reach
+    commits a reset orphaned, without pushing anything.
+
+    HARVESTING commits from another ref:
+
+    1. `log(from:)` lists the commits HEAD lacks, oldest first, each marked
+       new, already had, redundant, or CONFLICT with the reason;
+       `show(commit:, from:)` reads one.
+    2. `cherryPick(from:)` takes everything that applies cleanly, keeping
+       authorship, and reports the rest. Run `log(from:)` again after each
+       round to see what is left.
+    3. Per CONFLICT: if your own uncommitted edits are in the way, commit or
+       revert them and cherryPick again (the author is kept). Otherwise
+       `cherryPick(from:, commits: [<sha>], markers: true)` lands that commit
+       as uncommitted edits with conflict markers: resolve them, then
+       `commit` it yourself, reusing the printed message.
+    4. To put your own commits on top of that history instead of taking it
+       into yours, `rebase(ref:)` onto it.
+
+    A history read by address reflects its owner's last completed step:
+    work still in flight there is not visible yet.
 
     The A/M/D/R marks in `status` describe each path relative to the last
     commit, not `git status`'s index model — there is no staging area here,
