@@ -477,8 +477,14 @@ type Committer {
     let newHead = head(picked).commitSHA rescue {
       e: Error => raise `cherryPick: applying ${toString(pickable.length)} commit(s) failed: ${plainError(e.message)}`
     }
-    print(`Cherry-picked ${toString(pickable.length)} commit(s); HEAD is now ${short(newHead)}. Picked, by their hashes on the ref:` + "\n"
-      + pickable.map { p => `  ${short(p.commit.sha)} ${subject(p.commit.message)}` }.join("\n")
+    # Report what actually landed: a non-fast-forward pick makes new commits,
+    # whose hashes differ from the ref's. log() lists newest first.
+    let landed = head(picked).log(limit: replayBound, base: head(source)).{{sha, message}} rescue {
+      e: Error => raise `cherryPick: listing the picked commits failed: ${plainError(e.message)}`
+    }
+    let oldestFirst = landed.map { c => `  ${short(c.sha)} ${subject(c.message)}` }.reduce([] :: [String!]!) { acc, line => [line] + acc }
+    print(`Cherry-picked ${toString(landed.length)} commit(s), oldest first; HEAD is now ${short(newHead)}:` + "\n"
+      + oldestFirst.join("\n")
       + skippedNote + conflictBlock)
     picked
   }
