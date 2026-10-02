@@ -410,17 +410,49 @@ type Browser {
     result(run).file(path)
   }
 
+  # Model APIs reject images with a side over 8000px, and over 2000px once a
+  # request carries many images, so full-page captures can poison the whole
+  # conversation. 1568px is the largest edge models see without downscaling.
+  let maxImageEdge = 1568
+  let maxImageTiles = 8
+
+  # Shrinks wide images to maxImageEdge and slices tall ones into top-to-bottom
+  # tiles, keeping at most maxImageTiles. /total records the uncapped count.
+  let viewable(image: File!): Container! {
+    let edge = toString(maxImageEdge)
+    let script = [
+      "mkdir -p /out",
+      "magick /in/image -resize '" + edge + "x>' +repage -crop " + edge + "x" + edge + " +repage /out/tile-%03d.png",
+      "ls /out | wc -l | tr -d ' \\n' > /total",
+      "ls /out | sort | tail -n +" + toString(maxImageTiles + 1) + " | while read -r f; do rm \"/out/$f\"; done"
+    ].join("\n")
+    container
+      .from("alpine:3.21")
+      .withExec(["apk", "add", "--no-cache", "--quiet", "imagemagick", "imagemagick-jpeg"])
+      .withFile("/in/image", image)
+      .withExec(["sh", "-ec", script])
+  }
+
   """
   View a retained screenshot as an image in the conversation, not a File handle
   or base64 text. Defaults to the run's final screenshot; pass a named PNG/JPEG
   artifact to inspect another capture. Does not rerun the browser or modify files.
+  Images wider than 1568px are scaled down; taller ones arrive as top-to-bottom
+  tiles (at most 8), so prefer selector or clip captures for very long pages.
   """
-  viewScreenshot(llm: LLM!, run: String!, path: String! = "screenshot.png"): LLM! @cache(policy: FunctionCachePolicy.Never) {
-    let image = artifact(run, path)
-    llm.withContent([
-      LLMContentBlockInput(kind: LLMContentBlockKind.TEXT, text: "Browser screenshot from run " + run + ": " + path),
-      LLMContentBlockInput(kind: LLMContentBlockKind.IMAGE, file: image),
-    ])
+  viewScreenshot(llm: LLM!, run: String!, path: String! = "screenshot.png"): LLMContent! @cache(policy: FunctionCachePolicy.Never) {
+    let normalized = viewable(artifact(run, path))
+    let tiles = normalized.directory("/out")
+    let names = tiles.glob("*.png")
+    let total = normalized.file("/total").contents.trimSpace
+    let shown = toString(names.length)
+    let capped = if (total != shown) { "; first " + shown + " of " + total + " shown" } else { "" }
+    let note = if (names.length > 1) {
+      " (" + shown + " tiles of up to " + toString(maxImageEdge) + "px, top to bottom" + capped + ")"
+    } else { "" }
+    names.reduce(llmContent.withText("Browser screenshot from run " + run + ": " + path + note)) { content, name =>
+      content.withFile(tiles.file(name))
+    }
   }
 
   """
