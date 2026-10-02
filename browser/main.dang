@@ -42,8 +42,10 @@ type Browser {
   # existed when the tool state was created, surviving module upgrades.
   let scriptSource: Directory! { currentModule.source.directory("/") }
 
+  # Bump version when stored fields are removed or change meaning, so older
+  # saved tool state is discarded instead of failing to load.
   agent(base: LLM!): LLM! @agent {
-    base.withTools(currentNode, except: plumbing).withSystemPrompt(systemPrompt)
+    base.withTools(currentNode, except: plumbing, version: 1).withSystemPrompt(systemPrompt)
   }
 
   """
