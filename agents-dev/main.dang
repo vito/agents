@@ -73,7 +73,7 @@ type AgentsDev {
     null
   }
 
-  """Check checkout selection, HEAD state, and kept edits on a local Git fixture."""
+  """Check checkout and mount refs given by value, HEAD state, and kept edits on a local Git fixture."""
   contributorCheckoutRefs: Void @check {
     print(checkContributorCheckoutRefs)
     null
