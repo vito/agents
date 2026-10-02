@@ -219,6 +219,21 @@ let testBrowserWorkspace(ws: Workspace!): Void {
   let notImage = a.viewScreenshot(beforeView, aID, "results.json").transcript rescue { e: Error => "rejected non-image" }
   assert { notImage == "rejected non-image" }
 
+  # Captures default to the viewport; full-page captures of long pages are
+  # refused whole rather than scaled illegibly, and viewable by region.
+  let tallScript = """
+    await page.setContent('<div style="height:20000px">tall</div>');
+    await screenshot('tall', {fullPage: true});
+  """
+  let t = browserSnapshot(browser.run(ws, url: "about:blank", script: tallScript))
+  let tID = browserObservation(t, browser)
+  let viewportCaption = t.viewScreenshot(beforeView, tID).messages.{{content.{{text}}}}[1].content[0].text ?? ""
+  assert { viewportCaption.contains("1280x720 image") }
+  let refused = t.viewScreenshot(beforeView, tID, "tall.png").transcript rescue { e: Error => e.message }
+  assert { refused.contains("too small to read") }
+  let bandCaption = t.viewScreenshot(beforeView, tID, "tall.png", y: 1000, height: 2000).messages.{{content.{{text}}}}[1].content[0].text ?? ""
+  assert { bandCaption.contains("1280x2000 region at 0,1000") }
+
   let second = first.withNewFile(root + "/index.html", "<title>pending-second</title>")
   let b = browserSnapshot(a.run(second, root: root, script: testScript, timeoutMs: 1500))
   let bID = browserObservation(b, a)

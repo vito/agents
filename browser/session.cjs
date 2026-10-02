@@ -197,11 +197,18 @@ async function worker(config, workspace, working) {
     const timeout = cmd.timeoutMs || 30000;
     context.setDefaultTimeout(timeout);
     context.setDefaultNavigationTimeout(timeout);
-    const screenshot = async (name = 'screenshot') => {
+    // Viewport by default, like other agent browser tools: full-page captures of
+    // long pages are rarely legible once scaled for a model. Opt in with
+    // {fullPage: true}, or narrow with {selector} or {clip: {x, y, width, height}}.
+    // inspect's selector scopes its capture the same way.
+    const screenshot = async (name = 'screenshot', options = {}) => {
       if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(name)) throw new Error('Unsafe screenshot name');
+      const inspected = cmd.op === 'inspect' && cmd.kind === 'screenshot' && cmd.selector ? cmd.selector : undefined;
+      const { fullPage = false, selector = inspected, clip: region } = options ?? {};
+      if (selector && (fullPage || region)) throw new Error('screenshot selector cannot be combined with fullPage or clip');
       const filename = name.endsWith('.png') ? name : `${name}.png`;
-      const capture = cmd.op === 'inspect' && cmd.kind === 'screenshot' && cmd.selector ? page.locator(cmd.selector) : page;
-      await capture.screenshot({ path: path.join(artifactsPath, filename), ...(capture === page ? { fullPage: true } : {}), timeout: Math.min(timeout, 5000) });
+      const capture = selector ? page.locator(selector) : page;
+      await capture.screenshot({ path: path.join(artifactsPath, filename), ...(selector ? {} : { fullPage: !!fullPage, ...(region ? { clip: region } : {}) }), timeout: Math.min(timeout, 5000) });
       return filename;
     };
     await context.tracing.startChunk({ title: `${cmd.op} ${cmd.id}` });

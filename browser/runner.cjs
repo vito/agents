@@ -143,10 +143,16 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
     context.on('response', response => result.network.push({ type: 'response', status: response.status(), url: response.url() }));
     context.on('requestfailed', request => result.network.push({ type: 'failed', url: request.url(), error: request.failure()?.errorText }));
     page = await context.newPage(); // Deliberately leave about:blank; mocks can precede navigation.
-    const screenshot = async (name = 'screenshot') => {
+    // Viewport by default, like other agent browser tools: full-page captures of
+    // long pages are rarely legible once scaled for a model. Opt in with
+    // {fullPage: true}, or narrow with {selector} or {clip: {x, y, width, height}}.
+    const screenshot = async (name = 'screenshot', options = {}) => {
       if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/.test(name)) throw new Error('Unsafe screenshot name');
+      const { fullPage = false, selector, clip } = options ?? {};
+      if (selector && (fullPage || clip)) throw new Error('screenshot selector cannot be combined with fullPage or clip');
       const filename = name.endsWith('.png') ? name : `${name}.png`;
-      await page.screenshot({ path: path.join(artifacts, filename), fullPage: true, timeout: Math.min(5000, input.timeoutMs) });
+      const capture = selector ? page.locator(selector) : page;
+      await capture.screenshot({ path: path.join(artifacts, filename), ...(selector ? {} : { fullPage: !!fullPage, ...(clip ? { clip } : {}) }), timeout: Math.min(5000, input.timeoutMs) });
       return filename;
     };
     const routes = new Map();
