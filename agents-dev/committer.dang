@@ -54,35 +54,19 @@ let checkCommitterRebaseHelpers: String! {
 
 let runCommitterRebaseHelpers(service: Service!): String! {
   let url = service.endpoint(scheme: "git") + "/repo"
-  let fixture = committerRebaseFixture
-  # An unrelated remote and origin's push URL must not win over its fetch URL.
-  let configured = fixture.withExec(["sh", "-eu", "-c", """
-    git remote add upstream git://invalid.example/upstream
-    git remote add origin "$1"
-    git remote set-url --push origin git://invalid.example/push
-    git config --unset remote.origin.url
-    git config remote.origin.url "$1"
-    git config branch.main.remote origin
-  """, "fixture", url]).directory("/repo").asGit
-  let source = configured.tag("fork").asWorkspace
-  let onto = configured.branch("main").commitSHA
+  let fixture = committerRebaseFixture.directory("/repo").asGit
+  let source = fixture.tag("fork").asWorkspace
+  # A ref fetched from a remote URL, as an address like <url>#main lifts.
+  let upstream = git(url).branch("main", noLock: true)
+  let onto = upstream.commitSHA
   # Pin continuations before inspecting their workspaces: repeated lazy reads
   # would execute the non-cacheable rebase/rebaseContinue operations again.
-  let rebased = committer.rebase(llm: llm.withWorkspace(source), source: source, onto: "main").sync.workspace
+  let rebased = committer.rebase(llm: llm.withWorkspace(source), source: source, ref: upstream).sync.workspace
   assert { rebased.git.head.commitSHA == onto }
   assert { rebased.git.uncommitted.isEmpty }
 
-  # Explicit repo also works without an origin section (or any config).
-  [fixture, fixture.withNewFile("/repo/.git/config", "")].each { local =>
-    let bare = local.directory("/repo").asGit.tag("fork").asWorkspace
-    let missing = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
-    assert { missing.contains("the checkout has no origin remote") }
-    let result = committer.rebase(llm: llm.withWorkspace(bare), source: bare, onto: "main", repo: url).sync.workspace
-    assert { result.git.head.commitSHA == onto }
-  }
-
-  let origin = configured.tag("colliding").asWorkspace
-  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main").sync
+  let origin = fixture.tag("colliding").asWorkspace
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, ref: upstream).sync
   let landed = stopped.workspace
   # Reconstruct the expected continuation through existing public bookkeeping:
   # LLM exposes the rebound workspace but not its rebound Committer object.
@@ -128,12 +112,12 @@ let runCommitterRebaseReplay(service: Service!): String! {
   let upstream = fixture.branch("main")
   # A clean replay proves that upstream's hash is adopted rather than copied.
   let clean = fixture.tag("clean").asWorkspace
-  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", repo: url).sync.workspace
+  let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, ref: git(url).branch("main", noLock: true)).sync.workspace
   assert { applied.git.head.targetCommit.parentShas == [upstream.commitSHA] }
   assert { applied.git.uncommitted.isEmpty }
   assert { applied.file("ours.txt").contents == "o\n" }
 
-  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url).sync
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, ref: git(url).branch("main", noLock: true)).sync
   let landed = stopped.workspace
   assert { landed.git.head.targetCommit.parentShas == [upstream.commitSHA] }
   assert { landed.git.head.targetCommit.message.trimSpace == "fixture: ours, clean" }
@@ -184,9 +168,10 @@ let runCommitterRebaseFrom(service: Service!): String! {
   let fixture = committerRebaseFixture.directory("/repo").asGit
   let origin = fixture.branch("feature").asWorkspace
   let upstream = fixture.branch("main")
+  let remote = git(url).branch("main", noLock: true)
   # `from: "clean"` treats the clean commit as a stale parent: only the
   # commits after it replay, so the first one is the colliding commit.
-  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: "clean").sync
+  let stopped = committer.rebase(llm: llm.withWorkspace(origin), source: origin, ref: remote, from: "clean").sync
   let landed = stopped.workspace
   assert { landed.git.head.commitSHA == upstream.commitSHA }
   assert { !landed.directory("/").entries.contains("ours.txt") }
@@ -197,9 +182,9 @@ let runCommitterRebaseFrom(service: Service!): String! {
   assert { landed.git.uncommitted.diffStats.{{path}}.map { s => s.path } == ["shared.txt"] }
 
   # A `from` off this branch must fail rather than replay from the fork point.
-  let offBranch = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: upstream.commitSHA).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  let offBranch = committer.rebase(llm: llm.withWorkspace(origin), source: origin, ref: remote, from: upstream.commitSHA).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
   assert { offBranch.contains("is not an ancestor of HEAD") }
-  let typo = committer.rebase(llm: llm.withWorkspace(origin), source: origin, onto: "main", repo: url, from: "no-such-ref").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  let typo = committer.rebase(llm: llm.withWorkspace(origin), source: origin, ref: remote, from: "no-such-ref").sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
   assert { typo.contains("cannot resolve from") }
   "Rebase from checks passed."
 }
@@ -209,17 +194,15 @@ let checkCommitterRefs: String! {
   let upstream = fixture.branch("main")
   let ontoSha = upstream.commitSHA
 
-  # A ref given directly replaces the fetched remote branch: a clean replay
-  # adopts its hash rather than copying it.
+  # A ref given directly is adopted on a clean replay, not copied.
   let clean = fixture.tag("clean").asWorkspace
   let applied = committer.rebase(llm: llm.withWorkspace(clean), source: clean, ref: upstream).sync.workspace
   assert { applied.git.head.targetCommit.parentShas == [ontoSha] }
   assert { applied.git.uncommitted.isEmpty }
   assert { applied.file("ours.txt").contents == "o\n" }
-  let both = committer.rebase(llm: llm.withWorkspace(clean), source: clean, onto: "main", ref: upstream).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
-  assert { both.contains("not both") }
-  let neither = committer.rebase(llm: llm.withWorkspace(clean), source: clean).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
-  assert { neither.contains("pass ref:") }
+  # An unknown ref fails as the GitRef argument loads, before rebase runs.
+  let missing = committer.rebase(llm: llm.withWorkspace(clean), source: clean, ref: fixture.branch("no-such-branch")).sync.workspace.git.head.commitSHA rescue { e: Error => e.message }
+  assert { missing.contains("no-such-branch") }
 
   # cherryPick takes what applies and reports what conflicts, by address.
   let fork = fixture.tag("fork").asWorkspace

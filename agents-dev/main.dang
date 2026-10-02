@@ -7,7 +7,7 @@ type AgentsDev {
     null
   }
 
-  """Check rebase origin selection and conflict-marker validation through the API."""
+  """Check rebase onto a remote ref and conflict-marker validation through the API."""
   committerRebaseHelpers: Void @check {
     print(checkCommitterRebaseHelpers)
     null
