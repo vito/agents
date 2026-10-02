@@ -28,7 +28,7 @@
 #   * Workspace.compareCommitsFrom / withCommitsFrom plan and replay another
 #     workspace's commits onto this one (cherry-pick with authorship kept, or
 #     a fast-forward when hashes can be preserved). `rebase` is built from
-#     them: rewind to the fork point, fast-forward onto the fetched upstream
+#     them: rewind to the fork point, fast-forward onto the upstream ref's
 #     tip, replay our commits, and STOP at the first conflict — which is
 #     merged three-way into the working tree (Changeset.withChangeset with
 #     conflict markers) for the agent to resolve before `rebaseContinue`
@@ -601,15 +601,15 @@ type Committer {
   Rebase this branch's commits onto another ref, stopping at each conflict
   for you to resolve.
 
-  The target is either `onto`, a branch fetched from the checkout's remote,
-  or `ref`, any GitRef address — a git URL with a fragment, or an artifact
-  such as another agent's history (FindArtifacts lists them). The rebase
-  rewinds to where this branch forked from the target, fast-forwards to its
-  tip, and replays your commits on top — oldest first, authors and dates
-  intact, merge commits left out, commits already on the target dropped.
+  The target `ref` is any GitRef address — a git URL with a fragment, such
+  as "https://github.com/org/repo#main", or an artifact such as another
+  agent's history (FindArtifacts lists them). The rebase rewinds to where
+  this branch forked from the target, fast-forwards to its tip, and replays
+  your commits on top — oldest first, authors and dates intact, merge
+  commits left out, commits already on the target dropped.
 
   Pass `from` to replay only the commits after it — `git rebase --onto
-  <onto> <from>` — when this branch was stacked on another branch that has
+  <ref> <from>` — when this branch was stacked on another branch that has
   since been rewritten and merged: the old parent head leaves the parent's
   stale commits out of the replay.
 
@@ -631,41 +631,24 @@ type Committer {
     llm: LLM!,
     source: Workspace!,
     """
-    What to rebase onto, as it is now on the remote: a branch name such as
-    "main", a tag, or a commit sha. Leave empty when passing `ref`.
+    The ref to rebase onto: any GitRef address, including other agents'
+    histories (FindArtifacts lists them), or a git URL with a fragment such
+    as "https://github.com/org/repo#main".
     """
-    onto: String! = "",
-    """
-    Git URL of the repository to fetch `onto` from. Empty uses the checkout's
-    origin remote; name the upstream here to rebase a fork's branch onto it.
-    """
-    repo: String! = "",
+    ref: GitRef!,
     """
     Replay only the commits after this one (a sha or ref in this checkout's
-    history), like `git rebase --onto <onto> <from>`. Use it when the branch
+    history), like `git rebase --onto <ref> <from>`. Use it when the branch
     was stacked on another branch that has since been rewritten and merged:
     pass the old parent head so its stale commits are not replayed. Empty
-    replays everything since the fork point from `onto`.
+    replays everything since the fork point from `ref`.
     """
     from: String! = "",
-    """
-    The ref to rebase onto, instead of a remote branch: any GitRef address,
-    including other agents' histories (FindArtifacts lists them), or a git
-    URL with a fragment such as "https://github.com/org/repo#main".
-    """
-    ref: GitRef = null,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): fetches a live remote tip and rewrites the workspace; a
+    # @cache(Never): resolves a live remote tip and rewrites the workspace; a
     # later identical call must do both again.
     if (rebaseOrigin != null) {
       raise `rebase: a rebase is already in progress, stopped at ${short(rebaseStopped)}; ` + "finish it with rebaseContinue, or rebaseAbort to return to where you started"
-    }
-    let branch = onto.trimSpace
-    if (branch == "" and ref == null) {
-      raise "rebase: name the branch to rebase onto, e.g. onto: \"main\", or pass ref: with a git ref address"
-    }
-    if (branch != "" and ref != null) {
-      raise "rebase: pass either onto (a branch on the remote) or ref (a git ref address), not both"
     }
     if (!source.git.uncommitted.isEmpty) {
       raise "rebase: the working tree has pending changes; commit them first (status shows them)"
@@ -680,23 +663,13 @@ type Committer {
       e: Error => raise "rebase: " + noHistory(e.message)
     }
 
-    # The target: a ref given by address, or a branch fetched from the remote.
-    # Either way the rest of the rebase sees one GitRef and one label for it.
-    let upstream = if (ref != null) {
-      ref
-    } else {
-      git(remoteUrl(origin, repo)).ref(name: branch)
-    }
+    let upstream = ref
     let ontoSha = upstream.commitSHA rescue {
-      e: Error => if (ref != null) {
-        raise `rebase: cannot read the ref to rebase onto: ${plainError(e.message)}`
-      } else {
-        raise `rebase: cannot fetch ${branch} from ${remoteUrl(origin, repo)}: ${plainError(e.message)}`
-      }
+      e: Error => raise `rebase: cannot read the ref to rebase onto: ${plainError(e.message)}`
     }
-    let label = if (branch != "") { branch } else { refLabel(upstream, ontoSha) }
+    let label = refLabel(upstream, ontoSha)
     # `from` narrows the replay to the commits after it, the way `git rebase
-    # --onto <onto> <from>` does. It must be on this branch: anything else
+    # --onto <ref> <from>` does. It must be on this branch: anything else
     # would replay commits from the fork point instead, silently.
     let since = from.trimSpace
     let replayBase = if (since == "") {
@@ -1319,7 +1292,7 @@ type Committer {
   # through cleaned.
   let replayError(doing: String!, onto: String!, reason: String!): String! {
     if (reason.contains("maxCommits")) {
-      return `rebase: ${doing} failed: ${onto} has moved more than ${toString(replayBound)} commits past this branch's fork point, ` + "which is more than the engine can replay across at once. Rebase onto an older commit of it first " + `(onto: "<sha>"), then onto ${onto}.`
+      return `rebase: ${doing} failed: ${onto} has moved more than ${toString(replayBound)} commits past this branch's fork point, ` + "which is more than the engine can replay across at once. Rebase onto an older commit of it first " + `(a ref address ending in #<sha>), then onto ${onto}.`
     }
     `rebase: ${doing} failed: ${plainError(reason)}`
   }
@@ -1527,38 +1500,6 @@ type Committer {
       return ""
     }
     name
-  }
-
-  # Where `rebase` fetches from: an explicit repo, else the origin remote
-  # recorded in the checkout's git config, else the repository's logical URL.
-  let remoteUrl(source: Workspace!, repo: String!): String! {
-    if (repo.trimSpace != "") {
-      return repo.trimSpace
-    }
-    let config = source.git.directory.file("config").contents rescue {
-      e: Error => ""
-    }
-    let fromConfig = originUrl(config)
-    if (fromConfig != null) {
-      return fromConfig
-    }
-    let logical = repository(source).url rescue {
-      e: Error => null
-    }
-    if (logical != null and logical != "") {
-      return logical
-    }
-    raise "rebase: cannot tell where to fetch from — the checkout has no origin remote; pass repo: with the repository's git URL"
-  }
-
-  # The origin remote's fetch URL in a git config, or null when it has none.
-  let originUrl(config: String!): String {
-    # `\n\s*url` keeps a `pushurl` line from matching.
-    let m = config.match(`\[remote "origin"\][^\[]*?\n\s*url\s*=\s*(\S+)`)
-    if (m == null) {
-      return null
-    }
-    m.captures[0]
   }
 
   # Files in a patch that still carry conflict markers. Only the opening and
@@ -1927,11 +1868,11 @@ type Committer {
       Rewriting published history needs explicit authorization, not an
       automatic force push after a rejection.
     - `rebase` — replay this branch's commits onto another ref, keeping
-      authors and dates: `onto: "main"` for a branch fetched from the
-      remote, or `ref:` for any ref by address (see below). It stops at
-      the first commit that conflicts: the earlier ones are already on the
-      new base, and the conflicting one is merged three-way into your
-      working tree with <<<<<<< markers. Resolve them with your edit tools —
+      authors and dates: `ref:` takes the target by address (see below),
+      e.g. "https://github.com/org/repo#main". It stops at the first commit
+      that conflicts: the earlier ones are already on the new base, and the
+      conflicting one is merged three-way into your working tree with
+      <<<<<<< markers. Resolve them with your edit tools —
       do not give up on the commit — then `rebaseContinue` records it
       (original message and author kept; pass `message` to amend) and
       replays the rest, stopping again if needed. `rebaseSkip` drops the
@@ -1940,7 +1881,7 @@ type Committer {
       rebase prints the `push(branch:, expectedRemoteSHA:)` call to publish.
       For a branch stacked on a parent that was rewritten and merged, pass
       `from:` the old parent head to replay only the commits after it
-      (`git rebase --onto <onto> <from>`).
+      (`git rebase --onto <ref> <from>`).
     - `cherryPickPlan` — plan taking another ref's commits (`from:`, by
       address) into HEAD. Lists commits in source not in HEAD, oldest first,
       annotated new, already had, redundant, or CONFLICT with reasons and
