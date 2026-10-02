@@ -58,4 +58,4 @@ is-module = true
 name = "staff"
 
 [modules.editor]
-source = "github.com/vito/editor"
+source = "github.com/vito/editor@artifacts-targets"
