@@ -252,6 +252,59 @@ let testBrowserWorkspace(ws: Workspace!): Void {
   null
 }
 
+# readPage against a bound service: reader-view extraction, paging, plain text,
+# script-built pages falling back to Chromium, and HTTP errors. No model calls.
+let testBrowserReadPage: Void {
+  let server = """
+    const paragraphs = Array.from({length: 40}, (_, i) => '<p>Paragraph ' + i + ' of the durable article, long enough to look like prose to Readability.</p>').join('');
+    const pages = {
+      '/post': '<html><head><title>Durable Post</title></head><body><nav>MENU HOME ABOUT</nav><article><h1>Durable Post</h1><h2 id="why">Why<a href="#why"></a></h2>' + paragraphs + '<pre><code>npm install durable</code></pre></article><footer>FOOTER LINKS</footer></body></html>',
+      '/spa': '<html><head><title>App</title></head><body><div id="root"></div><script>document.getElementById("root").innerHTML = "<article><h1>Rendered</h1>" + "<p>Script-built content that only exists after JavaScript runs in a browser.</p>".repeat(20) + "</article>";</script></body></html>',
+    };
+    require('http').createServer((q, r) => {
+      if (q.url === '/notes.txt') { r.setHeader('Content-Type', 'text/plain'); return r.end('plain notes'); }
+      if (q.url === '/old') { r.writeHead(301, {Location: '/post'}); return r.end(); }
+      const body = pages[q.url];
+      if (!body) { r.writeHead(404, {'Content-Type': 'text/html'}); return r.end('<title>Missing</title><p>gone</p>'); }
+      r.setHeader('Content-Type', 'text/html; charset=utf-8'); r.end(body);
+    }).listen(8080, '0.0.0.0');
+  """
+  let service = container.from("node:22-bookworm-slim")
+    .withDefaultArgs(["node", "-e", server])
+    .withExposedPort(8080).asService
+
+  let a = browserSnapshot(browser.readPage("http://app:8080/old", service: service, limit: 1000))
+  let aID = browserObservation(a, browser)
+  let view = a.artifact(aID, "view.md").contents
+  assert { view.contains("Title: Durable Post") }
+  assert { view.contains("redirected from http://app:8080/old") }
+  assert { view.contains("Readability") }
+  assert { view.contains("untrusted") }
+  assert { view.contains("Continue with readPage(url, offset: ") }
+  let content = a.artifact(aID, "content.md").contents
+  assert { content.contains("Paragraph 39") }
+  assert { content.contains("npm install durable") }
+  assert { !content.contains("MENU HOME") }
+  assert { !content.contains("[](#why)") }
+
+  let tail = browserSnapshot(a.readPage("http://app:8080/post", service: service, offset: content.length - 50))
+  assert { tail.artifact(browserObservation(tail, a), "view.md").contents.contains("Showing characters") }
+
+  let text = browserSnapshot(browser.readPage("http://app:8080/notes.txt", service: service))
+  assert { text.artifact(browserObservation(text, browser), "view.md").contents.contains("plain notes") }
+
+  let spa = browserSnapshot(browser.readPage("http://app:8080/spa", service: service))
+  let spaView = spa.artifact(browserObservation(spa, browser), "view.md").contents
+  assert { spaView.contains("rendered in Chromium") }
+  assert { spaView.contains("Script-built content") }
+
+  let missing = browser.readPage("http://app:8080/nope", service: service).observations rescue { e: Error => [e.message] }
+  assert { (missing[0] ?? "").contains("HTTP 404") }
+  let misuse = browser.readPage("http://app:8080/post", prompt: "why?").observations rescue { e: Error => [e.message] }
+  assert { (misuse[0] ?? "").contains("summarize: true") }
+  null
+}
+
 let testBrowserBrowsers: Void {
   browser.prepared.withExec(["node", "-e", """
     (async () => {
@@ -271,6 +324,6 @@ let testBrowserBrowsers: Void {
 let testBrowserTools: Void {
   let tools = browser.agent(llm).tools
   assert { ["prepared", "checkRunner", "checkTools", "checkWorkspace", "checkBrowsers", "checkSessionRunner", "checkSessions"].all { tool => !tools.contains(tool) } }
-  assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot", "observations"].all { tool => tools.contains(tool) } }
+  assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot", "observations", "readPage"].all { tool => tools.contains(tool) } }
   null
 }
