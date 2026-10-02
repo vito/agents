@@ -6,11 +6,8 @@
 [modules.agents-dev]
 source = "agents-dev"
 
-[modules.dagger-dang-sdk]
-source = "github.com/dagger/dang-sdk"
-
-[modules.editor]
-source = "github.com/vito/editor"
+[modules.dang]
+source = "dagger.io/sdk/dang"
 
 [modules.committer]
 source = "committer"
@@ -24,21 +21,8 @@ source = "contributor"
 [modules.contributor.settings]
 githubToken = "cmd://gh auth token"
 
-[modules.context]
-source = "context"
-
-
-
-
-
-
-
-
-
-
-
 [sdks.dang]
-module = "dagger-dang-sdk"
+module = "dang"
 
 [sdks.dang.scopes.claude]
 is-module = true
@@ -72,3 +56,6 @@ name = "sandbox"
 [sdks.dang.scopes.staff]
 is-module = true
 name = "staff"
+
+[modules.editor]
+source = "github.com/vito/editor"
