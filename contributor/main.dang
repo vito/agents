@@ -56,17 +56,19 @@
 #   around: study a dependency with full tool capabilities → find the fix
 #   belongs upstream → hand a worker the checkout + push + PR.
 #
-# - `checkout` re-points the agent at a DIFFERENT repository: it fetches a
-#   git repo as a Workspace (GitRef.asWorkspace) and returns a continuation
-#   of the current conversation bound to that checkout. The agent keeps its
-#   own toolset — tools live on the conversation, and their `Workspace!` args
-#   simply auto-fill from the new binding — and the target workspace's agents,
-#   if it has any, are composed ON TOP (minus modules the originating
-#   workspace already provides). A checked-out workspace refuses export by
-#   construction, so the only way its changes leave is commit + push. The
-#   old workspace's pending edits stay behind unless named in `keep`, which
-#   overlays them onto the fresh checkout as uncommitted edits — the escape
-#   hatch for scratch work, or a task begun on the wrong branch.
+# - `checkout` re-points the agent at a DIFFERENT repository: it takes a
+#   GitRef by address (a git URL with an optional #<ref> fragment, or any
+#   GitRef artifact), checks it out as a Workspace (GitRef.asWorkspace), and
+#   returns a continuation of the current conversation bound to that
+#   checkout. The agent keeps its own toolset — tools live on the
+#   conversation, and their `Workspace!` args simply auto-fill from the new
+#   binding — and the target workspace's agents, if it has any, are composed
+#   ON TOP (minus modules the originating workspace already provides). A
+#   checked-out workspace refuses export by construction, so the only way
+#   its changes leave is commit + push. The old workspace's pending edits
+#   stay behind unless named in `keep`, which overlays them onto the fresh
+#   checkout as uncommitted edits — the escape hatch for scratch work, or a
+#   task begun on the wrong branch.
 #
 # Configuration lives in dagger.toml settings, not per-call arguments:
 # `githubToken` authenticates GitHub operations, reaching the container
@@ -684,42 +686,37 @@ type Contributor {
   mount(
     source: Workspace!,
     """
-    The repository: "owner/name" GitHub shorthand or a full git URL, e.g.
-    "dagger/dagger" or "https://github.com/dagger/dagger".
+    The repository and ref to mount, as any GitRef address, e.g.
+    "https://github.com/dagger/dagger" for the default branch or
+    "https://github.com/dagger/dagger#v0.19.0" for a branch, tag, or commit.
     """
-    repo: String!,
-    """
-    Branch, tag, or commit to mount. Empty means the default branch.
-    """
-    ref: String! = "",
+    repo: GitRef!,
     """
     Directory name under mnt/ to mount at. Empty uses the repository's name
-    (mnt/dagger for dagger/dagger). Mounting at a name already in use
+    (mnt/dagger for https://github.com/dagger/dagger); required when the ref
+    has no remote URL to name it by. Mounting at a name already in use
     replaces that mount.
     """
     name: String! = "",
   ): Workspace! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): a branch ref resolves live; a later identical call
     # must mount the repository as it is then.
-    let url = repoUrl(repo)
-    let repository = git(url)
-    let target = if (ref == "") {
-      repository.head
-    } else {
-      # ref() accepts a commit id, tag, branch, or fully-qualified ref.
-      repository.ref(ref)
-    }
+    #
     # Force the resolution HERE, so a typo'd repo or ref fails as this call
     # instead of poisoning every later read under the mount.
-    let sha = target.commitSHA rescue {
-      e: Error => raise `cannot mount ${repo}: ${plainError(e.message)}`
+    let resolved = repo.{{commitSHA, name}} rescue {
+      e: Error => raise `cannot mount that ref: ${plainError(e.message)}`
+    }
+    let label = refLabel(repo, resolved.name)
+    let url = remoteUrlOf(repo)
+    if (name == "" and url == "") {
+      raise "mount: this ref has no remote URL to name the mount by; pass name"
     }
     let dir = mountPath(if (name == "") { repoName(url) } else { name })
 
-    let at = if (ref == "") { "" } else { `@${ref}` }
-    print(`Mounted ${repo}${at} (${short(sha)}) at ${dir}/ — your file tools work on it; unmount with unmount("${Path(dir).name}") when done.`)
+    print(`Mounted ${label} (${short(resolved.commitSHA)}) at ${dir}/ — your file tools work on it; unmount with unmount("${Path(dir).name}") when done.`)
 
-    source.withMountedDirectory(dir, target.tree(discardGitDir: true))
+    source.withMountedDirectory(dir, repo.tree(discardGitDir: true))
   }
 
   """
@@ -748,10 +745,11 @@ type Contributor {
 
   Your workspace is replaced by a fresh checkout of `repo` — every workspace
   tool you already hold (read, edit, status, diff, commit, push, ...) simply
-  operates on the new checkout from here on. Use `ref` for a branch, tag,
-  or commit SHA; omit it for the default branch. Branches stay attached,
-  while tags and SHAs use detached HEAD (name a branch explicitly to push).
-  The result reports the resolved SHA and branch/detached state.
+  operates on the new checkout from here on. `repo` is any git ref by
+  address: a git URL with a `#<branch, tag or commit>` fragment, or the
+  default branch without one. Branches stay attached, while tags and SHAs
+  use detached HEAD (name a branch explicitly to push). The result reports
+  the resolved SHA and branch/detached state.
 
   When the target workspace defines agents of its own, they are composed on
   top of your toolset, except modules your originating workspace provides.
@@ -773,16 +771,13 @@ type Contributor {
     llm: LLM!,
     source: Workspace!,
     """
-    Git URL of the repository to check out, e.g.
-    "https://github.com/dagger/otel-go".
+    The repository and ref to check out, as any GitRef address, e.g.
+    "https://github.com/dagger/otel-go" for the default branch or
+    "https://github.com/dagger/otel-go#fix-x" for a branch, tag, or commit.
+    Branches stay attached; tags and SHAs use detached HEAD. Use a full SHA
+    for a remote commit; abbreviated SHAs may not resolve.
     """
-    repo: String!,
-    """
-    Branch, tag, or commit SHA to check out. Empty uses the repository's
-    default branch. Branches stay attached; tags and SHAs use detached HEAD.
-    Use a full SHA for a remote commit; abbreviated SHAs may not resolve.
-    """
-    ref: String! = "",
+    repo: GitRef!,
     """
     Glob patterns of pending changes to carry into the new checkout, relative
     to the workspace root (e.g. "notes/**" or "scratch.md") — the same
@@ -802,7 +797,7 @@ type Contributor {
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): resolves a live remote and rebinds the conversation; a
     # later identical call must fetch the repo as it is then.
-    let prepared = checkoutWorkspace(source, git(repo), repo, ref, keep)
+    let prepared = checkoutWorkspace(source, repo, keep)
     let target = prepared.workspace
     let where = prepared.where
 
@@ -855,28 +850,21 @@ type Contributor {
   # Resolve and prepare before rebinding the conversation.
   let checkoutWorkspace(
     source: Workspace!,
-    repository: GitRepository!,
-    repo: String!,
-    ref: String! = "",
+    selected: GitRef!,
     keep: [String!]! = [],
   ): {{workspace: Workspace!, where: String!}}! {
-    let selected = if (ref != "") {
-      repository.ref(ref)
-    } else {
-      repository.head
-    }
     # Force resolution here, so an invalid URL or ref cannot poison the
-    # continuation. Preserve the resolved ref: replacing it with its SHA
+    # continuation. Preserve the ref as given: replacing it with its SHA
     # would detach branch checkouts too.
     let resolved = selected.{{commitSHA, name}} rescue {
-      e: Error => raise `cannot check out ${repo}: ${plainError(e.message)}`
+      e: Error => raise `cannot check out that ref: ${plainError(e.message)}`
     }
     let state = if (resolved.name.hasPrefix("refs/heads/")) {
       "branch " + resolved.name.trimPrefix("refs/heads/")
     } else {
       "detached HEAD"
     }
-    let label = if (ref != "") { ref } else { "HEAD" }
+    let label = refLabel(selected, resolved.name)
 
     # Pending changes selected by `keep`, resolved against the OLD workspace
     # before anything switches. An explicit selection that matches nothing
@@ -902,21 +890,21 @@ type Contributor {
       # Force the overlay HERE too, for the same reason as the resolution:
       # reading the target's pending changes back evaluates the apply.
       carried.git.uncommitted.diffStats.{{path}}.length rescue {
-        e: Error => raise `cannot carry pending changes into ${repo}: ${plainError(e.message)}`
+        e: Error => raise `cannot carry pending changes into ${label}: ${plainError(e.message)}`
       }
       carried
     }
     # A full SHA can resolve syntactically without identifying a fetchable
     # object. Materialize the checkout before rebinding, not on a later read.
     target.directory("/").entries rescue {
-      e: Error => raise `cannot check out ${repo}: ${plainError(e.message)}`
+      e: Error => raise `cannot check out ${label}: ${plainError(e.message)}`
     }
     let keptNote = if (keptPaths.isEmpty) {
       ""
     } else {
       ` with ${toString(keptPaths.length)} pending file(s) kept: ${keptPaths.join(", ")}`
     }
-    {{workspace: target, where: `${repo}@${label} (${resolved.commitSHA}; ${state})` + keptNote}}
+    {{workspace: target, where: `${label} (${resolved.commitSHA}; ${state})` + keptNote}}
   }
 
   # Shared toolbox for GitHub operations: git, gh, and jq, run from the root
@@ -971,15 +959,25 @@ type Contributor {
     mountRoot + "/" + name
   }
 
-  # Expand GitHub "owner/name" shorthand into a clone URL; anything that
-  # already looks like a URL passes through.
-  let repoUrl(repo: String!): String! {
-    let r = repo.trimSpace
-    if (r.containsMatch(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)) {
-      "https://github.com/" + r
-    } else {
-      r
+  # The remote URL a ref was fetched from, or "" when it has none (e.g.
+  # another agent's history).
+  let remoteUrlOf(ref: GitRef!): String! {
+    (ref.asRepository.url ?? "") rescue {
+      e: Error => ""
     }
+  }
+
+  # How checkout and mount name a ref given by address, which is not itself
+  # recoverable: its remote URL ("ref" without one), plus @<branch or tag>
+  # when `name` (the resolved ref name) is one. Callers print the SHA.
+  let refLabel(ref: GitRef!, name: String!): String! {
+    let url = remoteUrlOf(ref)
+    let at = if (name.hasPrefix("refs/heads/") or name.hasPrefix("refs/tags/")) {
+      "@" + name.trimPrefix("refs/heads/").trimPrefix("refs/tags/")
+    } else {
+      ""
+    }
+    (if (url == "") { "ref" } else { url }) + at
   }
 
   # The repository's name from its URL: the last path element, minus .git.
@@ -1263,14 +1261,15 @@ type Contributor {
     pass `--repo owner/name` for another repository.
 
     To explore a more distant dependency, `mount` it:
-    mount(repo: "dagger/dagger") attaches its checkout under mnt/dagger,
-    and your regular file tools work on it like on any other directory.
-    Pass `ref` to pin a branch, tag or commit. Never read files through
-    `gh api .../contents/...` or blobs: they come back base64-encoded, and
-    the tool refuses them. A mount stays out of status, diff and commits;
-    `unmount` when done. Do not mount the primary product just because the
-    task begins with reading: use its own checkout, directly or in a
-    worker, so changes can be committed and pushed.
+    mount(repo: "https://github.com/dagger/dagger") attaches its checkout
+    under mnt/dagger, and your regular file tools work on it like on any
+    other directory. Add a `#<branch, tag or commit>` fragment to pin a
+    ref. Never read files through `gh api .../contents/...` or blobs: they
+    come back base64-encoded, and the tool refuses them. A mount stays out
+    of status, diff and commits; `unmount` when done. Do not mount the
+    primary product just because the task begins with reading: use its own
+    checkout, directly or in a worker, so changes can be committed and
+    pushed.
 
     To file an issue or open a pull request, write the body with your
     editor to a scratch file (e.g. tmp/body.md; the workspace is mounted
@@ -1315,7 +1314,8 @@ type Contributor {
     `checkout` replaces this conversation's workspace with a fresh checkout
     of a git repository — the writable starting point for development,
     PR review, or addressing feedback outside the current workspace. Pass
-    `ref` to select a branch, tag, or commit SHA; omit it for the default
+    `repo` as a git URL with a `#<branch, tag or commit>` fragment, e.g.
+    "https://github.com/org/repo#fix-x"; without one, you get the default
     branch. Branch refs keep their branch; tags and SHAs produce detached
     HEAD, so publishing from them needs an explicit push branch.
     Checkout reports the resolved SHA and branch/detached state. Your
