@@ -25,9 +25,15 @@ type AgentsDev {
     null
   }
 
-  """Check log(from:), cherryPick (markers too), rebase, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
+  """Check cherryPickPlan, cherryPick (markers too), rebase, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
   committerRefs: Void @check {
     print(checkCommitterRefs)
+    null
+  }
+
+  """Check log(base:) history direction, filtering and limits against cherryPickPlan."""
+  committerLog: Void @check {
+    print(checkCommitterLog)
     null
   }
 

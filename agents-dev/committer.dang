@@ -245,23 +245,32 @@ let checkCommitterRefs: String! {
   assert { replayed.reported.map { c => c.sha } == [replayed.sha] }
   assert { replayed.reported.map { c => c.message.trimSpace } == ["fixture: upstream change"] }
 
-  # log(from:) is the plan: the ref's commits HEAD lacks, oldest first, each
+  # cherryPickPlan is the ref's commits HEAD lacks, oldest first, each
   # annotated with what cherryPick would do, and conflicts pointing at the
   # markers route.
-  let plan = committer.log(source: fork, from: upstream)
+  let plan = committer.cherryPickPlan(source: fork, from: upstream)
+  assert { plan.hasPrefix("Commits in source not in HEAD\n\n") }
   assert { plan.contains("1 commit(s) on the ref that HEAD lacks") and plan.contains("1 new") }
   assert { plan.contains("[new]") and plan.contains("fixture: upstream change") }
-  let stack = committer.log(source: fork, from: fixture.branch("feature"))
+  let stack = committer.cherryPickPlan(source: fork, from: fixture.branch("feature"))
   assert { stack.contains("3 new") }
   let order = stack.split("\n").filter { l => l.contains("fixture:") }.map { l => l.trimSpace }
   assert { order == ["fixture: ours, clean", "fixture: ours, colliding", "fixture: after the conflict"] }
-  assert { committer.log(source: fork, from: fixture.branch("feature"), limit: 1).contains("2 older commit(s) not shown") }
-  assert { committer.log(source: picked, from: upstream).contains("HEAD already has every commit") }
-  let conflictPlan = committer.log(source: feature, from: upstream)
+  let limited = committer.cherryPickPlan(source: fork, from: fixture.branch("feature"), limit: 2)
+  assert { limited.contains("1 older commit(s) not shown") }
+  assert { limited.split("\n").filter { l => l.contains("fixture:") }.map { l => l.trimSpace } == ["fixture: ours, colliding", "fixture: after the conflict"] }
+  let empty = committer.cherryPickPlan(source: picked, from: upstream)
+  assert { empty.hasPrefix("Commits in source not in HEAD\n\n") and empty.contains("HEAD already has every commit") }
+  let invalidLimit = committer.cherryPickPlan(source: fork, from: upstream, limit: 0) rescue { e: Error => e.message }
+  assert { invalidLimit.contains("cherryPickPlan: limit must be positive") }
+  let conflictPlan = committer.cherryPickPlan(source: feature, from: upstream)
   assert { conflictPlan.contains("CONFLICT") and conflictPlan.contains("shared.txt") }
   assert { conflictPlan.contains("markers: true") }
-  let combined = committer.log(source: fork, from: upstream, paths: ["shared.txt"]) rescue { e: Error => e.message }
-  assert { combined.contains("do not combine with from") }
+  let dirtyPlan = committer.cherryPickPlan(source: fork.withNewFile("shared.txt", "pending\n"), from: upstream)
+  assert { dirtyPlan.contains("CONFLICT: you have uncommitted edits") and dirtyPlan.contains("shared.txt") }
+  assert { dirtyPlan.contains("commit or revert your edits") }
+  let redundantPlan = committer.cherryPickPlan(source: sibling.withCommitsFrom(source: upstream.asWorkspace), from: upstream)
+  assert { redundantPlan.contains("[redundant]") or redundantPlan.contains("[already had]") }
 
   # cherryPick(markers: true) is `git cherry-pick -n`: one commit, applied as
   # uncommitted edits with conflict markers where it no longer fits.
@@ -298,6 +307,83 @@ let checkCommitterRefs: String! {
   assert { saved.workspace.file("later.txt").contents == "later\n" }
   assert { committer.fileAt(source: fork, path: "later.txt", from: saved.head).contains("later") }
   "Committer ref address checks passed."
+}
+
+let checkCommitterLog: String! {
+  let fixture = committerRebaseFixture.directory("/repo").asGit
+  let upstream = fixture.branch("main")
+  let feature = fixture.branch("feature").asWorkspace
+  let subjects = ["fixture: after the conflict", "fixture: ours, colliding", "fixture: ours, clean"]
+
+  # Diverged refs deliberately have commits on both sides: history and the
+  # incoming plan must not silently swap directions or share their ordering.
+  let history = committer.log(source: feature, base: upstream)
+  assert { history.hasPrefix("Commits in HEAD not in base\n\n") }
+  assert { committerLogSubjects(history) == subjects }
+  assert { !history.contains("[new]") and !history.contains("CONFLICT") }
+  let incoming = committer.cherryPickPlan(source: feature, from: upstream)
+  assert { incoming.hasPrefix("Commits in source not in HEAD\n\n") }
+  assert { committerLogSubjects(incoming) == ["fixture: upstream change"] }
+  let reverse = committer.log(source: upstream.asWorkspace, base: feature.git.head)
+  assert { committerLogSubjects(reverse) == ["fixture: upstream change"] }
+  let reversePlan = committer.cherryPickPlan(source: upstream.asWorkspace, from: feature.git.head)
+  assert { committerLogSubjects(reversePlan) == ["fixture: ours, clean", "fixture: ours, colliding", "fixture: after the conflict"] }
+
+  # Plain history retains the common ancestor; a selected walk excludes it
+  # before paths, message search and limits, not after scanning recent HEAD.
+  let plain = committer.log(source: feature)
+  assert { !plain.contains("Commits in HEAD not in base") }
+  assert { committerLogSubjects(plain) == subjects + ["fixture: fork point"] }
+  let limited = committer.log(source: feature, base: upstream, limit: 1)
+  assert { committerLogSubjects(limited) == subjects.takeFirst }
+  assert { limited.contains("more history below") }
+  assert { !committer.log(source: feature, base: upstream, limit: 3).contains("more history below") }
+  let paths = committer.log(source: feature, base: upstream, paths: ["ours.txt"], limit: 1)
+  assert { committerLogSubjects(paths) == ["fixture: ours, clean"] }
+  assert { !paths.contains("more history below") }
+  let grep = committer.log(source: feature, base: upstream, grep: "OURS", limit: 1)
+  assert { committerLogSubjects(grep) == ["fixture: ours, colliding"] }
+  assert { grep.contains("2 match(es) in 3 searched commits in HEAD not in base; 1 not shown") }
+  let combined = committer.log(source: feature, base: upstream, paths: ["shared.txt"], grep: "KEEPS ITS BODY", full: true, limit: 1)
+  assert { combined.contains("Commits in HEAD not in base") }
+  assert { committerLogSubjects(combined) == ["fixture: ours, colliding"] }
+  assert { combined.contains("Keeps its body.") }
+  assert { combined.contains("1 match(es) in 1 searched commits in HEAD not in base touching the given paths") }
+  assert { !committer.log(source: feature, base: upstream, grep: "KEEPS ITS BODY").contains("Keeps its body.") }
+  [
+    committer.log(source: feature, base: feature.git.head),
+    committer.log(source: feature, base: upstream, paths: ["upstream.txt"]),
+    committer.log(source: feature, base: upstream, grep: "fork point"),
+  ].each { empty =>
+    assert { empty.hasPrefix("Commits in HEAD not in base\n\n") }
+    assert { committerLogSubjects(empty).isEmpty }
+  }
+  # More excluded commits than the grep search window must not bury our
+  # older commits. A merge makes both sides reachable from the same HEAD.
+  let merged = committerRebaseFixture.withExec(["sh", "-eu", "-c", """
+    export GIT_AUTHOR_DATE=2026-09-16T12:00:00Z
+    export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+    i=0
+    while [ "$i" -lt 501 ]; do
+      i=$((i + 1))
+      printf '%s\\n' "$i" > noise.txt
+      git add noise.txt
+      git commit -qm "fixture: excluded noise $i"
+    done
+    git tag noisy-base
+    git merge --no-ff -X theirs feature -m 'fixture: merge feature'
+  """]).directory("/repo").asGit
+  let selected = committer.log(source: merged.branch("main").asWorkspace, base: merged.tag("noisy-base"), grep: "KEEPS ITS BODY", limit: 1)
+  assert { committerLogSubjects(selected) == ["fixture: ours, colliding"] }
+  assert { selected.contains("1 match(es) in 4 searched commits in HEAD not in base") }
+  let selectedLimit = committer.log(source: merged.branch("main").asWorkspace, base: merged.tag("noisy-base"), limit: 2)
+  assert { committerLogSubjects(selectedLimit) == ["fixture: merge feature", "fixture: after the conflict"] }
+  assert { selectedLimit.contains("more history below") }
+  "Committer history and plan direction checks passed."
+}
+
+let committerLogSubjects(listing: String!): [String!]! {
+  listing.split("\n").filter { l => l.trimSpace.hasPrefix("fixture:") }.map { l => l.trimSpace }
 }
 
 let checkCommitterMessages(source: Workspace!): String! {
