@@ -7,7 +7,7 @@ type AgentsDev {
     null
   }
 
-  """Check rebase origin selection and conflict-marker validation through the API."""
+  """Check rebase onto a remote ref and conflict-marker validation through the API."""
   committerRebaseHelpers: Void @check {
     print(checkCommitterRebaseHelpers)
     null
@@ -22,6 +22,18 @@ type AgentsDev {
   """Check rebase replays only the commits after `from`, and rejects a `from` off the branch."""
   committerRebaseFrom: Void @check {
     print(checkCommitterRebaseFrom)
+    null
+  }
+
+  """Check cherryPickPlan, cherryPick (markers too), rebase, show, fileAt and restore against refs given by value, and the saved-workspace collection."""
+  committerRefs: Void @check {
+    print(checkCommitterRefs)
+    null
+  }
+
+  """Check log(base:) history direction, filtering and limits against cherryPickPlan."""
+  committerLog: Void @check {
+    print(checkCommitterLog)
     null
   }
 
@@ -61,19 +73,31 @@ type AgentsDev {
     null
   }
 
-  """Check checkout selection, HEAD state, and kept edits on a local Git fixture."""
+  """Check checkout and mount refs given by value, HEAD state, and kept edits on a local Git fixture."""
   contributorCheckoutRefs: Void @check {
     print(checkContributorCheckoutRefs)
     null
   }
 
-  """Check public glob filtering and literal internal drift paths without model calls."""
+  """Check the escape hatches' glob filtering and literal internal drift paths without model calls."""
   staffFiltering(source: Workspace!): Void @check {
     print(testStaffFiltering(source: source))
     null
   }
 
-  """Check internal bookkeeping remains absent from the chief's tools."""
+  """Check the roster collection: keys, items, subsets, and one unambiguous `member` dimension."""
+  staffMembers(source: Workspace!): Void @check {
+    print(testStaffMembers(source: source))
+    null
+  }
+
+  """Check a worker's live roster sees later hires, resolves addresses, and reaches the escape hatches."""
+  staffPeers(source: Workspace!): Void @check {
+    print(testStaffPeers(source: source))
+    null
+  }
+
+  """Check the chief's tools: orchestration and escape hatches, no git or bookkeeping."""
   staffTools(source: Workspace!): Void @check {
     print(testStaffTools(source: source))
     null

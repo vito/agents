@@ -2,18 +2,24 @@
 # gh reads -F files before making a request; the final missing file keeps this
 # offline even if a regression allows the mounted dependency into the toolbox.
 let checkContributorMountsOutsideToolbox: String! {
-  let ws = container.from("alpine:3.22")
+  let ws = container
+    .from("alpine:3.22")
     .withExec(["apk", "add", "--no-cache", "git"])
     .withWorkdir("/repo")
     .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
-    .directory("/repo").asGit.head.asWorkspace
+    .directory("/repo")
+    .asGit
+    .head
+    .asWorkspace
     .withNewFile("tmp/body.md", "draft\n")
     .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
   assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
   let result = contributor(githubToken: setSecret("contributor-test-token", "not-a-real-token")).gh(
     source: ws,
     args: ["api", "graphql", "-F", "draft=@tmp/body.md", "-F", "dependency=@mnt/dep/big.txt", "-F", "guard=@always-missing"],
-  ) rescue { e: Error => e.message }
+  ) rescue {
+    e: Error => e.message
+  }
   assert(message: result) { result.contains("open mnt/dep/big.txt: no such file or directory") }
   assert { !result.contains("open tmp/body.md:") }
   assert { !result.contains("open always-missing:") }
@@ -21,7 +27,8 @@ let checkContributorMountsOutsideToolbox: String! {
 }
 
 let checkContributorCheckoutRefs: String! {
-  let fixtureContainer = container.from("alpine:3.22")
+  let fixtureContainer = container
+    .from("alpine:3.22")
     .withExec(["apk", "add", "--no-cache", "git", "git-daemon"])
     .withWorkdir("/repo")
     .withExec(["sh", "-eu", "-c", """
@@ -44,7 +51,9 @@ let checkContributorCheckoutRefs: String! {
   let fixture = fixtureContainer.directory("/repo").asGit
   let baseSha = fixture.head.commitSHA
   let featureSha = fixture.branch("feature").commitSHA
-  let source = fixture.head.asWorkspace
+  let source = fixture
+    .head
+    .asWorkspace
     .withNewFile("marker", "pending\n")
     .withNewFile("new.txt", "new\n")
     .withNewFile("left.txt", "left behind\n")
@@ -55,10 +64,28 @@ let checkContributorCheckoutRefs: String! {
   # checkout's internal preparation helper. No model calls or target agents.
   let cases = [
     {{ref: "", sha: baseSha, head: "ref: refs/heads/main\n", marker: "base\n"}},
-    {{ref: "feature", sha: featureSha, head: "ref: refs/heads/feature\n", marker: "feature\n"}},
-    {{ref: "refs/heads/feature", sha: featureSha, head: "ref: refs/heads/feature\n", marker: "feature\n"}},
+    {{
+      ref: "feature",
+      sha: featureSha,
+      head: "ref: refs/heads/feature\n",
+      marker: "feature\n"
+    }},
+
+    {{
+      ref: "refs/heads/feature",
+      sha: featureSha,
+      head: "ref: refs/heads/feature\n",
+      marker: "feature\n"
+    }},
+
     {{ref: "v1", sha: baseSha, head: baseSha + "\n", marker: "base\n"}},
-    {{ref: "v1-annotated", sha: baseSha, head: baseSha + "\n", marker: "base\n"}},
+    {{
+      ref: "v1-annotated",
+      sha: baseSha,
+      head: baseSha + "\n",
+      marker: "base\n"
+    }},
+
     {{ref: baseSha, sha: baseSha, head: baseSha + "\n", marker: "base\n"}},
   ]
   cases.each { c =>
@@ -66,7 +93,12 @@ let checkContributorCheckoutRefs: String! {
     let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
     # Pin the continuation: checkout is uncached, so each lazy selection
     # would otherwise perform another checkout instead of inspecting one.
-    let switched = contributor.checkout(llm: base, source: source, repo: repo, ref: c.ref, composeAgents: false).sync
+    let switched = contributor.checkout(
+      llm: base,
+      source: source,
+      repo: contributorCheckoutRef(repo, c.ref),
+      composeAgents: false,
+    ).sync
     let target = switched.workspace
     assert { target.git.head.commitSHA == c.sha }
     assert { target.git.directory.file("HEAD").contents == c.head }
@@ -77,7 +109,13 @@ let checkContributorCheckoutRefs: String! {
   ["feature", "v1", baseSha].each { ref =>
     let server = contributorCheckoutServer(fixtureContainer)
     let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
-    let switched = contributor.checkout(llm: base, source: source, repo: repo, ref: ref, keep: ["marker", "new.txt", "delete.txt"], composeAgents: false).sync
+    let switched = contributor.checkout(
+      llm: base,
+      source: source,
+      repo: contributorCheckoutRef(repo, ref),
+      keep: ["marker", "new.txt", "delete.txt"],
+      composeAgents: false,
+    ).sync
     let target = switched.workspace
     let expectedHead = if (ref == "feature") { "ref: refs/heads/feature\n" } else { baseSha + "\n" }
     assert { target.git.directory.file("HEAD").contents == expectedHead }
@@ -90,20 +128,56 @@ let checkContributorCheckoutRefs: String! {
   }
   let server = contributorCheckoutServer(fixtureContainer)
   let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
-  let missing = contributor.checkout(llm: base, source: source, repo: repo, ref: "no-such-ref", composeAgents: false).workspace.git.head.commitSHA rescue {
+  let missing = contributor.checkout(
+    llm: base,
+    source: source,
+    repo: git(repo).ref("no-such-ref", noLock: true),
+    composeAgents: false,
+  ).workspace.git.head.commitSHA rescue {
     e: Error => e.message
   }
-  assert { missing.contains("cannot check out " + repo + ":") }
-  let unknownSha = contributor.checkout(llm: base, source: source, repo: repo, ref: "0000000000000000000000000000000000000001", composeAgents: false).workspace.git.head.commitSHA rescue {
+  # A GitRef argument resolves as it is loaded, so an unknown ref fails with
+  # the engine's own error before checkout runs.
+  assert(message: missing) { missing.contains("no-such-ref") }
+  let unknownSha = contributor.checkout(
+    llm: base,
+    source: source,
+    repo: git(repo).ref("0000000000000000000000000000000000000001", noLock: true),
+    composeAgents: false,
+  ).workspace.git.head.commitSHA rescue {
     e: Error => e.message
   }
-  assert { unknownSha.contains("cannot check out " + repo + ":") }
-  let noMatch = contributor.checkout(llm: base, source: source, repo: repo, ref: "v1", keep: ["absent"], composeAgents: false).workspace.git.head.commitSHA rescue {
+  assert(message: unknownSha) { unknownSha.contains("cannot check out") }
+  let noMatch = contributor.checkout(
+    llm: base,
+    source: source,
+    repo: git(repo).ref("v1", noLock: true),
+    keep: ["absent"],
+    composeAgents: false,
+  ).workspace.git.head.commitSHA rescue {
     e: Error => e.message
   }
   assert { noMatch.contains("nothing pending matches keep:") }
   assert { source.file("left.txt").contents == "left behind\n" }
   assert { source.file("marker").contents == "pending\n" }
+
+  # mount takes a GitRef the same way, named after its remote by default.
+  let mounted = contributor.mount(source: source, repo: git(repo).ref(
+    "feature",
+    noLock: true,
+  ))
+  assert { mounted.file("mnt/repo/marker").contents == "feature\n" }
+  # A ref with no remote URL has nothing to name the mount by.
+  let unnamed = contributor.mount(source: source, repo: fixture.branch("feature")).file("marker").contents rescue {
+    e: Error => e.message
+  }
+  assert(message: unnamed) { unnamed.contains("pass name") }
+  let named = contributor.mount(
+    source: source,
+    repo: fixture.branch("feature"),
+    name: "local",
+  )
+  assert { named.file("mnt/local/marker").contents == "feature\n" }
   let tools = contributor.agent(base).tools
   assert { tools.contains("checkout") }
   assert { !tools.contains("checkCheckoutRefs") and !tools.contains("checkMountsOutsideToolbox") }
@@ -111,10 +185,20 @@ let checkContributorCheckoutRefs: String! {
   "Checkout ref and keep checks passed."
 }
 
+# checkout takes a GitRef; build the one an address with an optional
+# #<ref> fragment would name.
+let contributorCheckoutRef(url: String!, ref: String!): GitRef! {
+  if (ref == "") { git(url).head(noLock: true) } else {
+    git(url).ref(ref, noLock: true)
+  }
+}
+
 # Give independent cases distinct remotes: the engine's remote-ref cache can
 # resolve a repeated branch checkout as detached after its first materialization.
 let contributorCheckoutServer(fixture: Container!): Service! {
-  fixture.withEnvVariable("FIXTURE_NONCE", Random.string).withExposedPort(9418)
+  fixture
+    .withEnvVariable("FIXTURE_NONCE", Random.string)
+    .withExposedPort(9418)
     .asService(args: ["git", "daemon", "--reuseaddr", "--export-all", "--base-path=/", "--listen=0.0.0.0"])
     .start
 }
