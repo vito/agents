@@ -23,13 +23,21 @@ async function artifactFiles(root, prefix = '') {
   return files.sort();
 }
 
-// Default Playwright timeouts, each capped by the run's own deadline. Actions
+// Default Playwright timeouts, each capped below the run's own deadline. Actions
 // (clicks, fills, locator waits) fail fast with Playwright's call log instead
 // of silently consuming the whole budget; navigation keeps a longer default for
 // first loads of large apps. Scripts can still raise either with
 // page/context.setDefaultTimeout or setDefaultNavigationTimeout.
 const ACTION_TIMEOUT_MS = 15000;
 const NAVIGATION_TIMEOUT_MS = 60000;
+// The caps leave headroom below the deadline: a stuck action timing out at
+// the deadline itself races it, and losing that race ends the run (or
+// invalidates a session) instead of failing one check with a call log.
+const deadlineCap = deadlineMs => Math.max(Math.floor(deadlineMs / 2), deadlineMs - 2000);
+const defaultTimeouts = deadlineMs => ({
+  action: Math.min(ACTION_TIMEOUT_MS, deadlineCap(deadlineMs)),
+  navigation: Math.min(NAVIGATION_TIMEOUT_MS, deadlineCap(deadlineMs)),
+});
 
 const inside = (root, target) => {
   const relative = path.relative(root, target);
@@ -140,8 +148,9 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
     browser = await ({ chromium, firefox, webkit }[input.browser]).launch({ headless: true });
     result.browser.version = browser.version();
     context = await browser.newContext({ viewport: { width: input.width, height: input.height }, baseURL, serviceWorkers: 'block' });
-    context.setDefaultTimeout(Math.min(ACTION_TIMEOUT_MS, input.timeoutMs));
-    context.setDefaultNavigationTimeout(Math.min(NAVIGATION_TIMEOUT_MS, input.timeoutMs));
+    const timeouts = defaultTimeouts(input.timeoutMs);
+    context.setDefaultTimeout(timeouts.action);
+    context.setDefaultNavigationTimeout(timeouts.navigation);
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
     const observe = p => {
       p.on('console', message => result.console.push({ source: 'page', type: message.type(), text: message.text(), location: message.location() }));
@@ -281,5 +290,5 @@ async function cli() {
   process.exitCode = summary.infrastructureError ? 1 : 0;
 }
 
-module.exports = { run, serve, summarize, workspaceFile, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS };
+module.exports = { run, serve, summarize, workspaceFile, defaultTimeouts, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS };
 if (require.main === module) cli().catch(error => { process.stderr.write(`${errorText(error)}\n`); process.exitCode = 1; });

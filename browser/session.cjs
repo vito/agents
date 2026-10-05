@@ -11,7 +11,7 @@ const assert = require('node:assert/strict');
 const { fork } = require('node:child_process');
 const { Console } = require('node:console');
 const { Writable } = require('node:stream');
-const { serve, workspaceFile, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS } = require('./runner.cjs');
+const { serve, workspaceFile, defaultTimeouts } = require('./runner.cjs');
 
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 128 * 1024 * 1024;
@@ -195,10 +195,11 @@ async function worker(config, workspace, working) {
     const checks = [], warnings = [];
     let inspection;
     const timeout = cmd.timeoutMs || 30000;
-    // Reset per command, capped by its deadline: a stuck action should fail as
-    // a check with Playwright's call log, not invalidate the whole session.
-    context.setDefaultTimeout(Math.min(ACTION_TIMEOUT_MS, timeout));
-    context.setDefaultNavigationTimeout(Math.min(NAVIGATION_TIMEOUT_MS, timeout));
+    // Reset per command, capped below its deadline: a stuck action should fail
+    // as a check with Playwright's call log, not invalidate the whole session.
+    const timeouts = defaultTimeouts(timeout);
+    context.setDefaultTimeout(timeouts.action);
+    context.setDefaultNavigationTimeout(timeouts.navigation);
     // Viewport by default, like other agent browser tools: full-page captures of
     // long pages are rarely legible once scaled for a model. Opt in with
     // {fullPage: true}, or narrow with {selector} or {clip: {x, y, width, height}}.

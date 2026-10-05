@@ -10,7 +10,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
-const { serve, summarize } = require('../runner.cjs');
+const { serve, summarize, defaultTimeouts } = require('../runner.cjs');
 const exec = promisify(execFile);
 const runner = path.resolve(__dirname, '../runner.cjs');
 
@@ -279,6 +279,15 @@ test('stuck actions fail fast with a call log; scripts can change the default', 
   assert.match(summary.checks[1].error, /Timeout 200ms exceeded/);
   assert.doesNotMatch(JSON.stringify(summary.checks), /Run timed out/);
   assert.match(report, /\n  ✗ default action timeout: locator\.click: Timeout 15000ms exceeded\.\n      Call log:\n        - waiting for locator\('#missing'\)\n/);
+});
+
+test('default timeouts leave headroom below short deadlines', () => {
+  assert.deepEqual(defaultTimeouts(120000), { action: 15000, navigation: 60000 });
+  assert.deepEqual(defaultTimeouts(30000), { action: 15000, navigation: 28000 });
+  // At or below 15s an uncapped default would race the deadline itself.
+  assert.deepEqual(defaultTimeouts(15000), { action: 13000, navigation: 13000 });
+  assert.deepEqual(defaultTimeouts(5000), { action: 3000, navigation: 3000 });
+  assert.deepEqual(defaultTimeouts(1000), { action: 500, navigation: 500 });
 });
 
 test('static serving rejects traversal and symlink escapes, disables caching', async t => {

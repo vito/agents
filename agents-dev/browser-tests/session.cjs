@@ -266,6 +266,15 @@ for (const resource of ['page', 'context', 'browser']) test(`closing the ${resou
   assert.deepEqual(await f.file(first.observation, 'screenshot.png'), bytes);
 });
 
+test('a stuck action under a short deadline fails its check and keeps the session', async t => {
+  const f = await fixture(t);
+  await navigate(f);
+  const result = await f.request({ op: 'exec', timeoutMs: 5000, script: `await check('stuck', async () => await page.locator('#missing').click());` });
+  assert.equal(result.summary.state, 'running');
+  assert.match(result.summary.checks[0].error, /Timeout 3000ms exceeded[\s\S]*Call log/);
+  passes(await f.request({ op: 'exec', script: '' }));
+});
+
 test('browser closure between commands stays failed after the idle deadline', async t => {
   const f = await fixture(t, { idleTimeoutMs: 600 });
   const marker = path.join(f.root, 'close-browser');
