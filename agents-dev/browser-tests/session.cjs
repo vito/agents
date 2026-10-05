@@ -275,6 +275,14 @@ test('a stuck action under a short deadline fails its check and keeps the sessio
   passes(await f.request({ op: 'exec', script: '' }));
 });
 
+test('refused requests report the reason without a stack', async t => {
+  const f = await fixture(t);
+  await f.request({ op: 'exec', timeoutMs: 200, script: 'await new Promise(() => {});' });
+  const refused = await f.request({ op: 'exec', script: '' }).then(() => null, error => error);
+  const { error } = JSON.parse(refused.message.replace(/^400: /, ''));
+  assert.equal(error, 'Session is failed: Command timed out after 200ms; session invalidated');
+});
+
 test('browser closure between commands stays failed after the idle deadline', async t => {
   const f = await fixture(t, { idleTimeoutMs: 600 });
   const marker = path.join(f.root, 'close-browser');

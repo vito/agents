@@ -411,7 +411,9 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       state = { ...state, ...Object.fromEntries(['state', 'browser', 'playwrightVersion', 'baseURL', 'url', 'fingerprint', 'loadedFingerprint', 'fixtureRevision'].map(key => [key, result[key]])), instanceID };
       result.instanceID = instanceID;
     } catch (error) {
-      state = { ...state, state: 'failed', failure: errorText(error) };
+      // failure is a reason, quoted by status lines and refused requests; the
+      // check below keeps the full error text for results.json.
+      state = { ...state, state: 'failed', failure: String(error?.message || error) };
       await kill();
       result = { ...state, observation: cmd.id, op: cmd.op, ok: false, counts: { total: 1, passed: 0, failed: 1 }, checks: [{ name: 'command', status: 'failed', error: errorText(error) }], warnings: [{ code: 'session-invalidated', message: 'Worker terminated before subsequent commands; final screenshot and trace may be unavailable' }], ...(cmd.script ? { scriptDigest: digest(cmd.script) } : {}) };
     } finally { clearTimeout(timer); pending = null; }
@@ -462,7 +464,12 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       let envelope;
       try { envelope = await task; } finally { queued--; armIdle(); }
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(envelope));
-    } catch (error) { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: clip(errorText(error)) })); }
+    } catch (error) {
+      // A refused request is an answer, not a crash: the message is the whole
+      // story ("Session is failed: ..."), and a controller stack trace would
+      // ride along into the tool output.
+      res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: clip(String(error?.message || error)) }));
+    }
   });
   server.requestTimeout = 650000;
   server.headersTimeout = 10000;

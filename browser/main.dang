@@ -538,6 +538,15 @@ type Browser {
   stop(session: String!): Browser! @cache(policy: FunctionCachePolicy.Never) {
     let svc = service(session)
     if (releasedSessions.contains(session)) { print("Session already released: " + session); return self }
+    let closed = closedSessions[session]
+    if (closed != null) {
+      # A failed or expired controller refuses commands, so asking it for a
+      # final capture only produces an error to report; just release it.
+      svc.stop(kill: true)
+      self.releasedSessions = releasedSessions + [session]
+      print("Released session: " + session + " (was " + closed + "; earlier observations remain readable)")
+      return self
+    }
     let id = Random.string
     let finished = retain(session, id, client(
       session,

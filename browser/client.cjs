@@ -50,7 +50,12 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
     try {
       response = await fetch(new URL(pathname, url), { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
     } catch (error) { throw new Error(`Browser control transport failed at ${url.origin}: ${error.message}`, { cause: error }); }
-    if (!response.ok) throw new Error(`Browser control rejected request (${response.status}): ${(await response.text()).slice(0, 8000)}`);
+    if (!response.ok) {
+      const body = await response.text();
+      let reason = body;
+      try { reason = JSON.parse(body).error ?? body; } catch {}
+      throw new Error(`Browser control rejected request (${response.status}): ${String(reason).slice(0, 8000)}`);
+    }
     return response;
   };
   command = { ...command, ...(instance ? { expectedInstance: instance } : {}) };
@@ -94,4 +99,6 @@ async function main() {
   process.stdout.write(await fs.readFile(reportPath, 'utf8'));
 }
 module.exports = { client, packageSource };
-if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
+// Our own errors are messages for the agent; only unexpected failures (no
+// message) fall back to the full text.
+if (require.main === module) main().catch(error => { process.stderr.write(`${error?.message || error?.stack || error}\n`); process.exitCode = 1; });
