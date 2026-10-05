@@ -4,6 +4,7 @@
 // evidence here decouples retained observations from the live service lifetime.
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { renderSession, renderStatus } = require('./report.cjs');
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const safeRelative = name => typeof name === 'string' && name.length > 0 && name.length <= 1024 && !name.includes('\\') && !name.includes('\0') && !path.posix.isAbsolute(name) && name.split('/').every(part => part !== '' && part !== '.' && part !== '..');
 
@@ -40,7 +41,7 @@ async function packageSource(root) {
   return files;
 }
 
-async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json' } = {}) {
+async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json', reportPath = '/report.txt', statusPath = '/status.txt' } = {}) {
   if (!endpoint || !token) throw new Error('BROWSER_ENDPOINT and BROWSER_TOKEN are required');
   const url = new URL(endpoint);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid browser control endpoint');
@@ -76,13 +77,21 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
   }
   await fs.writeFile(summaryPath, JSON.stringify(envelope, null, 2));
   await fs.writeFile(statePath, JSON.stringify(envelope.summary));
+  // Text for the agent, rendered from the evidence just materialized.
+  const events = async name => envelope.artifacts.includes(name) ? JSON.parse(await fs.readFile(path.join(artifacts, name), 'utf8')).events : undefined;
+  const files = { console: await events('console.json'), network: await events('network.json'), pageerrors: await events('pageerrors.json') };
+  if (command.op === 'inspect' && ['console', 'network', 'pageerrors'].includes(command.kind)) files.inspected = await events(`inspect-${command.kind}.json`);
+  await fs.writeFile(reportPath, renderSession(command, envelope.summary, files));
+  await fs.writeFile(statusPath, renderStatus(envelope.summary));
   return envelope;
 }
 
 async function main() {
   const command = JSON.parse(await fs.readFile(process.argv[2] || '/command.json', 'utf8'));
-  const envelope = await client(command);
-  process.stdout.write(`${JSON.stringify(envelope.summary)}\n`);
+  await client(command);
+  // The exec's output is what the agent sees. Status requests stay quiet: the
+  // module prints or lists their files itself.
+  if (command.op !== 'status') process.stdout.write(await fs.readFile('/report.txt', 'utf8'));
 }
 module.exports = { client, packageSource };
 if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

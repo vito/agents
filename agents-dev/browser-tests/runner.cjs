@@ -10,7 +10,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { execFile } = require('node:child_process');
 const { promisify } = require('node:util');
-const { serve } = require('../runner.cjs');
+const { serve, summarize } = require('../runner.cjs');
 const exec = promisify(execFile);
 const runner = path.resolve(__dirname, '../runner.cjs');
 
@@ -28,10 +28,10 @@ async function fixture(t) {
       const inputPath = path.join(root, 'input.json');
       await fs.writeFile(inputPath, JSON.stringify(input));
       const { stdout } = await exec(process.execPath, [runner, inputPath, workspace, artifacts], { timeout: 45000, maxBuffer: 1024 * 1024 });
-      assert.equal(stdout.trim().split('\n').length, 1, 'stdout contains only one summary');
-      const summary = JSON.parse(stdout);
+      // stdout is the agent's text report; the JSON contract is results.json.
+      assert.match(stdout, /^[✓✗] /, 'stdout is a rendered report');
       const result = JSON.parse(await fs.readFile(path.join(artifacts, 'results.json'), 'utf8'));
-      return { summary, result };
+      return { summary: summarize(result), result, report: stdout };
     },
   };
 }
@@ -47,8 +47,8 @@ async function evidence(dir) {
 
 test('no automatic navigation; named checks, version, logs and artifacts', async t => {
   const f = await fixture(t);
-  const { summary, result } = await f.run(`
-    console.log('script logs must not pollute summary stdout');
+  const { summary, result, report } = await f.run(`
+    console.log('script logs are reported apart from page logs');
     await check('initial page is blank', async () => assert.equal(page.url(), 'about:blank'));
     await page.goto(baseURL);
     await check('title', async () => await expect(page).toHaveTitle('Fixture'));
@@ -68,10 +68,19 @@ test('no automatic navigation; named checks, version, logs and artifacts', async
   assert.ok(summary.browser.version);
   t.diagnostic(`Browser: ${summary.browser.name} ${summary.browser.version}; Playwright: ${summary.playwrightVersion}; fixture fingerprint: ${summary.fingerprint}`);
   assert.ok(result.console.some(event => event.source === 'page' && event.text === 'hello from page'));
-  assert.ok(result.console.some(event => event.source === 'script' && event.text === 'script logs must not pollute summary stdout'));
+  assert.ok(result.console.some(event => event.source === 'script' && event.text === 'script logs are reported apart from page logs'));
   assert.ok(result.pageErrors.some(error => error.includes('page error example')));
   assert.ok(result.network.some(event => event.type === 'failed' && event.url.endsWith('/broken')));
   assert.ok(summary.artifacts.includes('named-evidence.png'));
+  t.diagnostic(report);
+  assert.match(report, new RegExp(`^✓ 2 checks passed · chromium ${summary.browser.version.replaceAll('.', '\\.')} · source test-fingerprint · \\d+(ms|\\.\\ds)\\n`));
+  assert.match(report, /\n  ✓ initial page is blank, title\n/);
+  assert.match(report, /\nscript:\n  script logs are reported apart from page logs\npage: 1 error · 1 failed request · 0 HTTP errors · 2 console \(1 log, 1 error\)\n/);
+  assert.match(report, /\n  error: page error example\n/);
+  assert.match(report, /\n  failed: http:\/\/127\.0\.0\.1:\d+\/broken \(net::ERR_FAILED\)\n/);
+  assert.match(report, /\n  console\.error: Failed to load resource: net::ERR_FAILED\n/);
+  assert.doesNotMatch(report, /hello from page/, 'page console lines other than errors/warnings are counted, not listed');
+  assert.match(report, /\nartifacts: named-evidence\.png \(\+ screenshot\.png, results\.json, trace\.zip, console\.json, network\.json, pageerrors\.json\)\n$/);
   await evidence(f.artifacts);
   assert.deepEqual(await fs.readdir(f.workspace), ['index.html'], 'harness does not write into workspace');
 });
@@ -199,7 +208,7 @@ test('invalid replacements preserve mocks; registered headers and buffers are sn
 
 test('assertion failures are results, continue execution, and retain evidence', async t => {
   const f = await fixture(t);
-  const { summary } = await f.run(`
+  const { summary, report } = await f.run(`
     await page.goto(baseURL);
     await check('reported failure', async () => assert.equal(1, 2));
     await check('still running', async () => assert.equal(2, 2));
@@ -208,6 +217,10 @@ test('assertion failures are results, continue execution, and retain evidence', 
   assert.deepEqual(summary.counts, { total: 2, passed: 1, failed: 1 });
   assert.equal(summary.checks[0].name, 'reported failure');
   assert.match(summary.checks[0].error, /AssertionError/);
+  // Real newlines and indentation, no stack frames, the script line kept.
+  assert.match(report, /^✗ 1 of 2 checks failed · /);
+  assert.match(report, /\n  ✗ reported failure: AssertionError \[ERR_ASSERTION\]: Expected values to be strictly equal:\n      1 !== 2\n      \(script line 3\)\n  ✓ still running\n/);
+  assert.doesNotMatch(report, /\\n|^\s+at /m);
   await evidence(f.artifacts);
 });
 
@@ -254,7 +267,7 @@ test('synchronous runaway is stopped by the process watchdog', async t => {
 
 test('stuck actions fail fast with a call log; scripts can change the default', async t => {
   const f = await fixture(t);
-  const { summary } = await f.run(`
+  const { summary, report } = await f.run(`
     await page.goto(baseURL);
     await check('default action timeout', async () => await page.locator('#missing').click());
     page.setDefaultTimeout(200);
@@ -265,6 +278,7 @@ test('stuck actions fail fast with a call log; scripts can change the default', 
   assert.match(summary.checks[0].error, /Timeout 15000ms exceeded[\s\S]*Call log/);
   assert.match(summary.checks[1].error, /Timeout 200ms exceeded/);
   assert.doesNotMatch(JSON.stringify(summary.checks), /Run timed out/);
+  assert.match(report, /\n  ✗ default action timeout: locator\.click: Timeout 15000ms exceeded\.\n      Call log:\n        - waiting for locator\('#missing'\)\n/);
 });
 
 test('static serving rejects traversal and symlink escapes, disables caching', async t => {

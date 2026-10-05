@@ -10,6 +10,7 @@ const { fork } = require('node:child_process');
 const { performance } = require('node:perf_hooks');
 const { Console } = require('node:console');
 const { Writable } = require('node:stream');
+const { renderRun } = require('./report.cjs');
 
 // Inventory regular files recursively, without following user-created symlinks.
 async function artifactFiles(root, prefix = '') {
@@ -274,9 +275,11 @@ async function cli() {
     summary = summarize(partial);
   }
   if (!summary) throw new Error(`Browser worker exited without results (code ${code}, signal ${signal})`);
-  process.stdout.write(`${JSON.stringify(summary)}\n`);
+  // stdout is the agent's report; the JSON contract stays in results.json.
+  const result = JSON.parse(await fs.readFile(path.join(artifacts, 'results.json'), 'utf8'));
+  process.stdout.write(renderRun(result));
   process.exitCode = summary.infrastructureError ? 1 : 0;
 }
 
-module.exports = { run, serve, workspaceFile, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS };
+module.exports = { run, serve, summarize, workspaceFile, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS };
 if (require.main === module) cli().catch(error => { process.stderr.write(`${errorText(error)}\n`); process.exitCode = 1; });

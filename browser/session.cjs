@@ -127,7 +127,7 @@ async function worker(config, workspace, working) {
   const sourceDirs = [];
   const routes = new Map();
   const observedCursors = { console: 0, network: 0, pageerrors: 0 };
-  const summary = () => ({ session: config.session, state: 'running', browser: { name: config.browser, version: browser.version() }, playwrightVersion: require('@playwright/test/package.json').version, baseURL, fingerprint, loadedFingerprint, fixtureRevision });
+  const summary = () => ({ session: config.session, state: 'running', browser: { name: config.browser, version: browser.version() }, playwrightVersion: require('@playwright/test/package.json').version, baseURL, url: page.url(), fingerprint, loadedFingerprint, fixtureRevision });
   const notify = () => process.send?.({ state: summary() });
   context.on('page', p => {
     p.on('console', message => events.console.add({ source: 'page', type: message.type(), text: clip(message.text(), 16000), location: message.location() }));
@@ -312,6 +312,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   const child = fork(__filename, ['--worker', JSON.stringify({ ...config, token: undefined }), workspace, working], { detached: true, stdio: ['ignore', 'ignore', 'inherit', 'ipc'], env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^BROWSER_(TOKEN|INSTANCE|ENDPOINT)$/.test(key))) });
   let state = { session: config.session, instanceID, state: 'starting', fingerprint: config.fingerprint || '', loadedFingerprint: null, fixtureRevision: 0 };
   let pending, exited = false, killTask, idle, queue = Promise.resolve(), queued = 0, usedBytes = 0;
+  let lastActivity = Date.now(), lastObservation = null;
   const retained = new Map();
   const ids = new Set();
   let startupResolve, startupReject;
@@ -394,7 +395,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   async function execute(cmd) {
     validateCommand(cmd);
     if (cmd.expectedInstance && cmd.expectedInstance !== instanceID) throw new Error('Session instance changed; refusing to use a restarted service');
-    if (cmd.op === 'status') return { summary: { ...state, retainedObservations: retained.size }, artifacts: [] };
+    if (cmd.op === 'status') return { summary: { ...state, retainedObservations: retained.size, idleMs: Date.now() - lastActivity, lastObservation }, artifacts: [] };
     if (state.state !== 'running') throw new Error(`Session is ${state.state}: ${state.failure || 'not running'}`);
     if (ids.has(cmd.id)) throw new Error('Observation ID already used; observations are immutable');
     if (cmd.op !== 'stop' && (ids.size >= MAX_OBSERVATIONS || usedBytes >= MAX_SESSION_BYTES)) throw new Error('Session retention limit reached; stop and start a new session');
@@ -406,7 +407,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
         new Promise((resolve, reject) => { pending = { id: cmd.id, resolve, reject }; child.send(cmd); }),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Command timed out after ${cmd.timeoutMs || 30000}ms; session invalidated`)), cmd.timeoutMs || 30000); }),
       ]);
-      state = { ...state, ...Object.fromEntries(['state', 'browser', 'playwrightVersion', 'baseURL', 'fingerprint', 'loadedFingerprint', 'fixtureRevision'].map(key => [key, result[key]])), instanceID };
+      state = { ...state, ...Object.fromEntries(['state', 'browser', 'playwrightVersion', 'baseURL', 'url', 'fingerprint', 'loadedFingerprint', 'fixtureRevision'].map(key => [key, result[key]])), instanceID };
       result.instanceID = instanceID;
     } catch (error) {
       state = { ...state, state: 'failed', failure: errorText(error) };
@@ -414,6 +415,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       result = { ...state, observation: cmd.id, op: cmd.op, ok: false, counts: { total: 1, passed: 0, failed: 1 }, checks: [{ name: 'command', status: 'failed', error: errorText(error) }], warnings: [{ code: 'session-invalidated', message: 'Worker terminated before subsequent commands; final screenshot and trace may be unavailable' }], ...(cmd.script ? { scriptDigest: digest(cmd.script) } : {}) };
     } finally { clearTimeout(timer); pending = null; }
     const envelope = await publish(cmd, result);
+    lastActivity = Date.now(); lastObservation = cmd.id;
     if (state.state !== 'running') { await kill(); await fs.rm(working, { recursive: true, force: true }); }
     return envelope;
   }

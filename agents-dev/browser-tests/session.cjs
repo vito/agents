@@ -343,31 +343,67 @@ test('idle expiry closes the browser while retained observations remain fetchabl
   assert.deepEqual(await f.file(first.observation, 'screenshot.png'), bytes);
 });
 
-test('client materializes immutable evidence and state, detects restarts, and prints only JSON', async t => {
+test('client materializes immutable evidence and state, detects restarts, and prints a text report', async t => {
   const f = await fixture(t);
   const output = path.join(f.root, 'client'); await fs.mkdir(output);
-  const options = { endpoint: f.service.endpoint, token: f.token, instance: f.service.instanceID, artifacts: path.join(output, 'artifacts'), summaryPath: path.join(output, 'summary.json'), statePath: path.join(output, 'state.json') };
+  const options = { endpoint: f.service.endpoint, token: f.token, instance: f.service.instanceID, artifacts: path.join(output, 'artifacts'), summaryPath: path.join(output, 'summary.json'), statePath: path.join(output, 'state.json'), reportPath: path.join(output, 'report.txt'), statusPath: path.join(output, 'status.txt') };
   const artifactInstances = [];
   f.service.server.on('request', req => {
     const url = new URL(req.url, f.service.endpoint);
     if (url.pathname === '/artifact') artifactInstances.push(url.searchParams.get('expectedInstance'));
   });
-  const result = await client({ op: 'exec', id: 'client-observation', script: `console.log('captured, not stdout'); await page.goto(baseURL);` }, options);
-  passes(result);
+  const result = await client({ op: 'exec', id: 'client-observation', script: `console.log('script output, reported'); await page.goto(baseURL); await check('loaded', async () => await expect(page).toHaveTitle('Session fixture')); await check('intentional', async () => assert.equal(1, 2));` }, options);
+  assert.equal(result.summary.ok, false);
   assert.deepEqual(JSON.parse(await fs.readFile(options.summaryPath, 'utf8')), result);
   assert.equal(JSON.parse(await fs.readFile(options.statePath, 'utf8')).instanceID, f.service.instanceID);
   assert.deepEqual((await fs.readdir(options.artifacts)).sort(), result.artifacts);
   assert.deepEqual(artifactInstances, result.artifacts.map(() => f.service.instanceID));
+  const report = await fs.readFile(options.reportPath, 'utf8');
+  t.diagnostic(report);
+  assert.match(report, /^✗ 1 of 2 checks failed · http:\/\/127\.0\.0\.1:\d+\/ · \d+(ms|\.\ds)\n/);
+  assert.match(report, /\n  ✗ intentional: AssertionError \[ERR_ASSERTION\]: Expected values to be strictly equal:\n      1 !== 2\n/);
+  assert.match(report, /\n  ✓ loaded\nscript:\n  script output, reported\npage: 0 errors · 0 failed requests · \d+ HTTP errors? · /);
+  assert.match(report, /\nartifacts: screenshot\.png, results\.json, trace\.zip, console\.json, network\.json, pageerrors\.json\n$/);
+  assert.match(await fs.readFile(options.statusPath, 'utf8'), /^test-session live · http:\/\/127\.0\.0\.1:\d+\/ · last client-observation$/);
   await assert.rejects(client({ op: 'status' }, { ...options, instance: 'restarted' }), /instance changed/);
   // The CLI's fixed paths are safe in the disposable prepared test container.
   await fs.rm('/artifacts', { recursive: true, force: true });
   const command = path.join(output, 'command.json'); await fs.writeFile(command, JSON.stringify({ op: 'status' }));
   const { stdout } = await exec(process.execPath, [path.resolve(__dirname, '../client.cjs'), command], { env: { ...process.env, BROWSER_ENDPOINT: f.service.endpoint, BROWSER_TOKEN: f.token, BROWSER_INSTANCE: f.service.instanceID } });
-  assert.equal(stdout.trim().split('\n').length, 1);
-  assert.equal(JSON.parse(stdout).state, 'running');
+  assert.equal(stdout, '', 'status requests leave display to the module');
+  assert.match(await fs.readFile('/status.txt', 'utf8'), /^test-session live · http:\/\/127\.0\.0\.1:\d+\/ · idle \d+s · last client-observation$/);
+  assert.match(await fs.readFile('/report.txt', 'utf8'), /^✓ live · chromium [\d.]+ · Playwright 1\.58\.2 · source source-v1\nbaseURL: http:\/\/127\.0\.0\.1:\d+\n$/);
   const bytes = await fs.readFile(path.join(options.artifacts, 'screenshot.png'));
   await f.request({ op: 'stop' });
   assert.deepEqual(await fs.readFile(path.join(options.artifacts, 'screenshot.png')), bytes);
+});
+
+test('session reports render inspections, invalidation and status lines', async t => {
+  const f = await fixture(t);
+  const output = path.join(f.root, 'reports'); await fs.mkdir(output);
+  const call = async (command, name) => {
+    const dir = path.join(output, name); await fs.mkdir(dir);
+    const paths = { artifacts: path.join(dir, 'artifacts'), summaryPath: path.join(dir, 'summary.json'), statePath: path.join(dir, 'state.json'), reportPath: path.join(dir, 'report.txt'), statusPath: path.join(dir, 'status.txt') };
+    await client({ id: name, ...command }, { endpoint: f.service.endpoint, token: f.token, instance: f.service.instanceID, ...paths });
+    const report = await fs.readFile(paths.reportPath, 'utf8');
+    t.diagnostic(report);
+    return { report, status: await fs.readFile(paths.statusPath, 'utf8') };
+  };
+  const started = await call({ op: 'status' }, 'started');
+  assert.match(started.report, /^✓ live · chromium [\d.]+ · Playwright 1\.58\.2 · source source-v1\nbaseURL: http:\/\/127\.0\.0\.1:\d+\n$/);
+  assert.match(started.status, /^test-session live · about:blank · idle \d+s$/);
+  const navigated = await call({ op: 'exec', script: `await mock('**/poll', {json: {value: 'ok'}}); await page.goto(baseURL); await page.evaluate(() => { console.warn('careful'); console.debug('noise'); });` }, 'navigated');
+  assert.match(navigated.report, /^✓ no checks · http:\/\/127\.0\.0\.1:\d+\/ · /);
+  assert.match(navigated.report, /\npage: 0 errors · 0 failed requests · 0 HTTP errors · 2 console \((1 warning, 1 debug|1 debug, 1 warning)\)\n  console\.warning: careful\n/);
+  const logs = await call({ op: 'inspect', kind: 'console' }, 'logs');
+  assert.match(logs.report, /^✓ inspect console · http:\/\/127\.0\.0\.1:\d+\/ · /);
+  assert.match(logs.report, /\nconsole: inspect-console\.json\n  warning: careful\n  debug: noise\n  \(next cursor \d+\)\n/);
+  const dom = await call({ op: 'inspect', kind: 'dom', selector: '#filter' }, 'dom');
+  assert.match(dom.report, /\ndom: inspect-dom\.html\n  <input id="filter" value="persistent filter"[^>\n]*>\n/);
+  const hung = await call({ op: 'exec', timeoutMs: 200, script: 'await new Promise(() => {});' }, 'hung');
+  assert.match(hung.report, /^✗ 1 of 1 check failed · http:\/\/127\.0\.0\.1:\d+\/\n/);
+  assert.match(hung.report, /\nsession failed: Command timed out after 200ms; session invalidated; start a new session\n  ✗ command: Command timed out after 200ms; session invalidated\n/);
+  assert.match(hung.status, /^test-session closed \(failed: Command timed out after 200ms; session invalidated\) · http:\/\/127\.0\.0\.1:\d+\/ · last hung$/);
 });
 
 test('event buffers report dropped and remaining ranges without duplicate cursors', () => {
