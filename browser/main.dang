@@ -99,6 +99,10 @@ type Browser {
   Playwright's call log; expect keeps its 5s default. Raise them in the script
   with page.setDefaultTimeout/setDefaultNavigationTimeout or {timeout} per call.
 
+  /workspace holds a snapshot of root (the whole workspace in url mode), taken
+  at call time and including pending edits: scripts can require('/workspace/...')
+  helper modules and read fixtures from it. Writes there are discarded.
+
   Example: await mock('**/snapshot.json', {json: {tools: []}});
   await page.goto(baseURL); await check('empty', async () => {
     await expect(page.locator('#tools')).toBeEmpty();
@@ -273,6 +277,11 @@ type Browser {
   and their binding names. No host credentials or host networking are inherited.
   Idle sessions close after idleTimeoutMs; a dead session is never resumed as a
   fresh browser. At most four unreleased sessions are allowed per toolset.
+
+  /workspace in the session holds a snapshot of root (the whole workspace in url
+  mode) taken when start is called, including pending edits, for exec scripts to
+  require('/workspace/...') helpers and fixtures. syncWorkspace updates the
+  served files and mock files, not /workspace; start a new session to refresh it.
   """
   start(
     ws: Workspace!,
@@ -404,7 +413,8 @@ type Browser {
   Each exec resets context defaults to 15s for actions and locator waits and 60s
   for navigation, capped at timeoutMs, so a stuck locator fails as a check with
   Playwright's call log instead of hitting the deadline; page.setDefaultTimeout
-  overrides persist with the page.
+  overrides persist with the page. /workspace is the snapshot taken at start;
+  scriptPath is read from the current workspace at call time.
   """
   exec(
     ws: Workspace!,
@@ -678,6 +688,11 @@ type Browser {
   log; expect keeps its 5s default. Pass {timeout} per call or use
   page.setDefaultTimeout/setDefaultNavigationTimeout for slow apps, and keep them
   below timeoutMs: an exec that reaches its deadline invalidates the session.
+
+  Scripts see a snapshot of root (the whole workspace in url mode) at /workspace,
+  including pending edits: require('/workspace/...') shared helpers or read
+  fixtures from it. run snapshots at each call; a session snapshots at start, and
+  syncWorkspace refreshes served files but not /workspace.
 
   Each exec/inspect/syncWorkspace/stop returns an immutable OBSERVATION handle;
   run returns an equivalent run handle. Pass those to artifacts/readArtifact/
