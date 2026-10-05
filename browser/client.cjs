@@ -4,6 +4,7 @@
 // evidence here decouples retained observations from the live service lifetime.
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { renderSession, renderStatus } = require('./report.cjs');
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const safeRelative = name => typeof name === 'string' && name.length > 0 && name.length <= 1024 && !name.includes('\\') && !name.includes('\0') && !path.posix.isAbsolute(name) && name.split('/').every(part => part !== '' && part !== '.' && part !== '..');
 
@@ -40,7 +41,7 @@ async function packageSource(root) {
   return files;
 }
 
-async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json' } = {}) {
+async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json', reportPath = null, statusPath = '/status.txt' } = {}) {
   if (!endpoint || !token) throw new Error('BROWSER_ENDPOINT and BROWSER_TOKEN are required');
   const url = new URL(endpoint);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid browser control endpoint');
@@ -49,7 +50,12 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
     try {
       response = await fetch(new URL(pathname, url), { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` }, redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
     } catch (error) { throw new Error(`Browser control transport failed at ${url.origin}: ${error.message}`, { cause: error }); }
-    if (!response.ok) throw new Error(`Browser control rejected request (${response.status}): ${(await response.text()).slice(0, 8000)}`);
+    if (!response.ok) {
+      const body = await response.text();
+      let reason = body;
+      try { reason = JSON.parse(body).error ?? body; } catch {}
+      throw new Error(`Browser control rejected request (${response.status}): ${String(reason).slice(0, 8000)}`);
+    }
     return response;
   };
   command = { ...command, ...(instance ? { expectedInstance: instance } : {}) };
@@ -76,13 +82,23 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
   }
   await fs.writeFile(summaryPath, JSON.stringify(envelope, null, 2));
   await fs.writeFile(statePath, JSON.stringify(envelope.summary));
+  // Text for the agent, rendered from the evidence just materialized.
+  const events = async name => envelope.artifacts.includes(name) ? JSON.parse(await fs.readFile(path.join(artifacts, name), 'utf8')).events : undefined;
+  const files = { console: await events('console.json'), network: await events('network.json'), pageerrors: await events('pageerrors.json') };
+  if (command.op === 'inspect' && ['console', 'network', 'pageerrors'].includes(command.kind)) files.inspected = await events(`inspect-${command.kind}.json`);
+  if (reportPath) await fs.writeFile(reportPath, renderSession(command, envelope.summary, files));
+  await fs.writeFile(statusPath, renderStatus(envelope.summary));
   return envelope;
 }
 
 async function main() {
   const command = JSON.parse(await fs.readFile(process.argv[2] || '/command.json', 'utf8'));
-  const envelope = await client(command);
-  process.stdout.write(`${JSON.stringify(envelope.summary)}\n`);
+  const reportPath = '/tmp/browser-report.txt';
+  await client(command, { reportPath });
+  // The module runs this with redirectStdout and prints that file itself.
+  process.stdout.write(await fs.readFile(reportPath, 'utf8'));
 }
 module.exports = { client, packageSource };
-if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });
+// Our own errors are messages for the agent; only unexpected failures (no
+// message) fall back to the full text.
+if (require.main === module) main().catch(error => { process.stderr.write(`${error?.message || error?.stack || error}\n`); process.exitCode = 1; });

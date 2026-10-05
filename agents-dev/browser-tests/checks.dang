@@ -4,7 +4,7 @@ let browserSnapshot(state: Dagger.Browser!): Dagger.Browser! {
 }
 
 let browserSessionHandle(state: Dagger.Browser!): String! {
-  let handle = state.sessions.match(`"session":\s*"([^"]+)"`).captures[0] ?? ""
+  let handle = state.sessions.match(`^(\S+) live`).captures[0] ?? ""
   assert { handle != "" }
   handle
 }

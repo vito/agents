@@ -11,7 +11,7 @@ const assert = require('node:assert/strict');
 const { fork } = require('node:child_process');
 const { Console } = require('node:console');
 const { Writable } = require('node:stream');
-const { serve, workspaceFile } = require('./runner.cjs');
+const { serve, workspaceFile, defaultTimeouts } = require('./runner.cjs');
 
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 128 * 1024 * 1024;
@@ -127,7 +127,7 @@ async function worker(config, workspace, working) {
   const sourceDirs = [];
   const routes = new Map();
   const observedCursors = { console: 0, network: 0, pageerrors: 0 };
-  const summary = () => ({ session: config.session, state: 'running', browser: { name: config.browser, version: browser.version() }, playwrightVersion: require('@playwright/test/package.json').version, baseURL, fingerprint, loadedFingerprint, fixtureRevision });
+  const summary = () => ({ session: config.session, state: 'running', browser: { name: config.browser, version: browser.version() }, playwrightVersion: require('@playwright/test/package.json').version, baseURL, url: page.url(), fingerprint, loadedFingerprint, fixtureRevision });
   const notify = () => process.send?.({ state: summary() });
   context.on('page', p => {
     p.on('console', message => events.console.add({ source: 'page', type: message.type(), text: clip(message.text(), 16000), location: message.location() }));
@@ -195,8 +195,11 @@ async function worker(config, workspace, working) {
     const checks = [], warnings = [];
     let inspection;
     const timeout = cmd.timeoutMs || 30000;
-    context.setDefaultTimeout(timeout);
-    context.setDefaultNavigationTimeout(timeout);
+    // Reset per command, capped below its deadline: a stuck action should fail
+    // as a check with Playwright's call log, not invalidate the whole session.
+    const timeouts = defaultTimeouts(timeout);
+    context.setDefaultTimeout(timeouts.action);
+    context.setDefaultNavigationTimeout(timeouts.navigation);
     // Viewport by default, like other agent browser tools: full-page captures of
     // long pages are rarely legible once scaled for a model. Opt in with
     // {fullPage: true}, or narrow with {selector} or {clip: {x, y, width, height}}.
@@ -310,6 +313,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   const child = fork(__filename, ['--worker', JSON.stringify({ ...config, token: undefined }), workspace, working], { detached: true, stdio: ['ignore', 'ignore', 'inherit', 'ipc'], env: Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^BROWSER_(TOKEN|INSTANCE|ENDPOINT)$/.test(key))) });
   let state = { session: config.session, instanceID, state: 'starting', fingerprint: config.fingerprint || '', loadedFingerprint: null, fixtureRevision: 0 };
   let pending, exited = false, killTask, idle, queue = Promise.resolve(), queued = 0, usedBytes = 0;
+  let lastActivity = Date.now(), lastObservation = null;
   const retained = new Map();
   const ids = new Set();
   let startupResolve, startupReject;
@@ -392,7 +396,7 @@ async function controller(config, { workspace = '/workspace', observations = '/o
   async function execute(cmd) {
     validateCommand(cmd);
     if (cmd.expectedInstance && cmd.expectedInstance !== instanceID) throw new Error('Session instance changed; refusing to use a restarted service');
-    if (cmd.op === 'status') return { summary: { ...state, retainedObservations: retained.size }, artifacts: [] };
+    if (cmd.op === 'status') return { summary: { ...state, retainedObservations: retained.size, idleMs: Date.now() - lastActivity, lastObservation }, artifacts: [] };
     if (state.state !== 'running') throw new Error(`Session is ${state.state}: ${state.failure || 'not running'}`);
     if (ids.has(cmd.id)) throw new Error('Observation ID already used; observations are immutable');
     if (cmd.op !== 'stop' && (ids.size >= MAX_OBSERVATIONS || usedBytes >= MAX_SESSION_BYTES)) throw new Error('Session retention limit reached; stop and start a new session');
@@ -404,14 +408,17 @@ async function controller(config, { workspace = '/workspace', observations = '/o
         new Promise((resolve, reject) => { pending = { id: cmd.id, resolve, reject }; child.send(cmd); }),
         new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Command timed out after ${cmd.timeoutMs || 30000}ms; session invalidated`)), cmd.timeoutMs || 30000); }),
       ]);
-      state = { ...state, ...Object.fromEntries(['state', 'browser', 'playwrightVersion', 'baseURL', 'fingerprint', 'loadedFingerprint', 'fixtureRevision'].map(key => [key, result[key]])), instanceID };
+      state = { ...state, ...Object.fromEntries(['state', 'browser', 'playwrightVersion', 'baseURL', 'url', 'fingerprint', 'loadedFingerprint', 'fixtureRevision'].map(key => [key, result[key]])), instanceID };
       result.instanceID = instanceID;
     } catch (error) {
-      state = { ...state, state: 'failed', failure: errorText(error) };
+      // failure is a reason, quoted by status lines and refused requests; the
+      // check below keeps the full error text for results.json.
+      state = { ...state, state: 'failed', failure: String(error?.message || error) };
       await kill();
       result = { ...state, observation: cmd.id, op: cmd.op, ok: false, counts: { total: 1, passed: 0, failed: 1 }, checks: [{ name: 'command', status: 'failed', error: errorText(error) }], warnings: [{ code: 'session-invalidated', message: 'Worker terminated before subsequent commands; final screenshot and trace may be unavailable' }], ...(cmd.script ? { scriptDigest: digest(cmd.script) } : {}) };
     } finally { clearTimeout(timer); pending = null; }
     const envelope = await publish(cmd, result);
+    lastActivity = Date.now(); lastObservation = cmd.id;
     if (state.state !== 'running') { await kill(); await fs.rm(working, { recursive: true, force: true }); }
     return envelope;
   }
@@ -457,7 +464,12 @@ async function controller(config, { workspace = '/workspace', observations = '/o
       let envelope;
       try { envelope = await task; } finally { queued--; armIdle(); }
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(envelope));
-    } catch (error) { res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: clip(errorText(error)) })); }
+    } catch (error) {
+      // A refused request is an answer, not a crash: the message is the whole
+      // story ("Session is failed: ..."), and a controller stack trace would
+      // ride along into the tool output.
+      res.writeHead(400, { 'Content-Type': 'application/json' }).end(JSON.stringify({ error: clip(String(error?.message || error)) }));
+    }
   });
   server.requestTimeout = 650000;
   server.headersTimeout = 10000;

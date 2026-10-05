@@ -58,11 +58,13 @@ type Staff {
   """
   Compose the staff-chief tools onto a base LLM.
   """
+  # Bump version when stored fields are removed or change meaning, so older
+  # saved tool state is discarded instead of failing to load.
   agent(base: LLM!): LLM! @agent {
     let tools = currentNode.{{... on Dagger.Staff!}}
       .withCompositionSource(base.workspace)
     base
-      .withTools(tools, except: plumbing)
+      .withTools(tools, except: plumbing, version: 1)
       .withSystemPrompt(chiefPrompt)
   }
 
