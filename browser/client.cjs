@@ -41,7 +41,7 @@ async function packageSource(root) {
   return files;
 }
 
-async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json', reportPath = '/report.txt', statusPath = '/status.txt' } = {}) {
+async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token = process.env.BROWSER_TOKEN, instance = process.env.BROWSER_INSTANCE, source = '/sync-source', artifacts = '/artifacts', summaryPath = '/summary.json', statePath = '/state.json', reportPath = null, statusPath = '/status.txt' } = {}) {
   if (!endpoint || !token) throw new Error('BROWSER_ENDPOINT and BROWSER_TOKEN are required');
   const url = new URL(endpoint);
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid browser control endpoint');
@@ -81,17 +81,17 @@ async function client(command, { endpoint = process.env.BROWSER_ENDPOINT, token 
   const events = async name => envelope.artifacts.includes(name) ? JSON.parse(await fs.readFile(path.join(artifacts, name), 'utf8')).events : undefined;
   const files = { console: await events('console.json'), network: await events('network.json'), pageerrors: await events('pageerrors.json') };
   if (command.op === 'inspect' && ['console', 'network', 'pageerrors'].includes(command.kind)) files.inspected = await events(`inspect-${command.kind}.json`);
-  await fs.writeFile(reportPath, renderSession(command, envelope.summary, files));
+  if (reportPath) await fs.writeFile(reportPath, renderSession(command, envelope.summary, files));
   await fs.writeFile(statusPath, renderStatus(envelope.summary));
   return envelope;
 }
 
 async function main() {
   const command = JSON.parse(await fs.readFile(process.argv[2] || '/command.json', 'utf8'));
-  await client(command);
-  // The exec's output is what the agent sees. Status requests stay quiet: the
-  // module prints or lists their files itself.
-  if (command.op !== 'status') process.stdout.write(await fs.readFile('/report.txt', 'utf8'));
+  const reportPath = '/tmp/browser-report.txt';
+  await client(command, { reportPath });
+  // The module runs this with redirectStdout and prints that file itself.
+  process.stdout.write(await fs.readFile(reportPath, 'utf8'));
 }
 module.exports = { client, packageSource };
 if (require.main === module) main().catch(error => { process.stderr.write(`${error.stack || error}\n`); process.exitCode = 1; });

@@ -370,9 +370,10 @@ test('client materializes immutable evidence and state, detects restarts, and pr
   await fs.rm('/artifacts', { recursive: true, force: true });
   const command = path.join(output, 'command.json'); await fs.writeFile(command, JSON.stringify({ op: 'status' }));
   const { stdout } = await exec(process.execPath, [path.resolve(__dirname, '../client.cjs'), command], { env: { ...process.env, BROWSER_ENDPOINT: f.service.endpoint, BROWSER_TOKEN: f.token, BROWSER_INSTANCE: f.service.instanceID } });
-  assert.equal(stdout, '', 'status requests leave display to the module');
+  // The CLI prints every report, status included; the module redirects
+  // stdout to a file and prints that.
+  assert.match(stdout, /^✓ live · chromium [\d.]+ · Playwright 1\.58\.2 · source source-v1\nbaseURL: http:\/\/127\.0\.0\.1:\d+\n$/);
   assert.match(await fs.readFile('/status.txt', 'utf8'), /^test-session live · http:\/\/127\.0\.0\.1:\d+\/ · idle \d+s · last client-observation$/);
-  assert.match(await fs.readFile('/report.txt', 'utf8'), /^✓ live · chromium [\d.]+ · Playwright 1\.58\.2 · source source-v1\nbaseURL: http:\/\/127\.0\.0\.1:\d+\n$/);
   const bytes = await fs.readFile(path.join(options.artifacts, 'screenshot.png'));
   await f.request({ op: 'stop' });
   assert.deepEqual(await fs.readFile(path.join(options.artifacts, 'screenshot.png')), bytes);

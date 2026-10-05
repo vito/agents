@@ -164,15 +164,18 @@ type Browser {
       .withNewFile("/input.json", input)
       .withEnvVariable("BROWSER_RUN_NONCE", id)
     if (service != null) { ctr = ctr.withServiceBinding(serviceHostname, service) }
-    # The runner prints its report; the exec's output is already shown in the
-    # call's logs, so it is not printed again here.
-    let result = ctr.withExec(["node", "/opt/browser/runner.cjs", "/input.json"], expect: ReturnType.ANY)
+    # The report is printed from a file rather than left in the exec's logs,
+    # which tool results abridge to a tail. redirectStdout keeps it out of
+    # those logs once the engine stops logging redirected output.
+    let result = ctr.withExec(["node", "/opt/browser/runner.cjs", "/input.json"], expect: ReturnType.ANY, redirectStdout: "/report.txt")
+    let report = result.file("/report.txt").contents
     if (result.exitCode != 0) {
       let errors = result.stderr.trimSpace
-      let detail = if (errors == "") { result.stdout.trimSpace } else { errors }
+      let detail = if (errors == "") { report.trimSpace } else { errors }
       raise "browser run failed: " + detail.split("\n").takeFirst(12).join("\n")
     }
     self.runs = self.runs.with(id, result.directory("/artifacts").sync)
+    print(report)
     print("Run: " + id + " · viewScreenshot(run, path) for images, readArtifact(run) for results.json")
     self
   }
@@ -362,7 +365,7 @@ type Browser {
     }
     self.sessionInstances = sessionInstances.with(id, info.summary.instanceID)
     self.sessionSummaries = sessionSummaries.with(id, response.file("/status.txt").contents)
-    # Status requests print nothing themselves; show the session's header once.
+    # The status report doubles as the session's header, shown once.
     print(response.file("/report.txt").contents)
     print("Session: " + id + " · exec/inspect/syncWorkspace with this handle; stop when finished")
     self
@@ -396,7 +399,8 @@ type Browser {
       .withEnvVariable("BROWSER_REQUEST_NONCE", Random.string)
       .withServiceBinding("browser-session", service(session))
     if (snapshot != null) { ctr = ctr.withDirectory("/sync-source", snapshot) }
-    let response = ctr.withExec(["node", "/client.cjs", "/command.json"], expect: ReturnType.ANY)
+    # Reports are printed from the redirected file; see run.
+    let response = ctr.withExec(["node", "/client.cjs", "/command.json"], expect: ReturnType.ANY, redirectStdout: "/report.txt")
     if (response.exitCode != 0) {
       raise "browser request failed: " + response.stderr.split("\n").takeFirst(12).join("\n")
     }
@@ -413,7 +417,7 @@ type Browser {
     if (info.summary.state != "running") {
       self.closedSessions = closedSessions.with(session, info.summary.state)
     }
-    # client.cjs printed the report; the exec's output is already in the logs.
+    print(response.file("/report.txt").contents)
     print("Observation: " + id + " · viewScreenshot/readArtifact with this handle, also after stop")
     self
   }
