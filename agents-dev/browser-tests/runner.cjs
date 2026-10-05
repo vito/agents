@@ -252,6 +252,21 @@ test('synchronous runaway is stopped by the process watchdog', async t => {
   assert.ok(result.artifacts.includes('before-timeout.png'));
 });
 
+test('stuck actions fail fast with a call log; scripts can change the default', async t => {
+  const f = await fixture(t);
+  const { summary } = await f.run(`
+    await page.goto(baseURL);
+    await check('default action timeout', async () => await page.locator('#missing').click());
+    page.setDefaultTimeout(200);
+    await check('raised or lowered by the script', async () => await page.locator('#missing').click());
+  `, { timeoutMs: 40000 });
+  assert.equal(summary.ok, false);
+  assert.deepEqual(summary.checks.map(check => check.name), ['default action timeout', 'raised or lowered by the script']);
+  assert.match(summary.checks[0].error, /Timeout 15000ms exceeded[\s\S]*Call log/);
+  assert.match(summary.checks[1].error, /Timeout 200ms exceeded/);
+  assert.doesNotMatch(JSON.stringify(summary.checks), /Run timed out/);
+});
+
 test('static serving rejects traversal and symlink escapes, disables caching', async t => {
   const f = await fixture(t);
   await fs.writeFile(path.join(f.root, 'secret.txt'), 'secret');

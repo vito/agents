@@ -94,6 +94,11 @@ type Browser {
   and exactly one of json/body/file. Files are relative to the source snapshot.
   Updating mocks affects future requests without reloading the page.
 
+  timeoutMs bounds the whole run. Actions and locator waits default to 15s and
+  navigation to 60s, each capped at timeoutMs, so a bad locator fails fast with
+  Playwright's call log; expect keeps its 5s default. Raise them in the script
+  with page.setDefaultTimeout/setDefaultNavigationTimeout or {timeout} per call.
+
   Example: await mock('**/snapshot.json', {json: {tools: []}});
   await page.goto(baseURL); await check('empty', async () => {
     await expect(page.locator('#tools')).toBeEmpty();
@@ -396,6 +401,10 @@ type Browser {
 
   Failed assertions preserve the live page for inspection. An execution deadline
   invalidates the session rather than allowing abandoned code to race later calls.
+  Each exec resets context defaults to 15s for actions and locator waits and 60s
+  for navigation, capped at timeoutMs, so a stuck locator fails as a check with
+  Playwright's call log instead of hitting the deadline; page.setDefaultTimeout
+  overrides persist with the page.
   """
   exec(
     ws: Workspace!,
@@ -663,6 +672,12 @@ type Browser {
   action/check; detached script work is not supported. Failed assertions leave the
   page alive, but a deadline invalidates the session so timed-out code cannot race
   later calls. Never treat a restarted service as the old browser session.
+
+  Playwright actions and locator waits default to 15s and navigation to 60s,
+  both capped at the run/exec timeoutMs, so a bad locator fails fast with its call
+  log; expect keeps its 5s default. Pass {timeout} per call or use
+  page.setDefaultTimeout/setDefaultNavigationTimeout for slow apps, and keep them
+  below timeoutMs: an exec that reaches its deadline invalidates the session.
 
   Each exec/inspect/syncWorkspace/stop returns an immutable OBSERVATION handle;
   run returns an equivalent run handle. Pass those to artifacts/readArtifact/

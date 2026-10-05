@@ -22,6 +22,14 @@ async function artifactFiles(root, prefix = '') {
   return files.sort();
 }
 
+// Default Playwright timeouts, each capped by the run's own deadline. Actions
+// (clicks, fills, locator waits) fail fast with Playwright's call log instead
+// of silently consuming the whole budget; navigation keeps a longer default for
+// first loads of large apps. Scripts can still raise either with
+// page/context.setDefaultTimeout or setDefaultNavigationTimeout.
+const ACTION_TIMEOUT_MS = 15000;
+const NAVIGATION_TIMEOUT_MS = 60000;
+
 const inside = (root, target) => {
   const relative = path.relative(root, target);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
@@ -131,8 +139,8 @@ async function run(input, { workspace = '/workspace', artifacts = '/artifacts' }
     browser = await ({ chromium, firefox, webkit }[input.browser]).launch({ headless: true });
     result.browser.version = browser.version();
     context = await browser.newContext({ viewport: { width: input.width, height: input.height }, baseURL, serviceWorkers: 'block' });
-    context.setDefaultTimeout(input.timeoutMs);
-    context.setDefaultNavigationTimeout(input.timeoutMs);
+    context.setDefaultTimeout(Math.min(ACTION_TIMEOUT_MS, input.timeoutMs));
+    context.setDefaultNavigationTimeout(Math.min(NAVIGATION_TIMEOUT_MS, input.timeoutMs));
     await context.tracing.start({ screenshots: true, snapshots: true, sources: true });
     const observe = p => {
       p.on('console', message => result.console.push({ source: 'page', type: message.type(), text: message.text(), location: message.location() }));
@@ -270,5 +278,5 @@ async function cli() {
   process.exitCode = summary.infrastructureError ? 1 : 0;
 }
 
-module.exports = { run, serve, workspaceFile };
+module.exports = { run, serve, workspaceFile, ACTION_TIMEOUT_MS, NAVIGATION_TIMEOUT_MS };
 if (require.main === module) cli().catch(error => { process.stderr.write(`${errorText(error)}\n`); process.exitCode = 1; });
