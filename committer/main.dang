@@ -80,9 +80,11 @@ type Committer {
   """
   Compose the git tools onto a base LLM.
   """
+  # Bump version when stored fields are removed or change meaning, so older
+  # saved tool state is discarded instead of failing to load.
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: plumbing)
+      .withTools(currentNode, except: plumbing, version: 1)
       .withSystemPrompt(systemPrompt)
   }
 
