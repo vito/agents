@@ -73,15 +73,13 @@ type Committer {
   # detaches HEAD, so this is what the finished rebase names in its push hint.
   let rebaseBranch: String! = ""
 
-  let plumbing = [
-    "withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState"
-  ]
+  let plumbing = ["withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState", "saved"]
 
+  # Bump version when stored fields are removed or change meaning, so older
+  # saved tool state is discarded instead of failing to load.
   """
   Compose the git tools onto a base LLM.
   """
-  # Bump version when stored fields are removed or change meaning, so older
-  # saved tool state is discarded instead of failing to load.
   agent(base: LLM!): LLM! @agent {
     base
       .withTools(currentNode, except: plumbing, version: 1)
@@ -546,7 +544,11 @@ type Committer {
       print("Nothing new to cherry-pick." + skippedNote + conflictBlock)
       return source
     }
-    let picked = source.withCommitsFrom(source: theirs, commits: pickable.map { p => p.commit.sha }, maxCommits: replayBound)
+    let picked = source.withCommitsFrom(
+      source: theirs,
+      commits: pickable.map { p => p.commit.sha },
+      maxCommits: replayBound,
+    )
     # Force the apply here, with the commits involved in hand, rather than
     # later when the engine rebinds the workspace.
     let newHead = head(picked).commitSHA rescue {
@@ -696,7 +698,11 @@ type Committer {
     # upstream does not already have. Asking the engine for "all new
     # commits" instead would select the merges too, and refuse them.
     let ours = head(origin).log(limit: replayBound, base: replayBase).{{sha, message, parentShas}} rescue {
-      e: Error => raise replayError(`listing this branch's commits since ${replayLabel}`, label, e.message)
+      e: Error => raise replayError(
+        `listing this branch's commits since ${replayLabel}`,
+        label,
+        e.message,
+      )
     }
     let linear = ours.filter { c => c.parentShas.length <= 1 }.map { c => c.sha }
     let merges = ours.filter { c => c.parentShas.length > 1 }
@@ -773,7 +779,17 @@ type Committer {
       }
       note = `Recorded ${short(rebaseStopped)} as ${short(sha)}` + (if (message == null) { "." } else { " with the new message." })
     }
-    advance(llm, origin, current, rebaseRemaining, rebaseOnto, rebaseOntoSha, rebaseOldHead, rebaseBranch, note)
+    advance(
+      llm,
+      origin,
+      current,
+      rebaseRemaining,
+      rebaseOnto,
+      rebaseOntoSha,
+      rebaseOldHead,
+      rebaseBranch,
+      note,
+    )
   }
 
   """
@@ -797,7 +813,17 @@ type Committer {
     head(clean).commitSHA rescue {
       e: Error => raise `rebaseSkip: discarding the pending edits failed: ${plainError(e.message)}`
     }
-    advance(llm, origin, clean, rebaseRemaining, rebaseOnto, rebaseOntoSha, rebaseOldHead, rebaseBranch, `Skipped ${short(rebaseStopped)}.`)
+    advance(
+      llm,
+      origin,
+      clean,
+      rebaseRemaining,
+      rebaseOnto,
+      rebaseOntoSha,
+      rebaseOldHead,
+      rebaseBranch,
+      `Skipped ${short(rebaseStopped)}.`,
+    )
   }
 
   """
@@ -1317,7 +1343,11 @@ type Committer {
       rewound.withCommitsFrom(source: upstream.asWorkspace, maxCommits: replayBound)
     }
     let newBaseSha = head(newBase).commitSHA rescue {
-      e: Error => raise replayError(`fast-forwarding to ${label} (${short(ontoSha)})`, label, e.message)
+      e: Error => raise replayError(
+        `fast-forwarding to ${label} (${short(ontoSha)})`,
+        label,
+        e.message,
+      )
     }
     # Fast-forwards keep hashes; anything else would mean upstream's commits
     # were copied instead of adopted, and the "rebased" branch would then
@@ -1408,7 +1438,11 @@ type Committer {
     }
     # Force the replay HERE, with the commits involved in hand.
     let appliedHead = head(applied).commitSHA rescue {
-      e: Error => raise replayError(`replaying ${toString(pickable.length)} commit(s) onto ${onto}`, onto, e.message)
+      e: Error => raise replayError(
+        `replaying ${toString(pickable.length)} commit(s) onto ${onto}`,
+        onto,
+        e.message,
+      )
     }
     let dropped = ahead.filter { p => p.status != WorkspaceCommitPickStatus.PICKABLE }
     let progress = [note].filter { n => n != "" }
@@ -1445,11 +1479,15 @@ type Committer {
       oldHead: oldHead,
       branch: branch,
     )
-    print((progress + [
-      `Rebase onto ${onto} (${short(ontoSha)}) STOPPED at ${short(sha)} "${subject(conflict.commit.message)}"; ` + `${toString(rest.length - 1)} commit(s) still to replay after it.`,
-      how,
-      "rebaseSkip drops this commit instead; rebaseAbort restores " + `${short(oldHead)}.`,
-    ]).join("\n"))
+    print(
+      (
+        progress + [
+          `Rebase onto ${onto} (${short(ontoSha)}) STOPPED at ${short(sha)} "${subject(conflict.commit.message)}"; ` + `${toString(rest.length - 1)} commit(s) still to replay after it.`,
+          how,
+          "rebaseSkip drops this commit instead; rebaseAbort restores " + `${short(oldHead)}.`,
+        ]
+      ).join("\n"),
+    )
     llm.withTools(tools, except: plumbing).withWorkspace(stopped)
   }
 
@@ -1568,7 +1606,10 @@ type Committer {
     }
   }
 
-  let pickLabel(status: WorkspaceCommitPickStatus, reason: WorkspaceCommitPickReason): String! {
+  let pickLabel(
+    status: WorkspaceCommitPickStatus,
+    reason: WorkspaceCommitPickReason,
+  ): String! {
     case (status) {
       WorkspaceCommitPickStatus.PICKABLE => "new"
       WorkspaceCommitPickStatus.PICKED => "already had"
