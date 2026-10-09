@@ -4,9 +4,14 @@
 #
 # Coding agents normally get curated tools (checks, generators, editor tools);
 # this module is for the rest: ad-hoc commands that need a real container.
-# It follows the session-state pattern of modules/engine-lab (state in `let`
-# fields, @cache(Never) + nonce cache-busting, per-call workspace copying)
-# and the Map-state pattern of modules/staff.
+# Session state lives in `let` fields (@cache(Never) + nonce cache-busting,
+# per-call workspace copying), following the Map-state pattern of the staff
+# module.
+#
+# Sandbox definitions are artifacts: any zero-arg Container-returning field of
+# a workspace module (this module's own `demo`, `git` and `dang` included) has
+# a DAG address like dag://sandbox/dang, and FindArtifacts(type: "Container")
+# lists them. There is no catalog tool here; discovery is the engine's.
 #
 # Mechanics per session (a named entry in the private maps):
 #   - `exec` copies the caller's workspace to /workspace in the sandbox
@@ -25,14 +30,15 @@
 #
 # NOTE on the sandbox arg: it is typed Container! and resolved at the
 # CALLER's boundary, never in this module. The tool layer lifts an address
-# string — an image ref like "golang:1.26", a "<module>:<function>" ref to
-# an installed workspace module, or a Container ID from a prior result —
-# via Query.address in the session's workspace-served schema
-# (core/llm_object_tools.go, liftableTypes), and the CLI does the same for
-# --sandbox flags in workspace mode. That is what makes sibling module refs
-# work: an in-module address() call would resolve in THIS module's schema,
-# where installed workspace siblings are not demand-loadable
-# (hack/designs/sandboxes.md §4, "Resolution context is the point").
+# string — an image ref like "golang:1.26", a DAG address like
+# "dag://<module>/<function>" naming a workspace module's Container
+# artifact, or a Container ID from a prior result — against the session's
+# bound workspace (core/llm_object_tools.go, liftableObjectArg), and the CLI
+# does the same for --sandbox flags in workspace mode. That is what makes
+# sibling module refs work: an in-module address() call would resolve in
+# THIS module's schema, where installed workspace siblings are not
+# demand-loadable (hack/designs/sandboxes.md §4, "Resolution context is the
+# point").
 #
 # NOT registered in dagger.toml: install per workspace where wanted
 # (hack/designs/sandboxes.md §3: not installed by default anywhere).
@@ -59,17 +65,16 @@ let sessionName(session: String!): String! {
 }
 
 # Build the sandbox's workspace like a local clone: reconstruct the checkout
-# from the host git session, then overlay every pending workspace edit. This
-# avoids syncing the entire host directory on each exec while preserving the
-# current tree (including edits git cannot track). Non-git workspaces retain
-# the directory-copy behavior.
+# from the host git session, then overlay the pending workspace edits
+# (Workspace.git.uncommitted: modified and untracked files, gitignored ones
+# left out as git status would). This avoids syncing the entire host
+# directory on each exec. Non-git workspaces retain the directory-copy
+# behavior.
 let workspaceTree(ws: Workspace!): Directory! {
   {
     let git = ws.git
-    let head = git.head
-    head.tree(discardGitDir: false, depth: 0, includeTags: true)
+    git.head.tree(discardGitDir: false, depth: 0, includeTags: true)
       .withChanges(git.uncommitted)
-      .withChanges(git.unmanaged)
       .sync
   } rescue {
     e: Error => ws.directory("/")
@@ -97,8 +102,10 @@ type Sandbox {
   Compose the sandbox tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
+    # The sandbox definitions stay artifacts (dag://sandbox/dang), not tools:
+    # they are reached by address as exec's `sandbox`.
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: ["demo", "git", "dang"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -106,8 +113,8 @@ type Sandbox {
   A demo sandbox: plain alpine.
 
   Guarantees any workspace with this module installed one resolvable
-  module-ref address ("sandbox:demo"), and serves as the module-ref test
-  target.
+  Container address ("dag://sandbox/demo"), and serves as the module-ref
+  test target.
   """
   demo: Container! {
     container.from("alpine:3.20")
@@ -142,11 +149,11 @@ type Sandbox {
   exec(
     ws: Workspace!,
     """
-    The sandbox container to run in. Supply an address: an image ref like
-    "golang:1.26", a "<module>:<function>" reference to an installed
-    module's Container-returning function (see listSandboxes), or a
-    Container ID from a prior result. Ignored when continuing an existing
-    session — the session's stored container is used — unless `fresh`.
+    The sandbox container to run in: an image ref like "golang:1.26", a
+    sandbox definition by DAG address like "dag://sandbox/dang"
+    (FindArtifacts(type: "Container") lists them), or a Container ID from a
+    prior result. Ignored when continuing an existing session — the
+    session's stored container is used — unless `fresh`.
     """
     sandbox: Container!,
     """
@@ -166,7 +173,7 @@ type Sandbox {
   ): Sandbox! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): running a command is a side effect; a cached replay
     # would silently skip it. The nonce env var busts the exec cache
-    # underneath for the same reason (same trick as engine-lab).
+    # underneath for the same reason.
     let name = sessionName(session)
     if (fresh) {
       self.afters = self.afters.without(name)
@@ -293,55 +300,27 @@ type Sandbox {
   }
 
   """
-  List available sandboxes and active sessions: the "<module>:<function>"
-  addresses discoverable from the calling workspace's installed modules,
-  plus each live session and whether it holds un-extracted changes.
+  List live sandbox sessions and whether each holds un-extracted changes.
+  To find sandbox definitions, use FindArtifacts(type: "Container").
   """
-  listSandboxes(ws: Workspace!): String! @cache(policy: FunctionCachePolicy.Never) {
-    let sessions = if (afters.isEmpty) {
-      "(no sandbox sessions)"
-    } else {
-      afters.map { name, after =>
-        let before = befores[name]
-        let state = if (before == null) {
-          "?"
-        } else {
-          let d = after.directory(workdir).changes(before)
-          if (d.isEmpty) {
-            "clean"
-          } else {
-            `${toString(d.diffStats.{{path}}.length)} file(s) pending — call changes(session: "${name}")`
-          }
-        }
-        `${name}: ${state}`
-      }.values.join("\n")
+  listSessions: String! @cache(policy: FunctionCachePolicy.Never) {
+    if (afters.isEmpty) {
+      return "(no sandbox sessions)"
     }
-    # v2 discovery (hack/designs/sandboxes.md §5): Workspace.addresses lists
-    # every zero-required-arg Container-returning function across the
-    # workspace's installed modules — the exact set exec's address lifting
-    # can resolve. Runs engine-side under the workspace's own client, so
-    # sibling modules load fine (unlike in-module address resolution).
-    let catalog = {
-      let addrs = ws.addresses(type: "Container").{{value, description}}
-      if (addrs.isEmpty) {
-        "(none installed)"
+    afters.map { name, after =>
+      let before = befores[name]
+      let state = if (before == null) {
+        "?"
       } else {
-        addrs.map { a =>
-          let desc = a.description.trimSpace.split("\n")[0]
-          if (desc == "") {
-            a.value
-          } else {
-            `${a.value} — ${desc}`
-          }
-        }.join("\n")
+        let d = after.directory(workdir).changes(before)
+        if (d.isEmpty) {
+          "clean"
+        } else {
+          `${toString(d.diffStats.{{path}}.length)} file(s) pending — call changes(session: "${name}")`
+        }
       }
-    } rescue {
-      e: Error => `(discovery failed: ${e.message})`
-    }
-    "module sandboxes (usable as `sandbox` addresses; any image ref works too):\n"
-      + catalog
-      + "\n\nsessions:\n"
-      + sessions
+      `${name}: ${state}`
+    }.values.join("\n")
   }
 
   let names: String! {
@@ -364,13 +343,15 @@ type Sandbox {
       structured results a raw command doesn't.
 
     Mechanics:
-    - `sandbox` is an address: an image ref like "golang:1.26", or a
-      "module:function" sandbox from `listSandboxes`.
+    - `sandbox` is an address: an image ref like "golang:1.26", or a sandbox
+      definition by DAG address like "dag://sandbox/dang".
+      FindArtifacts(type: "Container") lists the definitions in scope.
     - The workspace is COPIED in, not mounted. Nothing you do in the sandbox
       touches the real workspace until you call `changes`, which extracts
       /workspace's drift as a Changeset and applies it.
     - Pass `session` to keep state (installed packages, files outside
       /workspace) across calls; `fresh: true` starts a session over.
+      `listSessions` shows live sessions and their pending changes.
     - A continued session only sees your latest workspace edits when it has
       no un-extracted /workspace changes — pull pending changes first.
 
@@ -378,6 +359,6 @@ type Sandbox {
     if you exec the same setup twice, graduate it into a sandbox definition —
     a Container-returning function on a module (an existing one that owns
     the concern, or a workspace-local `sandboxes` module you create) — then
-    use its address. `listSandboxes` shows the catalog.
+    use its address.
   """
 }

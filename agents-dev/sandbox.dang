@@ -1,0 +1,73 @@
+let testSandboxSessions(source: Workspace!): String! {
+  let root = "sandbox-session-check-" + Random.string
+  let ws = source.git.head.asWorkspace.withNewFile(root + "/in.txt", "in\n")
+  let ran = sandbox.exec(
+    ws: ws,
+    sandbox: sandbox.demo,
+    args: ["sh", "-c", `cat ${root}/in.txt && echo out > ${root}/out.txt`],
+    session: "check",
+  )
+  assert { ran.listSessions == "check: 1 file(s) pending — call changes(session: \"check\")" }
+  let changes = ran.changes(session: "check")
+  assert { changes.addedPaths == [root + "/out.txt"] }
+  assert { changes.after.file(root + "/out.txt").contents == "out\n" }
+
+  # Once its changes are applied, the session is clean again; a clean session
+  # re-copies the current workspace and keeps state outside /workspace.
+  let applied = ws.withNewFile(root + "/out.txt", "out\n")
+  let healed = ran.exec(ws: applied, sandbox: sandbox.demo, args: ["touch", "/outside"], session: "check")
+  assert { healed.listSessions == "check: clean" }
+  let later = applied.withNewFile(root + "/later.txt", "later\n")
+  let continued = healed.exec(
+    ws: later,
+    sandbox: sandbox.demo,
+    args: ["sh", "-c", `test -e /outside && cp ${root}/later.txt ${root}/copied.txt`],
+    session: "check",
+  )
+  assert { continued.changes(session: "check").addedPaths == [root + "/copied.txt"] }
+  # Un-extracted changes are never clobbered by a re-copy.
+  let kept = continued.exec(ws: later, sandbox: sandbox.demo, args: ["touch", root + "/kept"], session: "check")
+  assert { kept.changes(session: "check").addedPaths == [root + "/copied.txt", root + "/kept"] }
+  # fresh drops the session's container.
+  let fresh = kept.exec(ws: later, sandbox: sandbox.demo, args: ["sh", "-c", `test -e /outside || touch ${root}/gone`], session: "check", fresh: true)
+  assert { fresh.changes(session: "check").addedPaths == [root + "/gone"] }
+  let missing = fresh.changes(session: "nobody").asPatch.contents rescue { e: Error => e.message }
+  assert { missing.contains("no sandbox session \"nobody\"") and missing.contains("(sessions: check)") }
+  "Sandbox session checks passed."
+}
+
+let testSandboxTools: String! {
+  # LLM.tools renders one "## <name>" heading per tool.
+  let agent = sandbox.agent(llm)
+  let tools = agent.tools
+  ["exec", "changes", "listSessions"].each { name =>
+    assert { tools.contains("## " + name + "\n") }
+  }
+  # Sandbox definitions are reached by address, not called as tools; the
+  # catalog is FindArtifacts' job.
+  ["demo", "git", "dang", "listSandboxes"].each { name =>
+    assert { !tools.contains("## " + name + "\n") }
+  }
+  let scope = agent.artifacts(include: ["sandbox"]).filterTypes(types: ["Container"])
+  let demo = scope.filterUri(uri: "dag://sandbox/demo").one.value.{{... on Container!}}
+  assert { demo.withExec(["cat", "/etc/alpine-release"]).stdout.hasPrefix("3.20") }
+  "Sandbox tool visibility checks passed."
+}
+
+let testSandboxSiblings(source: Workspace!): String! {
+  # testdata/ws installs a copy of the module next to a sibling, so module
+  # sources stay inside that workspace's root.
+  let copy = "sandbox/testdata/ws/.dagger/modules/sandbox/main.dang"
+  assert { source.file(copy).contents == source.file("sandbox/main.dang").contents }
+
+  let ws = source.directory("sandbox/testdata/ws").asWorkspace
+  let containers = ws.artifacts.filterTypes(types: ["Container"])
+  ["dag://sandbox/demo", "dag://sandbox/git", "dag://sandbox/dang"].each { uri =>
+    assert { containers.filterUri(uri: uri).one.description != "" }
+  }
+  let sidecar = containers.filterUri(uri: "dag://sidecar/ctr").one.value.{{... on Container!}}
+  assert { sidecar.envVariable("SIDECAR") == "yes" }
+  let ran = sandbox.exec(ws: ws, sandbox: sidecar, args: ["sh", "-c", "echo $SIDECAR > sidecar.txt"])
+  assert { ran.changes(session: "").after.file("sidecar.txt").contents == "yes\n" }
+  "Sandbox sibling checks passed."
+}
