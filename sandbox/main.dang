@@ -45,19 +45,6 @@
 
 let workdir = "/workspace"
 let dangVersion = "v2.1.3"
-# Tail-truncate command output to keep tool results context-friendly.
-let tailLines = 200
-
-# Last `lines` lines of s, with a truncation marker when shortened.
-let tail(s: String!, lines: Int! = tailLines): String! {
-  let all = s.split("\n")
-  if (all.length <= lines) {
-    s
-  } else {
-    let marker = "… (" + toString(all.length - lines) + " earlier lines truncated) …"
-    marker + "\n" + all.takeLast(lines).join("\n")
-  }
-}
 
 # "" means the implicit session, kept under a reserved name.
 let sessionName(session: String!): String! {
@@ -242,17 +229,11 @@ type Sandbox {
         experimentalPrivilegedNesting: true,
       )
 
+    # The command's stdout/stderr already flow through as the exec's logs;
+    # printing them again would duplicate them in the tool result.
     let code = after.exitCode
     if (code != 0) {
       print("exit code: " + toString(code))
-    }
-    let stdout = after.stdout
-    if (stdout.trimSpace != "") {
-      print(tail(stdout))
-    }
-    let stderr = after.stderr
-    if (stderr.trimSpace != "") {
-      print("stderr: " + tail(stderr))
     }
 
     self.afters = self.afters.with(name, after)
