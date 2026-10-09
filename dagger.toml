@@ -58,7 +58,7 @@ is-module = true
 name = "staff"
 
 [modules.editor]
-source = "github.com/vito/editor@main"
+source = "github.com/vito/editor@0"
 
 [modules.browser]
 source = "browser"
