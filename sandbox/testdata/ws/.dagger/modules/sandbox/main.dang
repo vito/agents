@@ -1,12 +1,12 @@
 # sandbox: a LAST-RESORT escape hatch for Dagger coding agents — run an argv
-# in an arbitrary container ("sandbox") with the workspace mounted at a
+# in an arbitrary container ("sandbox") with the workspace copied in at a
 # workdir.
 #
 # Coding agents normally get curated tools (checks, generators, editor tools);
 # this module is for the rest: ad-hoc commands that need a real container.
-# Session state lives in `let` fields (@cache(Never) + nonce cache-busting,
-# per-call workspace copying), following the Map-state pattern of the staff
-# module.
+# Session state lives in `let` fields (default-cached exec + nonce
+# cache-busting, per-call workspace copying), following the Map-state pattern
+# of the staff module.
 #
 # Sandbox definitions are artifacts: any zero-arg Container-returning field of
 # a workspace module (this module's own `demo`, `git` and `dang` included) has
@@ -27,6 +27,17 @@
 #     note points at `changes`. A dirty session whose tree already MATCHES
 #     the current workspace (its extraction was applied) self-heals to
 #     clean — see the drift check in exec.
+#   - Git: the sandbox gets a real checkout (.git included), so git works
+#     there as an escape hatch for operations the git tools lack (e.g.
+#     `git revert`). But raw .git writes never reach a Changeset: `changes`
+#     and every dirtiness check diff the working tree only. Commits made in
+#     the sandbox come back as HISTORY instead — the sandbox's .git reopened
+#     with GitRepository.withContents, keeping the workspace repository's
+#     URL and remotes — exposed as
+#     `dag://sandbox/sessions/head?sandbox-session=<name>` for any tool that
+#     takes a GitRef (cherry-pick, rebase, show...). A session holding
+#     commits the workspace lacks counts as dirty, so a re-copy never
+#     discards them.
 #
 # NOTE on the sandbox arg: it is typed Container! and resolved at the
 # CALLER's boundary, never in this module. The tool layer lifts an address
@@ -68,9 +79,79 @@ let workspaceTree(ws: Workspace!): Directory! {
   }
 }
 
+# A tree without its git metadata: raw .git writes (an index refreshed by
+# `git status`, new objects) are never workspace changes. Commits travel as
+# history instead; see Sandbox.sessions.
+let worktree(dir: Directory!): Directory! {
+  dir.withoutDirectory(".git")
+}
+
+# The working-tree changes a session container holds relative to `before`.
+let drift(after: Container!, before: Directory!): Changeset! {
+  worktree(after.directory(workdir)).changes(worktree(before))
+}
+
+# A session's checkout reopened as git history: the sandbox's .git as the
+# storage, the workspace repository's URL and remotes as the routing.
+let history(repo: GitRepository!, after: Container!): GitRepository! {
+  repo.withContents(directory: after.directory(workdir))
+}
+
+# The session's HEAD when it has moved off `seed`, the commit its checkout
+# was copied at; "" when it has not moved or has no git history.
+let movedHead(seed: String!, repo: GitRepository, after: Container!): String! {
+  if (seed == "") {
+    return ""
+  }
+  let r = repo
+  if (r == null) {
+    return ""
+  }
+  let head = history(r, after).head.commitSHA rescue {
+    e: Error => seed
+  }
+  if (head == seed) { "" } else { head }
+}
+
+# The session's uncommitted changes: its working tree against `before` plus
+# whatever the session committed since `seed`. Committed work travels as
+# history, so it must not ALSO come back as edits.
+let pending(after: Container!, before: Directory!, seed: String!, repo: GitRepository): Changeset! {
+  let r = repo
+  if (r == null) {
+    return drift(after, before)
+  }
+  if (movedHead(seed, r, after) == "") {
+    return drift(after, before)
+  }
+  let h = history(r, after)
+  let committed = h.head.tree(discardGitDir: true)
+    .changes(h.ref(name: seed).tree(discardGitDir: true))
+  worktree(after.directory(workdir)).changes(worktree(before).withChanges(committed))
+}
+
+# How many commits the session's HEAD has on top of `seed`.
+let newCommits(seed: String!, repo: GitRepository, after: Container!): Int! {
+  if (seed == "") {
+    return 0
+  }
+  let r = repo
+  if (r == null) {
+    return 0
+  }
+  let h = history(r, after)
+  h.head.log(limit: 1000, base: h.ref(name: seed)).{{sha}}.length rescue {
+    e: Error => 0
+  }
+}
+
+let historyAddress(name: String!): String! {
+  `dag://sandbox/sessions/head?sandbox-session=${name}`
+}
+
 """
-Run ad-hoc commands in arbitrary containers with the workspace mounted — the
-last-resort escape hatch when no curated tool fits.
+Run ad-hoc commands in arbitrary containers with the workspace copied in —
+the last-resort escape hatch when no curated tool fits.
 """
 type Sandbox {
   # ---- session state --------------------------------------------------------
@@ -84,15 +165,22 @@ type Sandbox {
   # workspace tree copied in at session start / last refresh — the "before"
   # side of change extraction
   let befores: Map[Directory!]! = [:]
+  # For sessions copied from a git workspace: the HEAD commit the copy was
+  # taken at, and the workspace repository whose routing (URL, remotes) the
+  # session's history keeps. Absent for non-git workspaces.
+  let seeds: Map[String!]! = [:]
+  let repos: Map[GitRepository!]! = [:]
 
   """
   Compose the sandbox tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
     # The sandbox definitions stay artifacts (dag://sandbox/dang), not tools:
-    # they are reached by address as exec's `sandbox`.
+    # they are reached by address as exec's `sandbox`. Likewise session
+    # histories (dag://sandbox/sessions/head?sandbox-session=<name>), whose
+    # collection and plumbing are not tools either.
     base
-      .withTools(currentNode, except: ["demo", "git", "dang"])
+      .withTools(currentNode, except: ["demo", "git", "dang", "sessions", "sessionHead"])
       .withSystemPrompt(systemPrompt)
   }
 
@@ -157,59 +245,79 @@ type Sandbox {
     Drop the stored session state first and start over from `sandbox`.
     """
     fresh: Boolean! = false,
-  ): Sandbox! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): running a command is a side effect; a cached replay
-    # would silently skip it. The nonce env var busts the exec cache
-    # underneath for the same reason.
+  ): Sandbox! {
+    # Default caching, deliberately. Every exec returns a new state, so an
+    # agent's next call always has a different receiver and really runs; a
+    # cache hit means the same state, workspace and args as a run that
+    # already happened. That is exactly what re-evaluating a chain needs —
+    # a resumed agent (or a client like Dang forcing a chain once per
+    # selection) rebuilds its session state from cache instead of re-running
+    # every command in it. The nonce env var below only ensures that when
+    # this function body DOES run, the command does too, rather than hitting
+    # the container exec cache for an identical chain.
     let name = sessionName(session)
     if (fresh) {
       self.afters = self.afters.without(name)
       self.befores = self.befores.without(name)
+      self.seeds = self.seeds.without(name)
+      self.repos = self.repos.without(name)
     }
 
     let current = workspaceTree(ws)
 
-    # The container to exec in, and the "before" tree in effect for this
-    # session after this call.
+    # The container to exec in, the "before" tree in effect for this session
+    # after this call, and the session's git seed (see `seeds`/`repos`).
     let ctr = container
     let sessionBefore = current
+    let copied = true
+    let seed = self.seeds[name] ?? ""
+    let repo = self.repos[name]
 
     let stored = self.afters[name]
     if (stored != null) {
       # Continued session. Only re-copy the CURRENT workspace when the
-      # sandbox holds no un-extracted /workspace changes; blindly re-copying
-      # would clobber work the caller hasn't pulled yet.
+      # sandbox holds nothing un-harvested — no working-tree changes, no new
+      # commits; blindly re-copying would clobber work the caller hasn't
+      # pulled yet.
       let prevBefore = self.befores[name]
       if (prevBefore == null) {
         raise `invariant violated: session "${name}" has a container but no before-tree`
       }
-      let pending = stored.directory(workdir).changes(prevBefore)
-      if (pending.isEmpty) {
+      # Self-healing for agent mode: `changes` advances the baseline on ITS
+      # returned value, but a Changeset-returning tool does not rebind the
+      # toolset object (core/llm.go: only a tool returning the bound object's
+      # own type does), so the advance is lost and the session would look
+      # dirty forever. When the sandbox tree already matches the CURRENT
+      # workspace — the extracted changes were applied — the session is
+      # de-facto clean. Likewise for commits once the workspace's history
+      # holds the session's HEAD.
+      let extracted = pending(stored, prevBefore, seed, repo).isEmpty or drift(stored, current).isEmpty
+      let landed = true
+      let moved = movedHead(seed, repo, stored)
+      if (moved != "") {
+        let r = repo
+        if (r != null) {
+          landed = ws.git.head.contains(other: history(r, stored).head) rescue {
+            e: Error => false
+          }
+        }
+      }
+      if (!extracted) {
+        print(`note: session "${name}" has un-extracted changes under ${workdir}; keeping its tree (the current workspace is NOT re-copied). Call changes(session: "${name}") to pull them.`)
+      }
+      if (!landed) {
+        print(`note: session "${name}" has commits the workspace lacks; keeping its tree (the current workspace is NOT re-copied). Take them from ${historyAddress(name)}, or pass fresh: true to drop them.`)
+      }
+      copied = extracted and landed
+      if (copied) {
         # withoutDirectory first: withDirectory overlays, so files deleted
         # from the workspace since the last copy would otherwise linger.
         ctr = stored
           .withoutDirectory(workdir)
           .withDirectory(workdir, current)
-        sessionBefore = current
       } else {
-        # Self-healing for agent mode: `changes` advances the baseline on
-        # ITS returned value, but a Changeset-returning tool does not rebind
-        # the toolset object (core/llm.go: only a tool returning the bound
-        # object's own type does), so the advance is lost and the session
-        # would look dirty forever. When the sandbox tree already matches
-        # the CURRENT workspace — the extracted changes were applied — the
-        # session is de-facto clean: re-copy and move on.
-        let drift = stored.directory(workdir).changes(current)
-        if (drift.isEmpty) {
-          ctr = stored
-            .withoutDirectory(workdir)
-            .withDirectory(workdir, current)
-          sessionBefore = current
-        } else {
-          print(`note: session "${name}" has un-extracted changes under ${workdir}; keeping its tree (the current workspace is NOT re-copied). Call changes(session: "${name}") to pull them.`)
-          ctr = stored
-          sessionBefore = prevBefore
-        }
+        ctr = stored
+        sessionBefore = prevBefore
       }
     } else {
       # New session: the sandbox arrives already resolved — the tool layer
@@ -218,6 +326,14 @@ type Sandbox {
       ctr = sandbox
         .withDirectory(workdir, current)
         .withWorkdir(workdir)
+    }
+
+    if (copied) {
+      # Re-seed: the commit just copied in, and the repository it came from.
+      seed = ws.git.head.commitSHA rescue {
+        e: Error => ""
+      }
+      repo = if (seed == "") { null } else { ws.git.head.asRepository }
     }
 
     let after = ctr
@@ -238,13 +354,24 @@ type Sandbox {
 
     self.afters = self.afters.with(name, after)
     self.befores = self.befores.with(name, sessionBefore)
+    if (repo == null) {
+      self.seeds = self.seeds.without(name)
+      self.repos = self.repos.without(name)
+    } else {
+      self.seeds = self.seeds.with(name, seed)
+      self.repos = self.repos.with(name, repo)
+    }
 
-    let delta = after.directory(workdir).changes(sessionBefore)
+    let delta = pending(after, sessionBefore, seed, repo)
     if (!delta.isEmpty) {
       # .{{path}} first: .length can't be called directly on a GraphQL
       # object list.
       let n = delta.diffStats.{{path}}.length
       print(`sandbox changed ${toString(n)} file(s) under ${workdir} — call changes(session: "${name}") to pull them into the workspace`)
+    }
+    let commits = newCommits(seed, repo, after)
+    if (commits > 0) {
+      print(`sandbox has ${toString(commits)} new commit(s) — take them from ${historyAddress(name)} with any tool that takes a GitRef (e.g. cherry-pick)`)
     }
 
     self
@@ -275,14 +402,16 @@ type Sandbox {
     # only persists where the caller keeps the returned object — in a
     # `dagger call ... exec ... changes` chain the Changeset is terminal, and
     # in agent mode a non-Sandbox-returning tool does not evolve the bound
-    # toolset state.
+    # toolset state. Commits are not part of this: they are taken from the
+    # session's history, not extracted.
     self.befores = self.befores.with(name, afterTree)
-    afterTree.changes(before)
+    pending(after, before, seeds[name] ?? "", repos[name])
   }
 
   """
-  List live sandbox sessions and whether each holds un-extracted changes.
-  To find sandbox definitions, use FindArtifacts(type: "Container").
+  List live sandbox sessions and whether each holds un-extracted changes or
+  new commits. To find sandbox definitions, use
+  FindArtifacts(type: "Container").
   """
   listSessions: String! @cache(policy: FunctionCachePolicy.Never) {
     if (afters.isEmpty) {
@@ -293,15 +422,47 @@ type Sandbox {
       let state = if (before == null) {
         "?"
       } else {
-        let d = after.directory(workdir).changes(before)
-        if (d.isEmpty) {
-          "clean"
-        } else {
-          `${toString(d.diffStats.{{path}}.length)} file(s) pending — call changes(session: "${name}")`
-        }
+        let files = pending(after, before, seeds[name] ?? "", repos[name]).diffStats.{{path}}.length
+        let commits = newCommits(seeds[name] ?? "", repos[name], after)
+        let notes = [
+          if (files > 0) { `${toString(files)} file(s) pending — call changes(session: "${name}")` } else { "" },
+          if (commits > 0) { `${toString(commits)} new commit(s) at ${historyAddress(name)}` } else { "" },
+        ].filter { n => n != "" }
+        if (notes.isEmpty) { "clean" } else { notes.join("; ") }
       }
       `${name}: ${state}`
     }.values.join("\n")
+  }
+
+  """
+  Sandbox sessions as a collection, keyed by session name. Only sessions
+  copied from a git workspace are listed: each one's checkout, commits
+  included, is its history.
+
+  `dag://sandbox/sessions/head?sandbox-session=<name>` is a session's HEAD
+  as a GitRef — the sandbox's .git reopened with the workspace repository's
+  URL and remotes — so commits made in the sandbox (e.g. by `git revert`)
+  can be cherry-picked, rebased onto or inspected by address with the git
+  tools.
+  """
+  sessions: Sessions! {
+    Sessions(currentNode.{{... on Dagger.Sandbox!}}, repos.keys)
+  }
+
+  """
+  A session's HEAD as a GitRef. Collection plumbing: Sessions.get reaches
+  the private session maps through it.
+  """
+  sessionHead(name: String!): GitRef! {
+    let after = afters[name]
+    if (after == null) {
+      raise `no sandbox session "${name}" — run exec first (sessions: ${names})`
+    }
+    let repo = repos[name]
+    if (repo == null) {
+      raise `sandbox session "${name}" has no git history: the workspace it copied is not a git checkout`
+    }
+    history(repo, after).head
   }
 
   let names: String! {
@@ -335,6 +496,12 @@ type Sandbox {
       `listSessions` shows live sessions and their pending changes.
     - A continued session only sees your latest workspace edits when it has
       no un-extracted /workspace changes — pull pending changes first.
+    - Git works in the sandbox (the checkout includes .git), for git
+      operations no tool covers, like `git revert`. `changes` never carries
+      .git itself: commits made in the sandbox are history, at
+      `dag://sandbox/sessions/head?sandbox-session=<name>` — pass that
+      address to any tool that takes a GitRef (e.g. cherry-pick) to take
+      them. The image needs git installed: "dag://sandbox/git" has it.
 
     Reaching for exec is a signal: if no tool covered the need, note it; and
     if you exec the same setup twice, graduate it into a sandbox definition —
@@ -342,4 +509,62 @@ type Sandbox {
     the concern, or a workspace-local `sandboxes` module you create) — then
     use its address.
   """
+}
+
+"""
+Sandbox sessions copied from a git workspace, as a collection keyed by
+session name. Selected by address as
+`dag://sandbox/sessions?sandbox-session=<name>`.
+"""
+type Sessions @collection {
+  # The tool object holding the sessions; private so Sandbox itself stays out
+  # of the collection's schema.
+  let sandbox: Dagger.Sandbox!
+
+  """
+  Session names, sorted.
+  """
+  names: [String!]! @keys
+
+  new(sandbox: Dagger.Sandbox!, names: [String!]!) {
+    self.sandbox = sandbox
+    self.names = names
+    self
+  }
+
+  """
+  The session with this name.
+  """
+  session(name: String!): Session! @get {
+    Session(name, sandbox.sessionHead(name))
+  }
+}
+
+"""
+One sandbox session's git history.
+"""
+type Session {
+  """
+  The session name `exec` and `changes` address it by.
+  """
+  name: String!
+
+  # Private: kept off the artifact tree except through `head`.
+  let ref: GitRef!
+
+  new(name: String!, ref: GitRef!) {
+    self.name = name
+    self.ref = ref
+    self
+  }
+
+  """
+  The session's HEAD as a GitRef — the artifact at
+  `dag://sandbox/sessions/head?sandbox-session=<name>`. Commits made in the
+  sandbox are reachable here; pass the address to any tool taking a GitRef
+  to cherry-pick, rebase onto or inspect them.
+  """
+  head: GitRef! {
+    ref
+  }
 }
