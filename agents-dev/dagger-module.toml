@@ -17,5 +17,9 @@ engineVersion = "v1.0.0-0"
   source = "../contributor"
 
 [[dependencies]]
+  name = "sandbox"
+  source = "../sandbox"
+
+[[dependencies]]
   name = "staff"
   source = "../staff"
