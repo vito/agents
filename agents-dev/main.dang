@@ -109,6 +109,30 @@ type AgentsDev {
     null
   }
 
+  """Check sandbox sessions: exec, change extraction, continued and fresh sessions."""
+  sandboxSessions(source: Workspace!): Void @check {
+    print(testSandboxSessions(source: source))
+    null
+  }
+
+  """Check the sandbox tools, with sandbox definitions reached by address instead."""
+  sandboxTools: Void @check {
+    print(testSandboxTools)
+    null
+  }
+
+  """Check sandbox definitions of sibling modules are workspace artifacts exec can run in."""
+  sandboxSiblings(source: Workspace!): Void @check {
+    print(testSandboxSiblings(source: source))
+    null
+  }
+
+  """Check sandbox git: .git stays out of changes, and commits come back as history."""
+  sandboxGit(source: Workspace!): Void @check {
+    print(testSandboxGit(source: source))
+    null
+  }
+
   # Browser checks are parked in browser-tests/checks.dang until CI's engine
   # supports their APIs. Keep the browser dependency unwired too: even loading
   # its schema requires the newer engine.

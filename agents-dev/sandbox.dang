@@ -1,0 +1,133 @@
+let testSandboxSessions(source: Workspace!): String! {
+  let root = "sandbox-session-check-" + Random.string
+  let ws = source.git.head.asWorkspace.withNewFile(root + "/in.txt", "in\n")
+  let ran = sandbox.exec(
+    ws: ws,
+    sandbox: sandbox.demo,
+    args: ["sh", "-c", `cat ${root}/in.txt && echo out > ${root}/out.txt`],
+    session: "check",
+  )
+  assert { ran.listSessions == "check: 1 file(s) pending — call changes(session: \"check\")" }
+  let changes = ran.changes(session: "check")
+  assert { changes.addedPaths == [root + "/out.txt"] }
+  assert { changes.after.file(root + "/out.txt").contents == "out\n" }
+
+  # Once its changes are applied, the session is clean again; a clean session
+  # re-copies the current workspace and keeps state outside /workspace.
+  let applied = ws.withNewFile(root + "/out.txt", "out\n")
+  let healed = ran.exec(ws: applied, sandbox: sandbox.demo, args: ["touch", "/outside"], session: "check")
+  assert { healed.listSessions == "check: clean" }
+  let later = applied.withNewFile(root + "/later.txt", "later\n")
+  let continued = healed.exec(
+    ws: later,
+    sandbox: sandbox.demo,
+    args: ["sh", "-c", `test -e /outside && cp ${root}/later.txt ${root}/copied.txt`],
+    session: "check",
+  )
+  assert { continued.changes(session: "check").addedPaths == [root + "/copied.txt"] }
+  # Un-extracted changes are never clobbered by a re-copy.
+  let kept = continued.exec(ws: later, sandbox: sandbox.demo, args: ["touch", root + "/kept"], session: "check")
+  assert { kept.changes(session: "check").addedPaths == [root + "/copied.txt", root + "/kept"] }
+  # fresh drops the session's container.
+  let fresh = kept.exec(ws: later, sandbox: sandbox.demo, args: ["sh", "-c", `test -e /outside || touch ${root}/gone`], session: "check", fresh: true)
+  assert { fresh.changes(session: "check").addedPaths == [root + "/gone"] }
+  let missing = fresh.changes(session: "nobody").asPatch.contents rescue { e: Error => e.message }
+  assert { missing.contains("no sandbox session \"nobody\"") and missing.contains("(sessions: check)") }
+  "Sandbox session checks passed."
+}
+
+let testSandboxTools: String! {
+  # LLM.tools renders one "## <name>" heading per tool.
+  let agent = sandbox.agent(llm)
+  let tools = agent.tools
+  ["exec", "changes", "listSessions"].each { name =>
+    assert { tools.contains("## " + name + "\n") }
+  }
+  # Sandbox definitions are reached by address, not called as tools; the
+  # catalog is FindArtifacts' job.
+  ["demo", "git", "dang", "sessions", "sessionHead", "listSandboxes"].each { name =>
+    assert { !tools.contains("## " + name + "\n") }
+  }
+  let scope = agent.artifacts(include: ["sandbox"]).filterTypes(types: ["Container"])
+  let demo = scope.filterUri(uri: "dag://sandbox/demo").one.value.{{... on Container!}}
+  assert { demo.withExec(["cat", "/etc/alpine-release"]).stdout.hasPrefix("3.20") }
+  "Sandbox tool visibility checks passed."
+}
+
+let testSandboxSiblings(source: Workspace!): String! {
+  # testdata/ws installs a copy of the module next to a sibling, so module
+  # sources stay inside that workspace's root.
+  let copy = "sandbox/testdata/ws/.dagger/modules/sandbox/main.dang"
+  assert { source.file(copy).contents == source.file("sandbox/main.dang").contents }
+
+  let ws = source.directory("sandbox/testdata/ws").asWorkspace
+  let containers = ws.artifacts.filterTypes(types: ["Container"])
+  ["dag://sandbox/demo", "dag://sandbox/git", "dag://sandbox/dang"].each { uri =>
+    assert { containers.filterUri(uri: uri).one.description != "" }
+  }
+  let sidecar = containers.filterUri(uri: "dag://sidecar/ctr").one.value.{{... on Container!}}
+  assert { sidecar.envVariable("SIDECAR") == "yes" }
+  let ran = sandbox.exec(ws: ws, sandbox: sidecar, args: ["sh", "-c", "echo $SIDECAR > sidecar.txt"])
+  assert { ran.changes(session: "").after.file("sidecar.txt").contents == "yes\n" }
+  "Sandbox sibling checks passed."
+}
+
+let testSandboxGit(source: Workspace!): String! {
+  let ws = source.git.head.asWorkspace
+  let seed = ws.git.head.commitSHA
+  let session = "git-" + Random.string
+  let address = "dag://sandbox/sessions/head?sandbox-session=" + session
+
+  # Read-only git still rewrites .git (a refreshed index); that is not a
+  # workspace change.
+  let looked = sandbox.exec(ws: ws, sandbox: sandbox.git, args: ["git", "status"], session: session)
+  assert { looked.listSessions == session + ": clean" }
+  assert { looked.changes(session: session).isEmpty }
+
+  # A commit made in the sandbox is history, not a Changeset — neither its
+  # .git writes nor its files come back as edits — and the session's HEAD is
+  # reachable as an artifact. Dates are deliberately NOT pinned: exec is
+  # cached, so every assertion below sees the same run, the same commit.
+  let file = "sandbox-git-check-" + Random.string + ".txt"
+  let identity = "git -c user.name=Check -c user.email=check@example.com"
+  let committed = looked.exec(ws: ws, sandbox: sandbox.git, args: ["sh", "-euc", [
+    `echo one > ${file}`,
+    `git add ${file}`,
+    `${identity} commit -qm 'check: sandbox commit'`,
+    "echo two > uncommitted.txt",
+  ].join("\n")], session: session)
+  assert { committed.changes(session: session).addedPaths == ["uncommitted.txt"] }
+  assert { committed.listSessions == session + ": 1 file(s) pending — call changes(session: \"" + session + "\"); 1 new commit(s) at " + address }
+  let head = committed.sessions.get(key: session).head
+  let log = head.log(limit: 2).{{sha, message}}
+  assert { log.map { c => c.message.trimSpace }.takeFirst == ["check: sandbox commit"] }
+  assert { log.map { c => c.sha }.takeLast == [seed] }
+  let artifact = committed.agent(llm).artifacts(include: ["sandbox"])
+    .filterUri(uri: address).one.value.{{... on GitRef!}}
+  assert { artifact.commitSHA == head.commitSHA }
+
+  # Un-harvested commits are never clobbered by a re-copy.
+  let kept = committed.exec(ws: ws, sandbox: sandbox.git, args: ["true"], session: session)
+  assert { kept.sessions.get(key: session).head.commitSHA == head.commitSHA }
+
+  # Once the workspace holds the commit (fast-forwarded here, as a
+  # cherry-pick would) and the edit, the session is clean again and
+  # re-copies the workspace.
+  let harvested = ws.withCommitsFrom(source: head.asWorkspace)
+    .withNewFile("uncommitted.txt", "two\n")
+  assert { harvested.git.head.commitSHA == head.commitSHA }
+  let healed = kept.exec(ws: harvested, sandbox: sandbox.git, args: ["true"], session: session)
+  assert { healed.listSessions == session + ": clean" }
+
+  # The escape hatch it exists for: a revert, taken back as history.
+  let reverted = healed.exec(ws: harvested, sandbox: sandbox.git, args: [
+    "sh", "-euc", `${identity} revert --no-edit HEAD`,
+  ], session: session)
+  assert { reverted.changes(session: session).isEmpty }
+  let revert = reverted.sessions.get(key: session).head
+  assert { revert.log(limit: 1).{{message}}.map { c => c.message }.join("").hasPrefix("Revert \"check: sandbox commit\"") }
+  let landed = harvested.withCommitsFrom(source: revert.asWorkspace)
+  assert { landed.git.head.commitSHA == revert.commitSHA }
+  assert { !landed.git.head.tree(discardGitDir: true).entries.contains(file) }
+  "Sandbox git checks passed."
+}
