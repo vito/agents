@@ -159,8 +159,8 @@ type Committer {
   are removed. Paths outside the selection are left alone. There is no staging
   area: this replaces working-tree files, not index entries.
 
-  Use `preview: true` to inspect the changes without applying them. Only restore
-  when discarding the selected edits is intended; use `reset` to move HEAD.
+  Only restore when discarding the selected edits is intended; use `reset` to
+  move HEAD.
   """
   restore(
     source: Workspace!,
@@ -176,10 +176,6 @@ type Committer {
     HEAD itself is never moved.
     """
     ref: String! = "HEAD",
-    """
-    Show the proposed changes without modifying the workspace.
-    """
-    preview: Boolean! = false,
     """
     Resolve `ref` in this git ref instead of the checkout: any GitRef
     address, including other agents' histories (FindArtifacts lists them) and
@@ -220,20 +216,11 @@ type Committer {
       print(`Selected files already match ${short(sha)}; nothing to restore.`)
       return source
     }
-    print((if (preview) { "Restore preview" } else { "Restoring files" })
-      + ` from ${sha}; HEAD unchanged.\n\n`
-      + statBlock(changes, [], maxFiles) + "\n\n"
-      + patchBlock(changes.asPatch.contents, [], 400))
-    if (preview) {
-      return source
-    }
+    print(`Restoring files from ${sha}; HEAD unchanged.`)
     # Apply to the original workspace: a snapshot pins HEAD and can lose the
     # branch attachment, which restore must preserve along with the commit.
-    let restored = source.withChanges(changes)
-    restored.git.uncommitted.diffStats.{{path}}.length rescue {
-      e: Error => raise `restore failed: ${plainError(e.message)}`
-    }
-    restored
+    # The engine summarizes the returned workspace with bounded patch previews.
+    source.withChanges(changes)
   }
 
   """
@@ -1894,7 +1881,6 @@ type Committer {
       (default HEAD) without moving HEAD. Required `paths` are globs like
       status/commit; selection covers both trees, so deleted files return and
       additions absent from the source are removed. Other files stay untouched.
-      Use `preview: true` to review the proposed patch without applying it.
       Only restore when discarding those edits is intended; there is no index.
     - `commit` — record pending changes as a commit and advance HEAD. Without
       `paths` it commits EVERYTHING `status` lists; with `paths`, only those

@@ -512,9 +512,6 @@ let checkCommitterRestore(source: Workspace!): String! {
     .withNewFile(root + "/keep.txt", "unselected\n")
     .withNewFile(root + "/nested/keep.txt", "unselected addition\n")
   let paths = [root + "/**/*.go"]
-  let previewed = committer.restore(source: working, paths: paths, preview: true)
-  assert { previewed.directory("/").changes(from: working.directory("/")).isEmpty }
-  assert { previewed.git.head.commitSHA == working.git.head.commitSHA }
   let restored = committer.restore(source: working, paths: paths)
   assert { restored.git.head.commitSHA == working.git.head.commitSHA }
   assert { restored.git.directory.file("HEAD").contents == working.git.directory.file("HEAD").contents }
@@ -551,6 +548,15 @@ let checkCommitterRestore(source: Workspace!): String! {
   let emptyCommit = committer.restore(source: working, paths: paths, ref: " ").git.head.commitSHA rescue { e: Error => e.message }
   assert { emptyCommit.contains("specify a source commit") }
   assert { committer.restore(source: working, paths: ["**"]).git.uncommitted.isEmpty }
+  # Restoring an added text file must not read its deletion patch into a String.
+  # Its contents alone exceed File.contents' 128 MiB limit.
+  let large = container.from("alpine:3.22")
+    .withExec(["sh", "-c", "yes restore-regression | head -c 135266304 > /large.txt"])
+    .file("/large.txt")
+  let largeWorking = working.withFile(root + "/large.txt", large)
+  let largeRestored = committer.restore(source: largeWorking, paths: [root + "/large.txt"])
+  assert { largeRestored.directory("/").changes(from: working.directory("/")).isEmpty }
+  assert { largeRestored.git.head.commitSHA == working.git.head.commitSHA }
   let tools = committer.agent(llm.withWorkspace(source)).tools
   assert { tools.contains("restore") }
   ["checkMessages", "checkRebaseHelpers", "checkRebaseReplay", "checkFiltering", "checkRestore"].each { name =>

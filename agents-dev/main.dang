@@ -43,7 +43,7 @@ type AgentsDev {
     null
   }
 
-  """Check selective restoration, previews, and validation on private fixtures."""
+  """Check selective restoration, large files, and validation on private fixtures."""
   committerRestore(source: Workspace!): Void @check {
     print(checkCommitterRestore(source))
     null
