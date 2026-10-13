@@ -4,7 +4,7 @@ Run from the agents repository: dagger-dev run python3 staff/tests/integration.p
 Requires an engine with both Agent and frozen Workspace Git APIs.
 
 Committed work is harvested with git tools by address
-(dag://staff/members/head?member=<name>); agents-dev's committer checks cover
+(dag://staff/members/head?staff-member=<name>); agents-dev's committer checks cover
 that. This script covers the uncommitted half: pendingOf and salvagePending.
 """
 
@@ -94,7 +94,7 @@ def main():
         committed_staff = roster(worker)
         clean = pending_of(committed_staff)
         assert "no uncommitted changes" in clean, clean
-        assert "dag://staff/members/head?member=worker" in clean, clean
+        assert "dag://staff/members/head?staff-member=worker" in clean, clean
         assert salvage(committed_staff, worker, "{ isEmpty }")["isEmpty"]
 
         pending_staff = roster(edit(edit(worker, "pending.txt", "unfinished\n"), "file.txt", "worker pending\n"))

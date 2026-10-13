@@ -13,7 +13,7 @@ let testStaffFiltering(source: Workspace!): String! {
   let none = fixture.pendingOf(name: "fixture", paths: [root + "/**/*.rs"])
   assert { none.contains("no uncommitted changes") }
   # The escape hatch points committed work at its address, not at a verb.
-  assert { none.contains("dag://staff/members/head?member=fixture") }
+  assert { none.contains("dag://staff/members/head?staff-member=fixture") }
   worker.stop
 
   # Exercise literal drift filtering through salvagePending. All other pending
@@ -104,24 +104,27 @@ let testStaffMembers(source: Workspace!): String! {
     assert { staff.members.keys == [] }
 
     # A member's head is an artifact: the collection field on the module's
-    # main object contributes a `member` dimension to the workspace schema,
-    # and `head` is a GitRef path under it.
+    # main object contributes a `staff-member` dimension (the engine
+    # namespaces the item type by module) to the workspace schema, and
+    # `head` is a GitRef path under it.
     let selected = source.artifacts.filterPathPattern(pattern: "staff/**")
     let dimensions = selected.dimensionDefinitions.{{identifier, name, itemType}}
-    assert { dimensions.any { d => d.identifier == "/staff/members" and d.name == "member" and d.itemType == "Member" } }
+    assert { dimensions.any { d => d.identifier == "/staff/members" and d.name == "staff-member" and d.itemType == "StaffMember" } }
     let paths = selected.pathDefinitions.{{uri, dimensions}}
-    assert { paths.any { p => p.uri == "dag://staff/members/head" and p.dimensions.contains("/staff/members") and p.dimensions.contains("type:GitRef") } }
+    assert { paths.any { p => p.uri == "dag://?git-ref=staff/members/head" and p.dimensions.contains("/staff/members") and p.dimensions.contains("type:GitRef") } }
     # Exactly one `members` tree: the worker's Peers is minted by a function
-    # with a required argument, so it adds no second `member` dimension (no
-    # staff/pull-tools/members) that would make the address ambiguous.
-    assert { dimensions.filter { d => d.name == "member" }.map { d => d.identifier } == ["/staff/members"] }
+    # with a required argument, so it adds no second `staff-member` dimension
+    # (no staff/pull-tools/members) that would make the address ambiguous.
+    # The item type's own `type:StaffMember` dimension shares the name, but
+    # collection aliases win over type names when resolving.
+    assert { dimensions.filter { d => d.name == "staff-member" and !d.identifier.hasPrefix("type:") }.map { d => d.identifier } == ["/staff/members"] }
     assert { !paths.any { p => p.uri.contains("pull-tools") or p.uri.contains("peers") } }
 
     # In a chief's scope the address resolves against its live roster, even
     # though the chief does not get `members` as a tool.
     let scope = llm.withWorkspace(base).withTools(roster, except: ["members"]).artifacts(include: ["staff/members"])
-    assert { scope.dimensionKeys(dimension: "member") == ["ahead", "idle"] }
-    let head = scope.filterUri(uri: "dag://staff/members/head?member=ahead").one.value.{{... on GitRef!}}
+    assert { scope.dimensionKeys(dimension: "staff-member") == ["ahead", "idle"] }
+    let head = scope.filterUri(uri: "dag://staff/members/head?staff-member=ahead").one.value.{{... on GitRef!}}
     assert { head.commitSHA == committed.git.head.commitSHA }
     null
   } rescue { e: Error => {
@@ -167,8 +170,8 @@ let testStaffPeers(source: Workspace!): String! {
     # A worker's scope resolves the same addresses through its bound Peers,
     # bound as spawn binds it: `members` is not a tool, yet still a tree.
     let scope = llm.withWorkspace(base).withTools(peers, except: ["members"]).artifacts(include: ["staff/members"])
-    assert { scope.dimensionKeys(dimension: "member") == ["chief", "late"] }
-    let head = scope.filterUri(uri: "dag://staff/members/head?member=chief").one.value.{{... on GitRef!}}
+    assert { scope.dimensionKeys(dimension: "staff-member") == ["chief", "late"] }
+    let head = scope.filterUri(uri: "dag://staff/members/head?staff-member=chief").one.value.{{... on GitRef!}}
     assert { head.commitSHA == chiefWorkspace.git.head.commitSHA }
 
     # The escape hatches reach any member, chief included.

@@ -19,5 +19,5 @@ failures with and without conflict markers. Expected validation failures
 appear as error spans even when the script passes.
 
 Committed work is not staff's concern: each member's history is the GitRef
-at `dag://staff/members/head?member=<name>`, harvested with git tools. The
+at `dag://staff/members/head?staff-member=<name>`, harvested with git tools. The
 agents-dev `committer-refs` and `staff-*` checks cover that path.

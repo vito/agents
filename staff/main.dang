@@ -10,7 +10,7 @@
 # the chief steers by name — sendTo/status/read/interruptWorker.
 #
 # Staff does no git. The roster is a COLLECTION (`members`): each agent's
-# committed history is an artifact, `dag://staff/members/head?member=<name>`,
+# committed history is an artifact, `dag://staff/members/head?staff-member=<name>`,
 # so whatever git tools the agent has that take a GitRef can inspect,
 # cherry-pick or rebase onto another agent's commits by address. Uncommitted
 # work has no git ref, so two escape hatches reach it by name: pendingOf
@@ -110,7 +110,7 @@ type Staff {
   you are subscribed to its lifecycle: when it goes idle (with its final
   reply) or fails (with the error), the news arrives as an event message.
   Keep working; check on it with status/read, steer it with sendTo, and take
-  its commits from `dag://staff/members/head?member=<name>` with your git
+  its commits from `dag://staff/members/head?staff-member=<name>` with your git
   tools. The worker gets fresh tools from the workspace where staff was
   composed, bound to your current worktree, the staff roster (`chief` and
   its peers, by address), and askChief, its line back to you. It cannot
@@ -279,7 +279,7 @@ type Staff {
 
   """
   Escape hatch for a worker's UNCOMMITTED edits. For committed work, use git
-  tools with `dag://staff/members/head?member=<name>`.
+  tools with `dag://staff/members/head?staff-member=<name>`.
 
   Monitor: show what a worker has changed but not committed — a per-file
   summary followed by a Git-compatible unified diff. No git ref reaches
@@ -307,7 +307,7 @@ type Staff {
 
   """
   Escape hatch for a worker's UNCOMMITTED edits. For committed work, use git
-  tools with `dag://staff/members/head?member=<name>`.
+  tools with `dag://staff/members/head?staff-member=<name>`.
 
   Recover: take everything a worker changed but never committed as your own
   pending edits, re-anchored on your workspace's current content. The
@@ -374,7 +374,7 @@ type Staff {
   """
   The roster as a collection, one member per worker, under its staff name.
 
-  Each member's committed history is an artifact — `dag://staff/members/head?member=<name>`
+  Each member's committed history is an artifact — `dag://staff/members/head?staff-member=<name>`
   is that agent's HEAD as a GitRef — so any git tool that takes a ref can
   inspect, cherry-pick or rebase onto another agent's commits by address.
   """
@@ -484,11 +484,11 @@ type Staff {
     work is only the fallback.
 
     HARVESTING IS GIT, BY ADDRESS. Each member's committed history is
-    addressable as `dag://staff/members/head?member=<name>`. Pass that
+    addressable as `dag://staff/members/head?staff-member=<name>`. Pass that
     address to any tool that takes a GitRef to inspect a worker's commits,
     cherry-pick them into your workspace, or rebase your own commits onto
     them — nothing needs pushing. FindArtifacts lists these addresses, and
-    FindArtifacts(dimension: "member") the names.
+    FindArtifacts(dimension: "staff-member") the names.
 
     Each worker sees the same roster — `chief` for you, staff names for its
     peers — and can inspect and take their work the same way, but cannot
@@ -537,11 +537,11 @@ type Staff {
     commits carry it.
 
     THE STAFF'S WORK IS ADDRESSABLE. Each member's committed history is a
-    git ref, `dag://staff/members/head?member=<name>` — `chief` for the
+    git ref, `dag://staff/members/head?staff-member=<name>` — `chief` for the
     chief, staff names for your peers. Pass it to any tool that takes a
     GitRef to inspect, cherry-pick, or rebase onto that work — e.g. put your
     commits on top of the chief's when it asks you to. FindArtifacts lists
-    these addresses, and FindArtifacts(dimension: "member") the names. The
+    these addresses, and FindArtifacts(dimension: "staff-member") the names. The
     roster is live as of the chief's last completed step, so peers hired
     after you show up too. Uncommitted work has no git ref: `pendingOf`
     (monitor) and `salvagePending` (recover) are escape hatches for a
@@ -570,7 +570,7 @@ type Staff {
 
 """
 The staff roster as a collection: staff names as keys, each agent's git
-history as the item. Selected by address as `dag://staff/members?member=<name>`.
+history as the item. Selected by address as `dag://staff/members?staff-member=<name>`.
 """
 type Members @collection {
   # The roster the keys were read from; private so Staff itself stays out of
@@ -656,7 +656,7 @@ type Member {
 
   """
   The agent's committed history: the HEAD of its workspace, as a GitRef. This
-  is the artifact at `dag://staff/members/head?member=<name>` — pass that
+  is the artifact at `dag://staff/members/head?staff-member=<name>` — pass that
   address to any tool taking a GitRef to rebase onto, cherry-pick from, or
   inspect this agent's commits.
   """
@@ -690,7 +690,7 @@ type Peers {
   """
   The staff roster as a collection: `chief`, and the workers in the chief's
   roster as of its last completed step — including workers hired after you.
-  `dag://staff/members/head?member=<name>` addresses a member's committed
+  `dag://staff/members/head?staff-member=<name>` addresses a member's committed
   history as a GitRef for tools that take one.
   """
   members: PeerMembers! @cache(policy: FunctionCachePolicy.Never) {
@@ -714,7 +714,7 @@ type Peers {
 
   """
   Escape hatch for an agent's UNCOMMITTED edits. For committed work, use git
-  tools with `dag://staff/members/head?member=<name>`.
+  tools with `dag://staff/members/head?staff-member=<name>`.
 
   Monitor: show what a member — `chief` or a peer — has changed but not
   committed, as a per-file summary followed by a Git-compatible unified
@@ -738,7 +738,7 @@ type Peers {
 
   """
   Escape hatch for an agent's UNCOMMITTED edits. For committed work, use git
-  tools with `dag://staff/members/head?member=<name>`.
+  tools with `dag://staff/members/head?staff-member=<name>`.
 
   Recover: take a member's uncommitted work as your own pending edits,
   re-anchored on your workspace's current content; its authorship is lost.
@@ -763,7 +763,7 @@ type Peers {
 
 """
 A worker's roster as a collection: `chief` and its peers by staff name.
-Selected by address as `dag://staff/members?member=<name>`, like the chief's.
+Selected by address as `dag://staff/members?staff-member=<name>`, like the chief's.
 """
 type PeerMembers @collection {
   # Private so the Agent API and the chief's Staff stay out of the
@@ -799,7 +799,8 @@ type PeerMembers @collection {
       raise `no staff member named "${name}": the chief has no roster`
     }
     # A local Member wrapping the chief's entry, not that entry itself: the
-    # item type names the collection's dimension, which must stay `member`.
+    # item type names the collection's dimension, which must stay
+    # `staff-member`.
     Member(name, via: live.get(key: name))
   }
 }
@@ -848,7 +849,7 @@ let pendingReport(theirs: Workspace!, name: String!, paths: [String!]!): String!
   if (scopedStats.isEmpty) {
     return `"${name}" has no uncommitted changes`
       + (if (paths.isEmpty) { "." } else { " under the given paths." })
-      + "\n\n" + `What it committed is at dag://staff/members/head?member=${name}, `
+      + "\n\n" + `What it committed is at dag://staff/members/head?staff-member=${name}, `
       + "for any tool that takes a GitRef."
   }
   let summary = scopedStats.map { s =>
@@ -883,7 +884,7 @@ let salvage(source: Workspace!, theirs: Workspace!, name: String!, markers: Bool
   let pending = scopeLiteralChanges(theirs.git.uncommitted, drift).asPatch.contents
   if (pending == "") {
     print(`"${name}" has no uncommitted work to take. What it committed is at `
-      + `dag://staff/members/head?member=${name}, for any tool that takes a GitRef.`)
+      + `dag://staff/members/head?staff-member=${name}, for any tool that takes a GitRef.`)
     return base.changes(from: base)
   }
 

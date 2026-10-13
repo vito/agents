@@ -40,7 +40,7 @@
 #     which the tool layer lifts from an address string — a git URL with a
 #     fragment, or any artifact that is a GitRef, such as another agent's
 #     history when a module exposes it, or this module's `saved` collection
-#     (dag://committer/saved/head?saved-workspace=<sha>). Commits that exist
+#     (dag://committer/saved/head?committer-saved-workspace=<sha>). Commits that exist
 #     only in another agent's workspace, or that a reset orphaned, are
 #     reachable without pushing anything (vito/agents#21).
 #     `cherryPickPlan(from:)` plans a harvest, `cherryPick(from:)` takes it,
@@ -180,7 +180,7 @@ type Committer {
     Resolve `ref` in this git ref instead of the checkout: any GitRef
     address, including other agents' histories (FindArtifacts lists them) and
     workspaces a reset left behind
-    (`dag://committer/saved/head?saved-workspace=<sha>`). With `ref` at its
+    (`dag://committer/saved/head?committer-saved-workspace=<sha>`). With `ref` at its
     default, restores from that ref's own commit.
     """
     from: GitRef = null,
@@ -365,7 +365,7 @@ type Committer {
     }
     print(`Reset HEAD from ${previous} to ${sha}. ${note} `
       + `To return to the workspace you left, reset to ${previous}; `
-      + `its commits stay reachable as dag://committer/saved/head?saved-workspace=${previous}.`)
+      + `its commits stay reachable as dag://committer/saved/head?committer-saved-workspace=${previous}.`)
     # A self-call gives the updated toolset an engine identity. Rebind both
     # it and the workspace through the continuation so the map persists.
     let tools = currentNode.{{... on Dagger.Committer!}}
@@ -452,7 +452,7 @@ type Committer {
 
   `from` is any GitRef address, including other agents' histories
   (FindArtifacts lists them), a workspace a reset left behind
-  (`dag://committer/saved/head?saved-workspace=<sha>`), or a git URL with a
+  (`dag://committer/saved/head?committer-saved-workspace=<sha>`), or a git URL with a
   fragment. Without `commits`, every commit on it that HEAD lacks is taken,
   oldest first; fast-forwarding when possible, so hashes may change.
   `cherryPickPlan(from:)` shows the plan first.
@@ -578,7 +578,7 @@ type Committer {
   each was at when it was saved.
 
   A reset orphans the commits it moved away from; each saved workspace keeps
-  them reachable. `dag://committer/saved/head?saved-workspace=<sha>` is a
+  them reachable. `dag://committer/saved/head?committer-saved-workspace=<sha>` is a
   saved workspace's HEAD as a GitRef: pass it to `show(from:)`,
   `fileAt(from:)`, `restore(from:)` or `cherryPick(from:)` to read or reapply
   those commits without resetting back.
@@ -1110,7 +1110,7 @@ type Committer {
     Resolve `commit` and `against` in this git ref instead of the checkout:
     any GitRef address, including other agents' histories (FindArtifacts
     lists them) and workspaces a reset left behind
-    (`dag://committer/saved/head?saved-workspace=<sha>`). With `commit` at
+    (`dag://committer/saved/head?committer-saved-workspace=<sha>`). With `commit` at
     its default, shows that ref's own commit.
     """
     from: GitRef = null,
@@ -1206,7 +1206,7 @@ type Committer {
     Resolve `commit` in this git ref instead of the checkout: any GitRef
     address, including other agents' histories (FindArtifacts lists them)
     and workspaces a reset left behind
-    (`dag://committer/saved/head?saved-workspace=<sha>`). With `commit` at
+    (`dag://committer/saved/head?committer-saved-workspace=<sha>`). With `commit` at
     its default, reads at that ref's own commit.
     """
     from: GitRef = null,
@@ -1940,7 +1940,7 @@ type Committer {
     `restore` take a git ref as an address string — any GitRef address,
     including other agents' histories (FindArtifacts lists them), a workspace
     a `reset` left behind
-    (`dag://committer/saved/head?saved-workspace=<sha>`; `reset` prints the
+    (`dag://committer/saved/head?committer-saved-workspace=<sha>`; `reset` prints the
     address, and `saved` lists them), or a git URL with a fragment such as
     "https://github.com/org/repo#main". This is how to read, take, or rebase
     onto commits that exist only in another agent's workspace, or reach
@@ -1993,7 +1993,7 @@ type Committer {
 """
 The workspaces `reset` left behind, as a collection keyed by the HEAD hash
 each was at when it was saved. Selected by address as
-`dag://committer/saved?saved-workspace=<sha>`.
+`dag://committer/saved?committer-saved-workspace=<sha>`.
 """
 type Saved @collection {
   # The tool object holding the saved workspaces; private so Committer itself
@@ -2047,7 +2047,7 @@ type SavedWorkspace {
 
   """
   The saved HEAD as a GitRef — the artifact at
-  `dag://committer/saved/head?saved-workspace=<sha>`. Its history stays
+  `dag://committer/saved/head?committer-saved-workspace=<sha>`. Its history stays
   reachable here after the reset that orphaned it.
   """
   head: GitRef! {
