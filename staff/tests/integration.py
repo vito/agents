@@ -1,11 +1,17 @@
-"""Exercise staff's escape hatches without model calls or writes to the user's checkout.
+"""Exercise staff without model calls or writes to the user's checkout.
 
 Run from the agents repository: dagger-dev run python3 staff/tests/integration.py
-Requires an engine with both Agent and frozen Workspace Git APIs.
+Requires an engine with the Agent API, frozen Workspace Git APIs, and the
+expertise record from dagger/dagger#14637 (LLM.expertise, Agent.parent,
+LLM.spawn(expertise:)).
 
 Committed work is harvested with git tools by address
 (dag://staff/members/head?staff-member=<name>); agents-dev's committer checks cover
 that. This script covers the uncommitted half: pendingOf and salvagePending.
+It also covers the worker role: a worker spawned from a chief's recorded
+composition has the worker tools and none of the chief's, knows its name and
+its chief, stays a worker when its recorded entries are recomposed, and gains
+the chief tools only when dag://staff/agent is composed explicitly.
 """
 
 import base64
@@ -71,6 +77,155 @@ def salvage(staff, ws, selection, args=""):
                  + ' } } }', staff=staff, ws=ws)["node"]["salvagePending"]
 
 
+PROBE = '''type Probe {
+  agent(base: LLM!): LLM! @agent {
+    base.withTools(currentNode).withSystemPrompt("probe capabilities")
+  }
+  probeRead(source: Workspace!): String! {
+    source.file("dagger.toml").contents
+  }
+}
+'''
+
+WORKER_PROMPT = "You are a worker agent on a staff"
+CHIEF_PROMPT = "You can hire and direct a staff"
+CHIEF_TOOLS = ("interruptWorker", "sendTo")
+
+
+def role_workspace(module):
+    """A synthetic workspace installing this staff module and a probe module."""
+    staff_dir = query('query($path: String!) { host { directory(path: $path, exclude: ["tests/"]) { id } } }',
+                      path=module)["host"]["directory"]["id"]
+    return query('query($staff: ID!, $toml: String!, $probeToml: String!, $probe: String!) { directory { '
+                 'withNewFile(path: "dagger.toml", contents: $toml) { '
+                 'withDirectory(path: "staff", source: $staff) { '
+                 'withNewFile(path: "probe/dagger-module.toml", contents: $probeToml) { '
+                 'withNewFile(path: "probe/main.dang", contents: $probe) { asWorkspace { id } } } } } } }',
+                 staff=staff_dir, probe=PROBE,
+                 probeToml='name = "probe"\nengineVersion = "v1.0.0-0"\n\n[runtime]\nsource = "dang"\n',
+                 toml='[modules.staff]\nsource = "staff"\n\n[modules.probe]\nsource = "probe"\n',
+                 )["directory"]["withNewFile"]["withDirectory"]["withNewFile"]["withNewFile"]["asWorkspace"]["id"]
+
+
+def expertise_at(ws, uri):
+    return [e["id"] for e in workspace_field(ws, 'artifacts { filterUri(uri: ' + json.dumps(uri)
+                                             + ') { asExpertise { id } } }')["artifacts"]["filterUri"]["asExpertise"]]
+
+
+def agent_field(agent, selection):
+    return query('query($agent: ID!) { node(id: $agent) { ... on Agent { ' + selection + ' } } }',
+                 agent=agent)["node"]
+
+
+def llm_field(llm, selection):
+    return query('query($llm: ID!) { node(id: $llm) { ... on LLM { ' + selection + ' } } }', llm=llm)["node"]
+
+
+CONVERSATION = 'id tools workspace { id } expertise { artifact { uri moduleName } } messages { role content { text } }'
+
+
+def describe(conversation):
+    """Recorded entry URIs, tools and system prompt texts of a conversation."""
+    return {
+        "id": conversation["id"],
+        "workspace": conversation["workspace"]["id"],
+        "uris": [e["artifact"]["uri"] for e in conversation["expertise"]],
+        "tools": conversation["tools"],
+        "prompts": [block["text"] or "" for m in conversation["messages"] if m["role"] == "SYSTEM"
+                    for block in m["content"]],
+    }
+
+
+def reload_recorded(conversation):
+    """What Editor's reload does: find each recorded entry again by URI, then recompose."""
+    entries = []
+    for uri in conversation["uris"]:
+        found = expertise_at(conversation["workspace"], uri)
+        assert len(found) == 1, (uri, found)
+        entries += found
+    llm = query('query($llm: ID!, $entries: [ID!]!) { node(id: $llm) { ... on LLM { '
+                'recompose(expertise: $entries) { ' + CONVERSATION + ' } } } }',
+                llm=conversation["id"], entries=entries)["node"]["recompose"]
+    return describe(llm)
+
+
+def assert_worker(conversation, name):
+    tools, prompts = conversation["tools"], conversation["prompts"]
+    for tool in ("askChief", "pendingOf", "salvagePending", "probeRead"):
+        assert tool in tools, (tool, tools)
+    for tool in CHIEF_TOOLS:
+        assert tool not in tools, (tool, tools)
+    assert sum(WORKER_PROMPT in p for p in prompts) == 1, prompts
+    assert sum(f'Your staff name is "{name}"' in p for p in prompts) == 1, prompts
+    assert not any(CHIEF_PROMPT in p for p in prompts), prompts
+    assert "probe capabilities" in prompts, prompts
+
+
+def worker_role(module):
+    ws = role_workspace(module)
+    # Default composition nominates the chief role, never the worker role.
+    defaults = [a["uri"] for a in workspace_field(ws, 'artifacts { filterTypes(types: ["Expertise"]) '
+                                                  '{ items { uri } } }')["artifacts"]["filterTypes"]["items"]]
+    assert any("staff/agent" in u for u in defaults), defaults
+    assert not any("staff/worker" in u for u in defaults), defaults
+
+    chief = query('query($ws: ID!, $entries: [ID!]!) { llm { withWorkspace(workspace: $ws) '
+                  '{ spawn(name: "role-chief", expertise: $entries) } } }', ws=ws,
+                  entries=expertise_at(ws, "dag://probe/agent") + expertise_at(ws, "dag://staff/agent"),
+                  )["llm"]["withWorkspace"]["spawn"]
+    chief_handle = agent_field(chief, "handle parent { handle }")
+    assert chief_handle["parent"] is None, chief_handle
+    selected = query('query($chief: ID!, $ws: ID!) { staff { workerExpertise(chief: $chief, source: $ws) '
+                     '{ id artifact { uri moduleName } } } }', chief=chief, ws=ws)["staff"]["workerExpertise"]
+    # The chief's record minus staff's own entries, then the worker role.
+    assert [e["artifact"]["moduleName"] for e in selected] == ["probe", "staff"], selected
+    assert "staff/worker" in selected[1]["artifact"]["uri"], selected
+
+    # A chief's spawn tool records the calling chief as the worker's parent.
+    # This script is no agent, so restore under a fresh handle with the chief
+    # as the recorded parent instead; the entries compose after that identity
+    # exists, as they do in Staff.spawn.
+    worker = query('query($ws: ID!, $entries: [ID!]!, $handle: String!, $parent: String!) { llm { '
+                   'withWorkspace(workspace: $ws) { spawn(name: "role-worker", handle: $handle, '
+                   'parentHandle: $parent, expertise: $entries) } } }', ws=ws,
+                   entries=[e["id"] for e in selected], handle="staff-role-" + os.urandom(6).hex(),
+                   parent=chief_handle["handle"])["llm"]["withWorkspace"]["spawn"]
+    try:
+        lineage = agent_field(worker, "name parent { handle name }")
+        assert lineage["name"] == "role-worker", lineage
+        assert lineage["parent"]["handle"] == chief_handle["handle"], lineage
+
+        seed = describe(agent_field(worker, "snapshot { " + CONVERSATION + " }")["snapshot"])
+        assert seed["uris"] == [e["artifact"]["uri"] for e in selected], seed["uris"]
+        assert_worker(seed, "role-worker")
+        # `me` is the worker; its chief resolves through me.parent.
+        keys = llm_field(seed["id"], 'artifacts(include: ["staff/members"]) '
+                         '{ dimensionKeys(dimension: "staff-member") }')["artifacts"]["dimensionKeys"]
+        assert keys == ["chief"], keys
+
+        # Reload keeps it a worker: same record, one worker prompt, no chief tools.
+        reloaded = reload_recorded(seed)
+        assert reloaded["uris"] == seed["uris"], reloaded["uris"]
+        assert_worker(reloaded, "role-worker")
+
+        # Explicitly composing the chief role adds the chief tools, and survives reload.
+        promoted = describe(query('query($llm: ID!, $entries: [ID!]!) { node(id: $llm) { ... on LLM { '
+                                  'compose(expertise: $entries) { ' + CONVERSATION + ' } } } }',
+                                  llm=reloaded["id"], entries=expertise_at(ws, "dag://staff/agent"),
+                                  )["node"]["compose"])
+        assert len(promoted["uris"]) == 3, promoted["uris"]
+        again = reload_recorded(promoted)
+        for conversation in (promoted, again):
+            for tool in CHIEF_TOOLS + ("askChief",):
+                assert tool in conversation["tools"], (tool, conversation["tools"])
+            assert any(CHIEF_PROMPT in p for p in conversation["prompts"]), conversation["prompts"]
+            assert sum('Your staff name is "role-worker"' in p for p in conversation["prompts"]) == 1
+    finally:
+        agent_field(worker, "stop")
+        agent_field(chief, "stop")
+    print("PASS: worker role tools/prompt/parent, reload stays a worker, explicit chief composition")
+
+
 def main():
     module = str(Path(__file__).resolve().parents[1])
     query('query($ref: String!) { moduleSource(refString: $ref) '
@@ -112,6 +267,7 @@ def main():
         assert git("rev-parse", "HEAD") == root_sha
         assert git("status", "--porcelain") == ""
     print("PASS: pendingOf summaries/scoping, salvagePending re-anchoring, conflicts and markers")
+    worker_role(module)
 
 
 def expect_error(fragment, action):

@@ -146,14 +146,17 @@ let testStaffPeers(source: Workspace!): String! {
     message: "fixture: chief commit",
     date: "2026-09-15T12:00:00Z",
   )
-  let early = llm.withWorkspace(base).spawn(name: "peers-early")
-  let late = llm.withWorkspace(base.withNewFile(root + "/late.txt", "unfinished\n")).spawn(name: "peers-late")
   # The chief's conversation binds its Staff, as Staff.agent does; the
-  # roster a worker sees is read from there.
+  # roster a worker sees is read from there. It starts with no workers: the
+  # chief must exist before a worker can name it as its parent.
+  let chief = llm.withWorkspace(chiefWorkspace).withTools(staff, except: ["members"]).spawn(name: "peers-chief")
+  let early = spawnUnder(chief, llm.withWorkspace(base), "early", [])
+  let late = llm.withWorkspace(base.withNewFile(root + "/late.txt", "unfinished\n")).spawn(name: "late")
   let hiredEarly = staff.withWorker("early", early)
-  let chief = llm.withWorkspace(chiefWorkspace).withTools(hiredEarly, except: ["members"]).spawn(name: "peers-chief")
-  let peers = staff.peers(chief: chief, name: "early");
+  # Peers holds only the worker itself; chief and name come from it.
+  let peers = staff.peers(me: early);
   {
+    chief.reseed(conversation: llm.withWorkspace(chiefWorkspace).withTools(hiredEarly, except: ["members"]))
     # The worker itself is left out; the chief is always there.
     assert { peers.members.keys == ["chief"] }
     let own = peers.members.get(key: "early").name rescue { e: Error => e.message }
@@ -168,7 +171,8 @@ let testStaffPeers(source: Workspace!): String! {
     assert { peers.members.get(key: "late").head.commitSHA == base.git.head.commitSHA }
 
     # A worker's scope resolves the same addresses through its bound Peers,
-    # bound as spawn binds it: `members` is not a tool, yet still a tree.
+    # bound as the worker role binds it: `members` is not a tool, yet still
+    # a tree.
     let scope = llm.withWorkspace(base).withTools(peers, except: ["members"]).artifacts(include: ["staff/members"])
     assert { scope.dimensionKeys(dimension: "staff-member") == ["chief", "late"] }
     let head = scope.filterUri(uri: "dag://staff/members/head?staff-member=chief").one.value.{{... on GitRef!}}
@@ -180,15 +184,19 @@ let testStaffPeers(source: Workspace!): String! {
     assert { peers.pendingOf(name: "chief").contains("no uncommitted changes") }
     assert { peers.salvagePending(source: base, name: "late").addedPaths.filter { p => !p.hasSuffix("/") } == [root + "/late.txt"] }
 
-    # Workers get the roster and escape hatches, never orchestration. Bound
-    # as spawn binds it: the roster is reached by address, not as a tool.
+    # Workers get the roster, the escape hatches and the line home, never
+    # orchestration. The roster is reached by address, not as a tool.
     let tools = llm.withWorkspace(base).withTools(peers, except: ["members"]).tools
-    ["pendingOf", "salvagePending"].each { name =>
+    ["pendingOf", "salvagePending", "askChief"].each { name =>
       assert { tools.contains("## " + name + "\n") }
     }
-    ["spawn", "sendTo", "interruptWorker", "logOf", "pullPending", "members"].each { name =>
+    ["spawn", "sendTo", "interruptWorker", "logOf", "pullPending", "members", "me", "chief"].each { name =>
       assert { !tools.contains("## " + name + "\n") }
     }
+
+    # A root agent has no chief: Peers says so instead of guessing.
+    let orphan = staff.peers(me: late).members.keys rescue { e: Error => [e.message] }
+    assert { orphan.length == 1 and (orphan[0] ?? "").contains("no chief") }
     null
   } rescue { e: Error => {
     early.stop
@@ -202,6 +210,133 @@ let testStaffPeers(source: Workspace!): String! {
   "Staff peers checks passed."
 }
 
+# A worker whose parent is `chief`, without a model call. A chief's spawn
+# tool records the calling chief as parent; a check has no calling agent, so
+# restore under a fresh handle with the chief as the recorded parent instead.
+# The expertise is composed after that identity exists, as spawn does.
+let spawnUnder(chief: Agent!, conversation: LLM!, name: String!, expertise: [Expertise!]!): Agent! {
+  conversation.spawn(
+    name: name,
+    handle: "staff-check-" + name + "-" + Random.string,
+    parentHandle: chief.handle,
+    expertise: expertise,
+  )
+}
+
+# The expertise selected by a DAG address, reloaded by ID so it can be passed
+# on as a concrete [Expertise!]! argument.
+let expertiseAt(ws: Workspace!, uri: String!): [Expertise!]! {
+  ws.artifacts.filterUri(uri: uri).asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
+}
+
+let recordedUris(conversation: LLM!): [String!]! {
+  conversation.expertise.{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
+}
+
+# What Editor's reload does: find each recorded entry again by address in the
+# conversation's current workspace, and recompose them in place.
+let reloadRecorded(conversation: LLM!): LLM! {
+  let ws = conversation.workspace
+  let entries = recordedUris(conversation).map { uri =>
+    let found = expertiseAt(ws, uri)
+    if (found.length != 1) {
+      raise `recorded entry ${uri} matched ${toString(found.length)} entries`
+    }
+    let entry = found[0]
+    if (entry == null) {
+      raise `recorded entry ${uri} is missing`
+    }
+    entry
+  }
+  conversation.recompose(expertise: entries)
+}
+
+let systemTexts(conversation: LLM!): [String!]! {
+  let texts: [String!]! = []
+  conversation.messages.{{role, content.{{text}}}}
+    .filter { m => m.role == LLMMessageRole.SYSTEM }
+    .each { m => m.content.each { c => texts += [c.text ?? ""] } }
+  texts
+}
+
+let testStaffWorker(source: Workspace!): String! {
+  let workerLine = `Your staff name is "check-worker"`
+  # Default composition picks the chief role, never the worker role.
+  let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "staff/**").items.{{ uri }}.map { a => a.uri }
+  assert(message: defaults.join(", ")) { defaults.any { u => u.contains("staff/agent") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("staff/worker") } }
+
+  # A chief composed from this workspace: git tools plus the staff chief role.
+  let chief = llm.withWorkspace(source).spawn(
+    name: "worker-check-chief",
+    expertise: expertiseAt(source, "dag://committer/agent") + expertiseAt(source, "dag://staff/agent"),
+  )
+  # Spawn inherits the chief's record minus staff's own entries, then adds
+  # the worker role. A module call returns a lazy list: select once, then
+  # reload each entry by ID.
+  let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ uri }} }}
+  let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+  let worker = spawnUnder(chief, llm.withWorkspace(source), "check-worker", selected);
+  {
+    let uris = picked.map { e => e.artifact.uri }
+    assert(message: uris.join(", ")) { uris.length == 2 and (uris[0] ?? "").contains("committer/agent") and (uris[1] ?? "").contains("staff/worker") }
+
+    let parent = worker.parent
+    if (parent == null) {
+      raise "the worker has no parent"
+    }
+    assert { parent.handle == chief.handle }
+    assert { worker.name == "check-worker" }
+
+    # The worker has the inherited git tools and the worker tools, and no
+    # chief tools. Tool names may be namespaced when several objects are
+    # bound, so match names rather than headings.
+    let conversation = worker.snapshot.sync
+    assert { recordedUris(conversation) == uris }
+    let tools = conversation.tools
+    assert { tools.contains("askChief") and tools.contains("pendingOf") and tools.contains("salvagePending") }
+    assert { tools.contains("cherryPick") }
+    assert { !tools.contains("interruptWorker") and !tools.contains("sendTo") }
+    # The worker prompt carries its staff name; the chief prompt is absent.
+    let prompts = systemTexts(conversation)
+    assert { prompts.filter { t => t.contains("You are a worker agent on a staff") }.length == 1 }
+    assert { prompts.any { t => t.contains(workerLine) } }
+    assert { !prompts.any { t => t.contains("You can hire and direct a staff") } }
+    # `me` is the worker, whose parent is the chief: the roster resolves.
+    let scope = conversation.artifacts(include: ["staff/members"])
+    assert { scope.dimensionKeys(dimension: "staff-member") == ["chief"] }
+
+    # Reloading the recorded entries refreshes the worker in place: still a
+    # worker, the same record, one worker prompt, no chief tools.
+    let reloaded = reloadRecorded(conversation)
+    assert { recordedUris(reloaded) == uris }
+    let reloadedTools = reloaded.tools
+    assert { reloadedTools.contains("askChief") and reloadedTools.contains("cherryPick") }
+    assert { !reloadedTools.contains("interruptWorker") and !reloadedTools.contains("sendTo") }
+    let reloadedPrompts = systemTexts(reloaded)
+    assert { reloadedPrompts.filter { t => t.contains(workerLine) }.length == 1 }
+    assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
+
+    # Explicitly composing the chief role still works, and survives reload.
+    let promoted = reloaded.compose(expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
+    assert { recordedUris(promoted).length == 3 }
+    let promotedTools = promoted.tools
+    assert { promotedTools.contains("interruptWorker") and promotedTools.contains("sendTo") }
+    assert { promotedTools.contains("askChief") }
+    let again = reloadRecorded(promoted)
+    assert { again.tools.contains("interruptWorker") and again.tools.contains("askChief") }
+    assert { systemTexts(again).filter { t => t.contains(workerLine) }.length == 1 }
+    null
+  } rescue { e: Error => {
+    worker.stop
+    chief.stop
+    raise e.message
+  }}
+  worker.stop
+  chief.stop
+  "Staff worker role checks passed."
+}
+
 let testStaffTools(source: Workspace!): String! {
   # LLM.tools renders one "## <name>" heading per tool.
   let tools = staff.agent(llm.withWorkspace(source)).tools
@@ -209,24 +344,25 @@ let testStaffTools(source: Workspace!): String! {
     assert { tools.contains("## " + name + "\n") }
   }
   # Git operations live in git tools, by address; the roster is reached by
-  # address too; bookkeeping stays out.
-  ["logOf", "diffOf", "pull", "pullConflicted", "pullPending", "pullTools", "peers", "members", "memberAgent", "memberOf"].each { name =>
+  # address too; bookkeeping and the worker role stay out.
+  ["logOf", "diffOf", "pull", "pullConflicted", "pullPending", "pullTools", "peers", "members", "memberAgent", "memberOf", "worker", "workerExpertise", "workerPrompt", "askChief"].each { name =>
     assert { !tools.contains("## " + name + "\n") }
   }
   assert { !tools.contains("withWorker") }
-  assert { !tools.contains("withCompositionSource") and !tools.contains("workerBase") }
   assert { !tools.contains("checkComposition") }
   assert { !tools.contains("checkFiltering") and !tools.contains("checkTools") }
   "Staff tool visibility checks passed."
 }
 
-let testStaffComposition: String! {
+let testStaffComposition(source: Workspace!): String! {
+  # The chief gains a module after staff was composed, from another
+  # workspace: the probe stands in for an Editor install. The worker inherits
+  # it from the chief's record, still from that origin, while working in the
+  # chief's current workspace.
   let origin = directory
     .withNewFile("dagger.toml", """
-      [env.dev.modules.probe]
+      [modules.probe]
       source = "probe"
-      [modules.staff]
-      source = "staff"
       """)
     .withNewFile("probe/dagger-module.toml", """
       name = "probe"
@@ -237,63 +373,34 @@ let testStaffComposition: String! {
     .withNewFile("probe/main.dang", """
       type Probe {
         agent(base: LLM!): LLM! @agent {
-          base.withTools(currentNode)
-            .withModel("origin-model")
-            .withSystemPrompt(`origin capabilities for ${base.workspace.file("marker").contents}`)
+          base.withTools(currentNode).withSystemPrompt("origin capabilities")
         }
         originRead(source: Workspace!): String! {
           source.file("marker").contents
         }
-        originWrite(source: Workspace!): Changeset! {
-          source.directory("/").withNewFile("written", "worker")
-            .changes(from: source.directory("/"))
-        }
       }
       """)
-    .withNewFile("staff/dagger-module.toml", """
-      name = "staff"
-      engineVersion = "v1.0.0-0"
-      [runtime]
-      source = "dang"
-      """)
-    .withNewFile("staff/main.dang", """
-      type Staff {
-        agent(base: LLM!): LLM! @agent {
-          raise "staff orchestration must be excluded"
-        }
-      }
-      """)
-    .withNewFile("marker", "origin")
-    .asWorkspace.withConfigEnvironment("dev")
-  let target = directory.withNewFile("marker", "checkout with pending edits").asWorkspace
-  let fixture = staff.withCompositionSource(origin)
-  let worker = fixture.workerBase(target).sync
-  assert { worker.tools.contains("originRead") and worker.tools.contains("originWrite") }
-  assert { worker.workspace.file("marker").contents == "checkout with pending edits" }
-  assert { worker.model == "origin-model" }
-  assert { worker.messages.{{role}}.all { m => m.role == LLMMessageRole.SYSTEM } }
-  assert { worker.messages.{{content.{{text}}}}.any { m =>
-    m.content.any { c => (c.text ?? "").contains("origin capabilities for checkout with pending edits") }
-  } }
-  assert { fixture.workerBase(target, model: "fixture-model").model == "fixture-model" }
-
-  # Roster mutations must preserve the saved origin; no turn is started.
-  let handle = worker.spawn(name: "composition-fixture")
-  let roster = fixture.withWorker("fixture", handle)
-  assert { roster.workerBase(target).tools.contains("originRead") }
-  handle.stop
-
-  # A destination with agent code is not implicitly trusted or composed.
-  let hostile = origin.withNewFile("probe/main.dang", """
-    type Probe {
-      agent(base: LLM!): LLM! @agent {
-        raise "destination agents must not execute"
-      }
-    }
-    """)
-  assert { fixture.workerBase(hostile).tools.contains("originRead") }
-  assert { origin.file("marker").contents == "origin" }
-  # Preserve direct API use when no chief composition has captured an origin.
-  assert { staff.workerBase(origin).tools.contains("originRead") }
-  "Staff checkout composition checks passed."
+    .asWorkspace
+  let chief = llm.withWorkspace(source).spawn(name: "composition-chief", expertise: expertiseAt(source, "dag://staff/agent"))
+  chief.reseed(conversation: chief.snapshot.sync.compose(expertise: expertiseAt(origin, "dag://probe/agent")))
+  let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ moduleName }} }}
+  let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+  let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
+  {
+    let modules = picked.map { e => e.artifact.moduleName }
+    assert(message: modules.join(", ")) { modules == ["probe", "staff"] }
+    let conversation = worker.snapshot.sync
+    assert { conversation.tools.contains("originRead") and conversation.tools.contains("askChief") }
+    assert { systemTexts(conversation).any { t => t == "origin capabilities" } }
+    # The worker works in the chief's current workspace, not the origin.
+    assert { conversation.workspace.file("staff/main.dang").contents == source.file("staff/main.dang").contents }
+    null
+  } rescue { e: Error => {
+    worker.stop
+    chief.stop
+    raise e.message
+  }}
+  worker.stop
+  chief.stop
+  "Staff composition inheritance checks passed."
 }
