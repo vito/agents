@@ -17,20 +17,31 @@
 # (monitor) and salvagePending (recover), reading the agent's Workspace
 # through its last committed conversation step.
 #
-# Workers bind `Peers` instead of Staff: the same `members` tree and escape
-# hatches, but no orchestration. Its roster is LIVE — derived on each read
+# Workers are composed, not hand-assembled. A worker inherits the chief's
+# actual composition — the expertise entries recorded on its conversation
+# (LLM.expertise), including anything installed after staff was composed —
+# minus staff's own entries, plus the worker ROLE: `worker(base, me)`, a plain
+# conversation transform reached by address as `dag://staff/worker`. It is not
+# @agent, so default composition never picks it up, and the engine records it
+# like any other entry, so reloading a worker refreshes its role instead of
+# turning it into a chief. spawn composes these entries after the worker's
+# identity exists, so `me` is the worker itself, on reload as well.
+#
+# The role binds `Peers` instead of Staff: the same `members` tree and escape
+# hatches, but no orchestration, plus a private line home (askChief) that
+# delivers the question and returns immediately; the chief answers mid-turn
+# with sendTo(replyTo:), and the engine refuses any wait that would deadlock.
+# Peers holds nothing but `me` and derives the rest at call time: the chief
+# is `me.parent`, the worker's staff name `me.name`, and the roster is read
 # from the chief's last committed step, whose bound Staff holds the current
-# roster — so a worker sees peers hired after it. Plus a private line home
-# (askChief) that delivers the question and returns immediately; the chief
-# answers mid-turn with sendTo(replyTo:), and the engine refuses any wait
-# that would deadlock.
+# roster — so a worker sees peers hired after it.
 #
 # State: `agents` holds live Agent handles in module state, evolved by tools
 # returning Staff! (the modules/editor pattern — engine-object handles in
-# Dang state serialize as IDs and just work). The worker's tool objects are
-# minted via real self-calls (Dagger.staff.peers, Dagger.staff.chiefLine):
-# the result of a module call has engine identity, which withTools needs — a
-# locally constructed Dang object does not.
+# Dang state serialize as IDs and just work). The worker's Peers is minted via
+# a real self-call (Dagger.staff.peers): the result of a module call has
+# engine identity, which withTools needs — a locally constructed Dang object
+# does not.
 #
 # Registered in dagger.toml; can also be loaded directly with `dagger -m ./staff`.
 """
@@ -41,18 +52,14 @@ type Staff {
   # Live worker handles; unique by name, by construction.
   let agents: Map[Agent!]! = [:]
 
-  # Tool configuration belongs to the originating workspace, not necessarily
-  # the worktree the chief now edits (checkout preserves tools across switches).
-  # Keep the source, not the partially composed base LLM or live tool state.
-  let compositionSource: Workspace = null
-
   # Public for self-calls or the artifact tree, not chief tools: roster
-  # bookkeeping and worker plumbing, and the `members` collection, which is
-  # reached by address rather than as a tool. Prompt constants are excluded
-  # too. Workers bind only the dedicated Peers object, never this full Staff.
+  # bookkeeping and worker plumbing, the worker role, and the `members`
+  # collection, which is reached by address rather than as a tool. Prompt
+  # constants are excluded too. Workers bind only the dedicated Peers object,
+  # never this full Staff.
   let plumbing = [
-    "withWorker", "chiefLine", "peers", "memberAgent", "members",
-    "withCompositionSource", "workerBase", "workerPrompt", "workerPromptFor"
+    "withWorker", "peers", "memberAgent", "members",
+    "worker", "workerExpertise", "workerPrompt"
   ]
 
   """
@@ -61,45 +68,53 @@ type Staff {
   # Bump version when stored fields are removed or change meaning, so older
   # saved tool state is discarded instead of failing to load.
   agent(base: LLM!): LLM! @agent {
-    let tools = currentNode.{{... on Dagger.Staff!}}
-      .withCompositionSource(base.workspace)
     base
-      .withTools(tools, except: plumbing, version: 1)
+      .withTools(currentNode.{{... on Dagger.Staff!}}, except: plumbing, version: 2)
       .withSystemPrompt(chiefPrompt)
   }
 
   """
-  Retain the workspace supplying worker capabilities, independently of the
-  workspace later passed to spawn. Internal composition plumbing only.
+  The worker role: compose a staff worker's tools and instructions onto a
+  conversation. `me` is the worker itself — the agent that owns the
+  conversation, never the chief that spawned it.
+
+  Not @agent, so default composition never selects it; spawn composes it by
+  address as `dag://staff/worker`, and the engine records it on the worker's
+  conversation, so reloading refreshes the role in place.
   """
-  withCompositionSource(source: Workspace!): Staff! {
-    self.compositionSource = source
-    self
+  worker(base: LLM!, me: Agent!): LLM! {
+    base
+      # Peers holds only `me` and derives the chief, the roster and its own
+      # name from it on every call. It exposes only the roster, the escape
+      # hatches and askChief, so future Staff orchestration methods cannot
+      # leak into workers by accident. Its `members` tree is reached by
+      # address, so it is not a tool.
+      .withTools(Dagger.staff.peers(me: me), except: ["members"], version: 1)
+      .withSystemPrompt(workerPrompt + "\n\n" + `Your staff name is "${me.name}": the chief and your peers address you by it, and message attribution headers use it.`)
   }
 
   """
-  Build a fresh worker base without starting a turn. Internal spawn plumbing.
+  The expertise spawn composes into a new worker: the chief's recorded
+  composition minus staff's own entries (its chief `agent`, or a role it holds
+  as a worker itself), followed by the worker role from `source`. Internal
+  spawn plumbing; public so the selection can be checked without a model.
   """
-  workerBase(source: Workspace!, model: String = null): LLM! {
-    # Direct API callers that never ran agent retain the old source-based
-    # behavior. A composed Staff always uses its recorded origin instead.
-    let origin = compositionSource ?? source
-    # Workers work; they don't orchestrate. Do not discover or run agent code
-    # from a checkout merely because the chief now operates on that worktree.
-    # Expertise lists come back as lazy GraphQL lists; reload each by ID to
-    # pass them as a concrete [Expertise!]! argument.
-    let expertise = origin.artifacts
-      .filterTypes(types: ["Expertise"])
-      .withoutUri(uri: "dag://staff/**")
+  workerExpertise(chief: Agent!, source: Workspace!): [Expertise!]! {
+    # `sync` pins one snapshot, as workerWorkspace does. Expertise lists come
+    # back as lazy GraphQL lists; reload each by ID to pass them on as a
+    # concrete [Expertise!]! argument. Each entry keeps the workspace it was
+    # composed from, so inherited tools still come from where the chief got
+    # them, not from whatever worktree it operates on now.
+    let inherited = chief.snapshot.sync.expertise.{{ id, artifact.{{ moduleName }} }}
+      .filter { e => e.artifact.moduleName != "staff" }
+      .map { e => node(id: e.id).{{ ... on Expertise! }} }
+    let role = source.artifacts
+      .filterUri(uri: "dag://staff/worker")
       .asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
-    let base = llm.withWorkspace(source)
-      .compose(expertise: expertise)
-      .withWorkspace(source)
-    if (model == null) {
-      base
-    } else {
-      base.withModel(model ?? "")
+    if (role.isEmpty) {
+      raise "no worker role at dag://staff/worker in this workspace: install the staff module here to hire workers"
     }
+    inherited + role
   }
 
   """
@@ -111,11 +126,11 @@ type Staff {
   reply) or fails (with the error), the news arrives as an event message.
   Keep working; check on it with status/read, steer it with sendTo, and take
   its commits from `dag://staff/members/head?staff-member=<name>` with your git
-  tools. The worker gets fresh tools from the workspace where staff was
-  composed, bound to your current worktree, the staff roster (`chief` and
-  its peers, by address), and askChief, its line back to you. It cannot
-  spawn or steer workers. Tools layered onto the chief later are not
-  automatically inherited.
+  tools. The worker inherits your composition as it stands now — the tools
+  you were composed with, including any installed since — bound to your
+  current worktree, plus the staff roster (`chief` and its peers, by
+  address) and askChief, its line back to you. It cannot spawn or steer
+  workers.
 
   The worker's roster is live: it lists the chief under the reserved name
   `chief` and every worker in your roster as of your last completed step, so
@@ -142,8 +157,8 @@ type Staff {
     task: String!,
     """
     Model for the worker's conversation — e.g. a cheaper model for rote
-    work, or a stronger one for a hard problem. Defaults to the originating
-    workspace composition's own choice.
+    work, or a stronger one for a hard problem. Defaults to the session's
+    default model, unless an inherited entry picks one.
     """
     model: String = null,
   ): Dagger.Staff! @cache(policy: FunctionCachePolicy.Never) {
@@ -155,29 +170,26 @@ type Staff {
     if (agents.has(name)) {
       raise `staff member "${name}" already exists — pick another name`
     }
-    let base = workerBase(source, model)
-    let worker = base
-      # Peers holds the chief's handle and derives the roster from it on
-      # every read, so workers hired after this one show up too. It exposes
-      # only the roster and the escape hatches, so future Staff orchestration
-      # methods cannot leak into workers by accident. Its `members` tree is
-      # reached by address, so it is not a tool.
-      .withTools(Dagger.staff.peers(chief: chief, name: name), except: ["members"])
-      # The line home, minted via a real self-call; the boss handle itself
-      # stays out of the tool schema.
-      .withTools(Dagger.staff.chiefLine(boss: chief), except: ["boss"])
-      .withSystemPrompt(workerPromptFor(name))
-      # spawn mints a unique agent instance per call.
-      .spawn(name: name)
+    let base = llm.withWorkspace(source)
+    let seeded = if (model == null) {
+      base
+    } else {
+      base.withModel(model ?? "")
+    }
+    # spawn mints a unique agent instance per call — named, with this chief
+    # as its parent — and only then composes the entries, so the role's `me`
+    # is the worker. The engine records them on the worker's conversation;
+    # that record is what a reload refreshes.
+    let hired = seeded.spawn(name: name, expertise: workerExpertise(chief, source))
     # Fire-and-forget: signal-with-start opens the worker's first turn.
-    worker.send(task)
+    hired.send(task)
     # Subscribe the chief to the worker's lifecycle (defaults: IDLE and
     # FAILED): completions and failures arrive as event messages — steering
     # the chief's open turn or waking it — so nothing needs polling or
     # blocking waits. An already-settled worker fires immediately,
     # so even an instant finish is not missed.
-    worker.notify(subscriber: chief)
-    currentNode.{{... on Dagger.Staff!}}.withWorker(name, worker)
+    hired.notify(subscriber: chief)
+    currentNode.{{... on Dagger.Staff!}}.withWorker(name, hired)
   }
 
   """
@@ -360,15 +372,15 @@ type Staff {
   }
 
   """
-  Mint the tool object a worker receives: the roster and the escape hatches,
-  no orchestration. Takes the chief's handle, from which the roster is read
-  live; `name` is the worker's own staff name, left out of its roster.
+  Mint the tool object the worker role binds: the roster, the escape hatches
+  and the line home, no orchestration. `me` is the worker itself; the chief
+  and the roster are derived from it live.
 
   The required argument is load-bearing: it keeps this off the artifact
   tree, so `dag://staff/members` has exactly one meaning.
   """
-  peers(chief: Agent!, name: String! = ""): Peers! {
-    Peers(chief, name)
+  peers(me: Agent!): Peers! {
+    Peers(me)
   }
 
   """
@@ -390,15 +402,6 @@ type Staff {
   """
   memberAgent(name: String!): Agent! {
     member(name)
-  }
-
-  """
-  Mint a worker's line back to its chief. Used by spawn via a self-call (a
-  module-call result has the engine identity withTools needs); not part of
-  the chief's or the workers' toolset.
-  """
-  chiefLine(boss: Agent!): ChiefLine! {
-    ChiefLine(boss)
   }
 
   # Address a member by name, with a helpful miss.
@@ -441,10 +444,11 @@ type Staff {
     block waiting for a worker.
 
     - `spawn` hires a named worker with its own read-write copy of your
-      workspace and starts it on a task. Names are unique; every other tool
-      addresses workers by name. Spawning subscribes you to the worker's
-      lifecycle: when it finishes a turn or fails, the news arrives as an
-      "[event from agent ...]" message carrying its final reply or error.
+      workspace and your tools, minus staff orchestration, and starts it on
+      a task. Names are unique; every other tool addresses workers by name.
+      Spawning subscribes you to the worker's lifecycle: when it finishes a
+      turn or fails, the news arrives as an "[event from agent ...]" message
+      carrying its final reply or error.
     - `sendTo` steers a worker without blocking (returning the delivery
       evidence). With `replyTo`, it answers a question: quote the ref from
       the question's attribution header (e.g. "#3").
@@ -510,14 +514,16 @@ type Staff {
   """
 
   # Instructions for each WORKER. Public so tests (and the curious) can read
-  # the exact text spawn composes into every worker — recordings that replay
-  # a worker's conversation must match it byte for byte. spawn composes
-  # workerPromptFor(name), which appends the worker's own staff name.
+  # the exact text the worker role composes — recordings that replay a
+  # worker's conversation must match it byte for byte. The role appends a
+  # closing line carrying the worker's own staff name (`me.name`), so it can
+  # refer to itself the way the chief and its peers address it.
   workerPrompt: String! = """
     You are a worker agent on a staff, reporting to a chief agent. Work your
-    task autonomously to completion with the available tools. The chief
-    reads results from your conversation and collects your final reply, so
-    end each task with a concise, self-contained report.
+    task autonomously to completion with the available tools — the chief's
+    own, minus its staff orchestration. The chief reads results from your
+    conversation and collects your final reply, so end each task with a
+    concise, self-contained report.
 
     THE WORKSPACE IS YOURS. It is a private read-write copy — not the
     chief's, not shared with any other worker. Edit, create, delete, run
@@ -545,7 +551,8 @@ type Staff {
     roster is live as of the chief's last completed step, so peers hired
     after you show up too. Uncommitted work has no git ref: `pendingOf`
     (monitor) and `salvagePending` (recover) are escape hatches for a
-    member's uncommitted edits. You cannot spawn, steer, or interrupt agents.
+    member's uncommitted edits. Your staff tools cannot spawn, steer, or
+    interrupt agents.
 
     You have one line home: `askChief` delivers a question to the chief and
     returns immediately with the question's ref. The answer arrives later as
@@ -553,19 +560,6 @@ type Staff {
     end your turn to wait for it; its arrival wakes you. Use it sparingly,
     and prefer working with what you have.
   """
-
-  """
-  The exact system prompt spawn composes into a worker with the given staff
-  name: workerPrompt plus a closing line carrying the name, so a worker can
-  refer to itself the way the chief and its peers address it (attribution
-  headers and the roster use this name). Public for the same reason as
-  workerPrompt: recordings that replay a worker's conversation must match
-  this text byte for byte, so the interpolation is part of the constant's
-  contract rather than a private spawn detail.
-  """
-  workerPromptFor(name: String!): String! {
-    workerPrompt + "\n\n" + `Your staff name is "${name}": the chief and your peers address you by it, and message attribution headers use it.`
-  }
 }
 
 """
@@ -667,24 +661,33 @@ type Member {
 }
 
 """
-A worker's view of the staff: the roster and the escape hatches for
-uncommitted work.
+A worker's view of the staff: the roster, the escape hatches for
+uncommitted work, and the line home to the chief.
 
 Workers receive this narrow tool object instead of Staff itself, so they can
 inspect and take any member's work without gaining orchestration
 capabilities such as spawn, steering, or interruption.
 """
 type Peers {
-  # The chief's live handle. Private so the Agent API never enters the tool
-  # schema; the roster is derived from it on every read.
-  let chief: Agent!
-  # This worker's own staff name, left out of its roster.
-  let name: String!
+  # The worker itself, as the worker role received it. Its only state:
+  # the chief (`me.parent`) and the worker's staff name (`me.name`) are
+  # derived from it on every call. Private so the Agent API never enters the
+  # tool schema, and state rather than an argument so `members` stays
+  # reachable by address.
+  let me: Agent!
 
-  new(chief: Agent!, name: String!) {
-    self.chief = chief
-    self.name = name
+  new(me: Agent!) {
+    self.me = me
     self
+  }
+
+  # The chief that spawned this worker, looked up live.
+  let chief: Agent! {
+    let parent = me.parent
+    if (parent == null) {
+      raise `"${me.name}" has no chief: staff worker tools need the agent that spawned it`
+    }
+    parent
   }
 
   """
@@ -702,14 +705,40 @@ type Peers {
     # `members` collection at its current value. `sync` pins one snapshot.
     # A chief without staff tools (e.g. a hand-built fixture) has no roster
     # beyond itself; `chief` stays reachable either way.
-    let roster: Dagger.StaffMembers = chief.snapshot.sync
+    let boss = chief
+    let roster: Dagger.StaffMembers = boss.snapshot.sync
       .artifacts(include: ["staff/members"])
       .filterUri(uri: "dag+staff-members://staff/members")
       .one.value.{{... on Dagger.StaffMembers!}} rescue {
         e: Error => null
       }
     let workers = if (roster == null) { [] } else { roster.keys }
-    PeerMembers(chief, roster, ["chief"] + workers.filter { n => n != name })
+    let own = me.name
+    PeerMembers(boss, roster, ["chief"] + workers.filter { n => n != own })
+  }
+
+  """
+  Ask your chief a question. Non-blocking: the question is delivered and
+  this returns immediately — the answer arrives later as a message headed
+  "[reply from agent ...]".
+
+  Keep working if you can; if you truly cannot proceed without the answer,
+  end your turn — the reply's arrival wakes you. Your question lands on the
+  chief's record attributed to you, and the chief answers it mid-turn
+  whenever it has an answer, not necessarily right away.
+  """
+  askChief(
+    """
+    The question to put on the chief's record.
+    """
+    question: String!,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): a worker re-asking the same question must reach the
+    # chief again, not replay the first delivery from cache.
+    let msg = chief.send(question)
+    `question ${msg.ref} delivered to the chief. The answer will arrive as `
+      + `a "[reply from agent ...]" message — keep working, or end your turn `
+      + `to wait for it.`
   }
 
   """
@@ -802,39 +831,6 @@ type PeerMembers @collection {
     # item type names the collection's dimension, which must stay
     # `staff-member`.
     Member(name, via: live.get(key: name))
-  }
-}
-
-"""
-A worker's private line back to the chief that spawned it.
-"""
-type ChiefLine {
-  # The chief's live handle; bound with except: ["boss"] so it never shows
-  # up as a tool.
-  boss: Agent!
-
-  """
-  Ask your chief a question. Non-blocking: the question is delivered and
-  this returns immediately — the answer arrives later as a message headed
-  "[reply from agent ...]".
-
-  Keep working if you can; if you truly cannot proceed without the answer,
-  end your turn — the reply's arrival wakes you. Your question lands on the
-  chief's record attributed to you, and the chief answers it mid-turn
-  whenever it has an answer, not necessarily right away.
-  """
-  askChief(
-    """
-    The question to put on the chief's record.
-    """
-    question: String!,
-  ): String! @cache(policy: FunctionCachePolicy.Never) {
-    # @cache(Never): a worker re-asking the same question must reach the
-    # chief again, not replay the first delivery from cache.
-    let msg = boss.send(question)
-    `question ${msg.ref} delivered to the chief. The answer will arrive as `
-      + `a "[reply from agent ...]" message — keep working, or end your turn `
-      + `to wait for it.`
   }
 }
 
