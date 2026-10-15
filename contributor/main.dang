@@ -835,9 +835,14 @@ type Contributor {
       print(`Checked out ${where}. Your tools now operate on this checkout; ` + "it contributes no additional agents.")
       return switched
     }
-    let layered = switched.compose(expertise: expertise)
-    # compose is lazy: force the composition HERE, so a failing target module
-    # lands in this rescue instead of poisoning the continuation.
+    # Recompose BEFORE switching: recompose refreshes every recorded entry
+    # from the bound workspace, so doing it after withWorkspace(target)
+    # would swap the agent's own modules for same-named (untrusted) code in
+    # the target. The extras keep their own source workspace, so they still
+    # run the target's code, and they are recorded like any other entry.
+    let layered = llm.recompose(expertise: expertise).withWorkspace(target)
+    # recompose is lazy: force the composition HERE, so a failing target
+    # module lands in this rescue instead of poisoning the continuation.
     layered.model rescue {
       e: Error => return unlayered(switched, where, plainError(e.message))
     }
