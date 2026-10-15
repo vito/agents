@@ -2,16 +2,17 @@
 
 Run from the agents repository: dagger-dev run python3 staff/tests/integration.py
 Requires an engine with the Agent API, frozen Workspace Git APIs, and the
-expertise record from dagger/dagger#14637 (LLM.expertise, Agent.parent,
-LLM.spawn(expertise:)).
+expertise record from dagger/dagger#14637 (LLM.expertise, LLM.compose,
+LLM.recompose, Agent.parent, LLM.spawn(expertise:)).
 
 Committed work is harvested with git tools by address
 (dag://staff/members/head?staff-member=<name>); agents-dev's committer checks cover
 that. This script covers the uncommitted half: pendingOf and salvagePending.
 It also covers the worker role: a worker spawned from a chief's recorded
 composition has the worker tools and none of the chief's, knows its name and
-its chief, stays a worker through Agent.recompose (what reload does), and
-gains the chief tools only through Agent.compose with dag://staff/agent.
+its chief, stays a worker through LLM.recompose on its snapshot (what reload
+does), and gains the chief tools only through LLM.compose with
+dag://staff/agent.
 """
 
 import base64
@@ -136,21 +137,28 @@ def describe(conversation):
     }
 
 
-def agent_compose(agent, field, conversation, entries=None):
-    """Run Agent.recompose or Agent.compose on `conversation`, owned by `agent`.
+def on_snapshot(agent, field, entries=None):
+    """Run LLM.recompose or LLM.compose on `agent`'s snapshot.
 
     recompose refreshes every recorded entry in the bound workspace: what
-    Editor's reload does. compose runs and records the given entries.
+    Editor's reload does. compose runs and records the given entries. Either
+    way the entries' `me` is the conversation's owning agent, and the agent
+    itself is unchanged until the result is reseeded.
     """
-    args = 'conversation: $llm' + (', expertise: $entries' if entries is not None else '')
-    variables = {"agent": agent, "llm": conversation["id"]}
-    params = '$agent: ID!, $llm: ID!'
+    args = '(expertise: $entries)' if entries is not None else ''
+    params = '$agent: ID!'
+    variables = {"agent": agent}
     if entries is not None:
         variables["entries"] = list(entries)
         params += ', $entries: [ID!]!'
-    llm = query('query(' + params + ') { node(id: $agent) { ... on Agent { '
-                + field + '(' + args + ') { ' + CONVERSATION + ' } } } }', **variables)["node"][field]
+    llm = query('query(' + params + ') { node(id: $agent) { ... on Agent { snapshot { '
+                + field + args + ' { ' + CONVERSATION + ' } } } } }', **variables)["node"]["snapshot"][field]
     return describe(llm)
+
+
+def reseed(agent, conversation):
+    query('query($agent: ID!, $llm: ID!) { node(id: $agent) { ... on Agent { reseed(conversation: $llm) } } }',
+          agent=agent, llm=conversation["id"])
 
 
 def assert_worker(conversation, name):
@@ -208,15 +216,25 @@ def worker_role(module):
         assert keys == ["chief"], keys
 
         # Reload keeps it a worker: same record, one worker prompt, no chief tools.
-        reloaded = agent_compose(worker, "recompose", seed)
+        reloaded = on_snapshot(worker, "recompose")
         assert reloaded["uris"] == seed["uris"], reloaded["uris"]
         assert_worker(reloaded, "role-worker")
 
-        # Becoming a chief is explicit, and survives another reload.
-        promoted = agent_compose(worker, "compose", reloaded, expertise_at(ws, "dag://staff/agent"))
+        # Composing nothing is a no-op.
+        assert on_snapshot(worker, "compose", [])["uris"] == seed["uris"]
+
+        # Becoming a chief is explicit, and survives another reload once the
+        # worker itself is reseeded with it.
+        promoted = on_snapshot(worker, "compose", expertise_at(ws, "dag://staff/agent"))
         assert len(promoted["uris"]) == 3, promoted["uris"]
-        again = agent_compose(worker, "recompose", promoted)
-        for conversation in (promoted, again):
+        reseed(worker, promoted)
+        again = on_snapshot(worker, "recompose")
+        assert again["uris"] == promoted["uris"], again["uris"]
+        # An entry already recorded under the same address is refreshed in
+        # place, not recorded twice.
+        twice = on_snapshot(worker, "compose", expertise_at(ws, "dag://staff/agent"))
+        assert twice["uris"] == promoted["uris"], twice["uris"]
+        for conversation in (promoted, again, twice):
             for tool in CHIEF_TOOLS + ("askChief",):
                 assert tool in conversation["tools"], (tool, conversation["tools"])
             assert any(CHIEF_PROMPT in p for p in conversation["prompts"]), conversation["prompts"]

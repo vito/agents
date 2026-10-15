@@ -115,6 +115,12 @@ type AgentsDev {
     null
   }
 
+  """Check a worker's checkout of a repository installing staff keeps it a worker, takes the target's versions of recorded modules, and composes the target's new agents."""
+  staffCheckout(source: Workspace!): Void @check {
+    print(testStaffCheckout(source: source))
+    null
+  }
+
   """Check sandbox sessions: exec, change extraction, continued and fresh sessions."""
   sandboxSessions(source: Workspace!): Void @check {
     print(testSandboxSessions(source: source))

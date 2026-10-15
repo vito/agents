@@ -288,10 +288,11 @@ let testStaffWorker(source: Workspace!): String! {
     let scope = conversation.artifacts(include: ["staff/members"])
     assert { scope.dimensionKeys(dimension: "staff-member") == ["chief"] }
 
-    # Reload is the owning agent's recompose: every recorded entry is
-    # refreshed in the conversation's bound workspace. The worker stays a
-    # worker: the same record, one worker prompt, no chief tools.
-    let reloaded = worker.recompose(conversation: conversation)
+    # Reload is a bare recompose of the agent's own conversation: every
+    # recorded entry is refreshed in its bound workspace, and `me` is the
+    # owning agent. The worker stays a worker: the same record, one worker
+    # prompt, no chief tools.
+    let reloaded = worker.snapshot.recompose
     assert { recordedUris(reloaded) == uris }
     let reloadedTools = reloaded.tools
     assert { reloadedTools.contains("askChief") and reloadedTools.contains("cherryPick") }
@@ -300,15 +301,25 @@ let testStaffWorker(source: Workspace!): String! {
     assert { reloadedPrompts.filter { t => t.contains(workerLine) }.length == 1 }
     assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
 
-    # Becoming a chief is explicit, and survives another reload.
-    let promoted = worker.compose(conversation: reloaded, expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
+    # Becoming a chief is explicit, and survives another reload. Reseeding
+    # applies the promotion to the worker itself, as a reload tool's
+    # committed step would.
+    let promoted = worker.snapshot.compose(expertise: expertiseAt(source, "dag://staff/agent")).sync
     assert { recordedUris(promoted).length == 3 }
     let promotedTools = promoted.tools
     assert { promotedTools.contains("interruptWorker") and promotedTools.contains("sendTo") }
     assert { promotedTools.contains("askChief") }
-    let again = worker.recompose(conversation: promoted)
+    worker.reseed(conversation: promoted)
+    let again = worker.snapshot.recompose
+    assert { recordedUris(again).length == 3 }
     assert { again.tools.contains("interruptWorker") and again.tools.contains("askChief") }
     assert { systemTexts(again).filter { t => t.contains(workerLine) }.length == 1 }
+
+    # Composing an entry that is already recorded refreshes it in place
+    # rather than recording it twice, and composing nothing changes nothing.
+    let twice = worker.snapshot.compose(expertise: expertiseAt(source, "dag://staff/agent"))
+    assert { recordedUris(twice) == recordedUris(again) }
+    assert { recordedUris(worker.snapshot.compose(expertise: [])) == recordedUris(again) }
     null
   } rescue { e: Error => {
     worker.stop
@@ -365,7 +376,7 @@ let testStaffComposition(source: Workspace!): String! {
       """)
     .asWorkspace
   let chief = llm.withWorkspace(source).spawn(name: "composition-chief", expertise: expertiseAt(source, "dag://staff/agent"))
-  chief.reseed(conversation: chief.compose(conversation: chief.snapshot.sync, expertise: expertiseAt(origin, "dag://probe/agent")))
+  chief.reseed(conversation: chief.snapshot.sync.compose(expertise: expertiseAt(origin, "dag://probe/agent")))
   let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ moduleName }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
@@ -378,7 +389,7 @@ let testStaffComposition(source: Workspace!): String! {
     # The worker works in the chief's current workspace, not the origin.
     assert { conversation.workspace.file("staff/main.dang").contents == source.file("staff/main.dang").contents }
     # That workspace has no probe, so reload keeps the recorded entry.
-    let reloaded = worker.recompose(conversation: conversation)
+    let reloaded = worker.snapshot.recompose
     assert { recordedUris(reloaded) == recordedUris(conversation) }
     assert { reloaded.tools.contains("originRead") and reloaded.tools.contains("askChief") }
     null
@@ -390,4 +401,113 @@ let testStaffComposition(source: Workspace!): String! {
   worker.stop
   chief.stop
   "Staff composition inheritance checks passed."
+}
+
+# A Dang module directory: `typeName`'s @agent binds it with `prompt`, and
+# its one tool `tool` reads the workspace's marker file.
+let agentModule(name: String!, typeName: String!, prompt: String!, tool: String!): Directory! {
+  directory
+    .withNewFile("dagger-module.toml", [
+      `name = "${name}"`,
+      `engineVersion = "v1.0.0-0"`,
+      "[runtime]",
+      `source = "dang"`,
+      "",
+    ].join("\n"))
+    .withNewFile("main.dang", [
+      `type ${typeName} {`,
+      "  agent(base: LLM!): LLM! @agent {",
+      `    base.withTools(currentNode).withSystemPrompt("${prompt}")`,
+      "  }",
+      `  ${tool}(source: Workspace!): String! {`,
+      `    source.file("marker").contents`,
+      "  }",
+      "}",
+      "",
+    ].join("\n"))
+}
+
+let testStaffCheckout(source: Workspace!): String! {
+  let workerLine = `Your staff name is "checkout-worker"`
+  # The worker's probe entry is recorded from an origin workspace.
+  let origin = directory
+    .withNewFile("dagger.toml", "[modules.probe]\nsource = \"probe\"\n")
+    .withDirectory("probe", agentModule("probe", "Probe", "origin capabilities", "originRead"))
+    .asWorkspace
+  # The checkout target installs staff (this repository's), its own version
+  # of probe, and a module the worker has never had.
+  let tree = directory
+    .withNewFile("dagger.toml", [
+      "[modules.staff]", `source = "staff"`, "",
+      "[modules.probe]", `source = "probe"`, "",
+      "[modules.extra]", `source = "extra"`, "",
+    ].join("\n"))
+    .withNewFile("marker", "target\n")
+    .withDirectory("staff", source.directory("/staff"))
+    .withDirectory("probe", agentModule("probe", "Probe", "target capabilities", "targetRead"))
+    .withDirectory("extra", agentModule("extra", "Extra", "extra capabilities", "extraRead"))
+  let fixtureContainer = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git", "git-daemon"])
+    .withDirectory("/repo", tree)
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", """
+      git init -b main
+      git config user.name 'Checkout Test'
+      git config user.email checkout@example.com
+      export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+      export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+      git add .
+      git commit -m target
+    """])
+  let server = contributorCheckoutServer(fixtureContainer)
+  let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
+
+  let chief = llm.withWorkspace(source).spawn(name: "checkout-chief", expertise: expertiseAt(source, "dag://staff/agent"))
+  let worker = spawnUnder(chief, llm.withWorkspace(source), "checkout-worker",
+    expertiseAt(origin, "dag://probe/agent") + expertiseAt(source, "dag://staff/worker"));
+  {
+    let before = worker.snapshot.sync
+    assert { before.tools.contains("originRead") and before.tools.contains("askChief") }
+    # Pin the continuation: checkout is uncached.
+    let switched = contributor.checkout(
+      llm: before,
+      source: before.workspace,
+      repo: contributorCheckoutRef(repo, ""),
+    ).sync
+    assert { switched.workspace.file("marker").contents == "target\n" }
+
+    # The record keeps its entries and gains only the new module's default:
+    # staff is already recorded (as the worker role), so the target's
+    # `staff/agent` is not composed and the worker stays a worker.
+    let uris = recordedUris(switched)
+    assert(message: uris.join(", ")) { uris.length == 3 }
+    assert(message: uris.join(", ")) { (uris[0] ?? "").contains("probe/agent") and (uris[1] ?? "").contains("staff/worker") and (uris[2] ?? "").contains("extra/agent") }
+    assert(message: uris.join(", ")) { !uris.any { u => u.contains("staff/agent") } }
+    let tools = switched.tools
+    assert { tools.contains("askChief") and tools.contains("pendingOf") }
+    assert { !tools.contains("interruptWorker") and !tools.contains("sendTo") }
+    let prompts = systemTexts(switched)
+    assert { prompts.filter { t => t.contains(workerLine) }.length == 1 }
+    assert { !prompts.any { t => t.contains("You can hire and direct a staff") } }
+    # `me` is still the worker: its chief resolves.
+    assert { switched.artifacts(include: ["staff/members"]).dimensionKeys(dimension: "staff-member") == ["chief"] }
+
+    # The recorded probe entry now comes from the target, which provides the
+    # same module; the new module's agent is composed on top.
+    assert { tools.contains("targetRead") and !tools.contains("originRead") }
+    assert { prompts.any { t => t == "target capabilities" } }
+    assert { !prompts.any { t => t == "origin capabilities" } }
+    assert { tools.contains("extraRead") and prompts.any { t => t == "extra capabilities" } }
+    null
+  } rescue { e: Error => {
+    worker.stop
+    chief.stop
+    server.stop
+    raise e.message
+  }}
+  worker.stop
+  chief.stop
+  server.stop
+  "Staff checkout adoption checks passed."
 }
