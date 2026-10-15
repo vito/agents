@@ -23,8 +23,11 @@
 # conversation transform reached by address as `dag://staff/worker`. It is not
 # @agent, so default composition never picks it up, and the engine records it
 # like any other entry, so reloading a worker refreshes its role instead of
-# turning it into a chief. spawn composes these entries after the worker's
-# identity exists, so `me` is the worker itself, on reload as well.
+# turning it into a chief. spawn finds the role in the workspace the chief's
+# own staff entry was discovered in (Artifact.workspace), so hiring still
+# works after the chief checks out a repository without staff. spawn composes
+# these entries after the worker's identity exists, so `me` is the worker
+# itself, on reload as well.
 #
 # The role binds `Peers` instead of Staff: the same `members` tree and escape
 # hatches, but no orchestration, plus a private line home (askChief) that
@@ -95,23 +98,38 @@ type Staff {
   """
   The expertise spawn composes into a new worker: the chief's recorded
   composition minus staff's own entries (its chief `agent`, or a role it holds
-  as a worker itself), followed by the worker role from `source`. Internal
-  spawn plumbing; public so the selection can be checked without a model.
+  as a worker itself), followed by the worker role, found through the chief's
+  own recorded staff entry: `dag://staff/worker` in the workspace that entry
+  was discovered in, not the chief's current workspace. Internal spawn
+  plumbing; public so the selection can be checked without a model.
   """
-  workerExpertise(chief: Agent!, source: Workspace!): [Expertise!]! {
+  workerExpertise(chief: Agent!): [Expertise!]! {
     # `sync` pins one snapshot, as workerWorkspace does. Expertise lists come
     # back as lazy GraphQL lists; reload each by ID to pass them on as a
     # concrete [Expertise!]! argument. Each entry keeps the workspace it was
     # composed from, so inherited tools still come from where the chief got
     # them, not from whatever worktree it operates on now.
-    let inherited = chief.snapshot.sync.expertise.{{ id, artifact.{{ moduleName }} }}
+    let recorded = chief.snapshot.sync.expertise.{{ id, artifact.{{ moduleName, workspace.{{ id }} }} }}
+    let inherited = recorded
       .filter { e => e.artifact.moduleName != "staff" }
       .map { e => node(id: e.id).{{ ... on Expertise! }} }
-    let role = source.artifacts
+    # The role comes from the same staff the chief was composed with, so it
+    # survives the chief checking out a repository without staff (or with a
+    # different staff of its own).
+    let own = recorded.filter { e => e.artifact.moduleName == "staff" }
+    let entry = own[0]
+    if (entry == null) {
+      raise "the chief's composition records no staff entry, so there is no worker role to hire with: compose dag://staff/agent first"
+    }
+    let home = entry.artifact.workspace
+    if (home == null) {
+      raise "the chief's staff entry records no workspace it was discovered in, so its worker role (dag://staff/worker) cannot be found"
+    }
+    let role = node(id: home.id).{{ ... on Workspace! }}.artifacts
       .filterUri(uri: "dag://staff/worker")
       .asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
     if (role.isEmpty) {
-      raise "no worker role at dag://staff/worker in this workspace: install the staff module here to hire workers"
+      raise "the workspace the chief's staff entry came from has no worker role at dag://staff/worker"
     }
     inherited + role
   }
@@ -179,7 +197,7 @@ type Staff {
     # as its parent — and only then composes the entries, so the role's `me`
     # is the worker. The engine records them on the worker's conversation;
     # that record is what a reload refreshes.
-    let hired = seeded.spawn(name: name, expertise: workerExpertise(chief, source))
+    let hired = seeded.spawn(name: name, expertise: workerExpertise(chief))
     # Fire-and-forget: signal-with-start opens the worker's first turn.
     hired.send(task)
     # Subscribe the chief to the worker's lifecycle (defaults: IDLE and
