@@ -288,10 +288,10 @@ let testStaffWorker(source: Workspace!): String! {
     let scope = conversation.artifacts(include: ["staff/members"])
     assert { scope.dimensionKeys(dimension: "staff-member") == ["chief"] }
 
-    # Reload is a bare recompose: every recorded entry is refreshed from the
-    # bound workspace. The worker stays a worker: the same record, one
-    # worker prompt, no chief tools.
-    let reloaded = conversation.recompose
+    # Reload is the owning agent's recompose: every recorded entry is
+    # refreshed in the conversation's bound workspace. The worker stays a
+    # worker: the same record, one worker prompt, no chief tools.
+    let reloaded = worker.recompose(conversation: conversation)
     assert { recordedUris(reloaded) == uris }
     let reloadedTools = reloaded.tools
     assert { reloadedTools.contains("askChief") and reloadedTools.contains("cherryPick") }
@@ -301,12 +301,12 @@ let testStaffWorker(source: Workspace!): String! {
     assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
 
     # Becoming a chief is explicit, and survives another reload.
-    let promoted = reloaded.recompose(expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
+    let promoted = worker.compose(conversation: reloaded, expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
     assert { recordedUris(promoted).length == 3 }
     let promotedTools = promoted.tools
     assert { promotedTools.contains("interruptWorker") and promotedTools.contains("sendTo") }
     assert { promotedTools.contains("askChief") }
-    let again = promoted.recompose
+    let again = worker.recompose(conversation: promoted)
     assert { again.tools.contains("interruptWorker") and again.tools.contains("askChief") }
     assert { systemTexts(again).filter { t => t.contains(workerLine) }.length == 1 }
     null
@@ -365,7 +365,7 @@ let testStaffComposition(source: Workspace!): String! {
       """)
     .asWorkspace
   let chief = llm.withWorkspace(source).spawn(name: "composition-chief", expertise: expertiseAt(source, "dag://staff/agent"))
-  chief.reseed(conversation: chief.snapshot.sync.recompose(expertise: expertiseAt(origin, "dag://probe/agent")))
+  chief.reseed(conversation: chief.compose(conversation: chief.snapshot.sync, expertise: expertiseAt(origin, "dag://probe/agent")))
   let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ moduleName }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
@@ -378,7 +378,7 @@ let testStaffComposition(source: Workspace!): String! {
     # The worker works in the chief's current workspace, not the origin.
     assert { conversation.workspace.file("staff/main.dang").contents == source.file("staff/main.dang").contents }
     # That workspace has no probe, so reload keeps the recorded entry.
-    let reloaded = conversation.recompose
+    let reloaded = worker.recompose(conversation: conversation)
     assert { recordedUris(reloaded) == recordedUris(conversation) }
     assert { reloaded.tools.contains("originRead") and reloaded.tools.contains("askChief") }
     null

@@ -10,8 +10,8 @@ Committed work is harvested with git tools by address
 that. This script covers the uncommitted half: pendingOf and salvagePending.
 It also covers the worker role: a worker spawned from a chief's recorded
 composition has the worker tools and none of the chief's, knows its name and
-its chief, stays a worker through a bare recompose (what reload does), and
-gains the chief tools only when recomposed with dag://staff/agent.
+its chief, stays a worker through Agent.recompose (what reload does), and
+gains the chief tools only through Agent.compose with dag://staff/agent.
 """
 
 import base64
@@ -136,14 +136,20 @@ def describe(conversation):
     }
 
 
-def recompose(conversation, entries=()):
-    """Refresh every recorded entry from the bound workspace, then add `entries`.
+def agent_compose(agent, field, conversation, entries=None):
+    """Run Agent.recompose or Agent.compose on `conversation`, owned by `agent`.
 
-    With no entries this is what Editor's reload does.
+    recompose refreshes every recorded entry in the bound workspace: what
+    Editor's reload does. compose runs and records the given entries.
     """
-    llm = query('query($llm: ID!, $entries: [ID!]!) { node(id: $llm) { ... on LLM { '
-                'recompose(expertise: $entries) { ' + CONVERSATION + ' } } } }',
-                llm=conversation["id"], entries=list(entries))["node"]["recompose"]
+    args = 'conversation: $llm' + (', expertise: $entries' if entries is not None else '')
+    variables = {"agent": agent, "llm": conversation["id"]}
+    params = '$agent: ID!, $llm: ID!'
+    if entries is not None:
+        variables["entries"] = list(entries)
+        params += ', $entries: [ID!]!'
+    llm = query('query(' + params + ') { node(id: $agent) { ... on Agent { '
+                + field + '(' + args + ') { ' + CONVERSATION + ' } } } }', **variables)["node"][field]
     return describe(llm)
 
 
@@ -202,14 +208,14 @@ def worker_role(module):
         assert keys == ["chief"], keys
 
         # Reload keeps it a worker: same record, one worker prompt, no chief tools.
-        reloaded = recompose(seed)
+        reloaded = agent_compose(worker, "recompose", seed)
         assert reloaded["uris"] == seed["uris"], reloaded["uris"]
         assert_worker(reloaded, "role-worker")
 
         # Becoming a chief is explicit, and survives another reload.
-        promoted = recompose(reloaded, expertise_at(ws, "dag://staff/agent"))
+        promoted = agent_compose(worker, "compose", reloaded, expertise_at(ws, "dag://staff/agent"))
         assert len(promoted["uris"]) == 3, promoted["uris"]
-        again = recompose(promoted)
+        again = agent_compose(worker, "recompose", promoted)
         for conversation in (promoted, again):
             for tool in CHIEF_TOOLS + ("askChief",):
                 assert tool in conversation["tools"], (tool, conversation["tools"])
