@@ -10,8 +10,8 @@ Committed work is harvested with git tools by address
 that. This script covers the uncommitted half: pendingOf and salvagePending.
 It also covers the worker role: a worker spawned from a chief's recorded
 composition has the worker tools and none of the chief's, knows its name and
-its chief, stays a worker when its recorded entries are recomposed, and gains
-the chief tools only when dag://staff/agent is composed explicitly.
+its chief, stays a worker through a bare recompose (what reload does), and
+gains the chief tools only when recomposed with dag://staff/agent.
 """
 
 import base64
@@ -136,16 +136,14 @@ def describe(conversation):
     }
 
 
-def reload_recorded(conversation):
-    """What Editor's reload does: find each recorded entry again by URI, then recompose."""
-    entries = []
-    for uri in conversation["uris"]:
-        found = expertise_at(conversation["workspace"], uri)
-        assert len(found) == 1, (uri, found)
-        entries += found
+def recompose(conversation, entries=()):
+    """Refresh every recorded entry from the bound workspace, then add `entries`.
+
+    With no entries this is what Editor's reload does.
+    """
     llm = query('query($llm: ID!, $entries: [ID!]!) { node(id: $llm) { ... on LLM { '
                 'recompose(expertise: $entries) { ' + CONVERSATION + ' } } } }',
-                llm=conversation["id"], entries=entries)["node"]["recompose"]
+                llm=conversation["id"], entries=list(entries))["node"]["recompose"]
     return describe(llm)
 
 
@@ -204,17 +202,14 @@ def worker_role(module):
         assert keys == ["chief"], keys
 
         # Reload keeps it a worker: same record, one worker prompt, no chief tools.
-        reloaded = reload_recorded(seed)
+        reloaded = recompose(seed)
         assert reloaded["uris"] == seed["uris"], reloaded["uris"]
         assert_worker(reloaded, "role-worker")
 
-        # Explicitly composing the chief role adds the chief tools, and survives reload.
-        promoted = describe(query('query($llm: ID!, $entries: [ID!]!) { node(id: $llm) { ... on LLM { '
-                                  'compose(expertise: $entries) { ' + CONVERSATION + ' } } } }',
-                                  llm=reloaded["id"], entries=expertise_at(ws, "dag://staff/agent"),
-                                  )["node"]["compose"])
+        # Becoming a chief is explicit, and survives another reload.
+        promoted = recompose(reloaded, expertise_at(ws, "dag://staff/agent"))
         assert len(promoted["uris"]) == 3, promoted["uris"]
-        again = reload_recorded(promoted)
+        again = recompose(promoted)
         for conversation in (promoted, again):
             for tool in CHIEF_TOOLS + ("askChief",):
                 assert tool in conversation["tools"], (tool, conversation["tools"])

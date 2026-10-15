@@ -233,24 +233,6 @@ let recordedUris(conversation: LLM!): [String!]! {
   conversation.expertise.{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
 }
 
-# What Editor's reload does: find each recorded entry again by address in the
-# conversation's current workspace, and recompose them in place.
-let reloadRecorded(conversation: LLM!): LLM! {
-  let ws = conversation.workspace
-  let entries = recordedUris(conversation).map { uri =>
-    let found = expertiseAt(ws, uri)
-    if (found.length != 1) {
-      raise `recorded entry ${uri} matched ${toString(found.length)} entries`
-    }
-    let entry = found[0]
-    if (entry == null) {
-      raise `recorded entry ${uri} is missing`
-    }
-    entry
-  }
-  conversation.recompose(expertise: entries)
-}
-
 let systemTexts(conversation: LLM!): [String!]! {
   let texts: [String!]! = []
   conversation.messages.{{role, content.{{text}}}}
@@ -306,9 +288,10 @@ let testStaffWorker(source: Workspace!): String! {
     let scope = conversation.artifacts(include: ["staff/members"])
     assert { scope.dimensionKeys(dimension: "staff-member") == ["chief"] }
 
-    # Reloading the recorded entries refreshes the worker in place: still a
-    # worker, the same record, one worker prompt, no chief tools.
-    let reloaded = reloadRecorded(conversation)
+    # Reload is a bare recompose: every recorded entry is refreshed from the
+    # bound workspace. The worker stays a worker: the same record, one
+    # worker prompt, no chief tools.
+    let reloaded = conversation.recompose
     assert { recordedUris(reloaded) == uris }
     let reloadedTools = reloaded.tools
     assert { reloadedTools.contains("askChief") and reloadedTools.contains("cherryPick") }
@@ -317,13 +300,13 @@ let testStaffWorker(source: Workspace!): String! {
     assert { reloadedPrompts.filter { t => t.contains(workerLine) }.length == 1 }
     assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
 
-    # Explicitly composing the chief role still works, and survives reload.
-    let promoted = reloaded.compose(expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
+    # Becoming a chief is explicit, and survives another reload.
+    let promoted = reloaded.recompose(expertise: expertiseAt(reloaded.workspace, "dag://staff/agent"))
     assert { recordedUris(promoted).length == 3 }
     let promotedTools = promoted.tools
     assert { promotedTools.contains("interruptWorker") and promotedTools.contains("sendTo") }
     assert { promotedTools.contains("askChief") }
-    let again = reloadRecorded(promoted)
+    let again = promoted.recompose
     assert { again.tools.contains("interruptWorker") and again.tools.contains("askChief") }
     assert { systemTexts(again).filter { t => t.contains(workerLine) }.length == 1 }
     null
@@ -382,7 +365,7 @@ let testStaffComposition(source: Workspace!): String! {
       """)
     .asWorkspace
   let chief = llm.withWorkspace(source).spawn(name: "composition-chief", expertise: expertiseAt(source, "dag://staff/agent"))
-  chief.reseed(conversation: chief.snapshot.sync.compose(expertise: expertiseAt(origin, "dag://probe/agent")))
+  chief.reseed(conversation: chief.snapshot.sync.recompose(expertise: expertiseAt(origin, "dag://probe/agent")))
   let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ moduleName }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
@@ -394,6 +377,10 @@ let testStaffComposition(source: Workspace!): String! {
     assert { systemTexts(conversation).any { t => t == "origin capabilities" } }
     # The worker works in the chief's current workspace, not the origin.
     assert { conversation.workspace.file("staff/main.dang").contents == source.file("staff/main.dang").contents }
+    # That workspace has no probe, so reload keeps the recorded entry.
+    let reloaded = conversation.recompose
+    assert { recordedUris(reloaded) == recordedUris(conversation) }
+    assert { reloaded.tools.contains("originRead") and reloaded.tools.contains("askChief") }
     null
   } rescue { e: Error => {
     worker.stop

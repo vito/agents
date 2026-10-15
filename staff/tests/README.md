@@ -23,9 +23,9 @@ even when the script passes.
 It also exercises the worker role in a synthetic workspace installing staff
 and a probe module: a worker spawned from a chief's recorded composition
 inherits the probe, has the worker tools and no chief tools, carries its staff
-name in its prompt, and has the chief as its parent. Recomposing its recorded
-entries, as Editor's reload does, keeps it a worker; composing
-`dag://staff/agent` explicitly adds the chief tools.
+name in its prompt, and has the chief as its parent. A bare `recompose`, as
+Editor's reload does, keeps it a worker; recomposing with `dag://staff/agent`
+adds the chief tools.
 
 Committed work is not staff's concern: each member's history is the GitRef
 at `dag://staff/members/head?staff-member=<name>`, harvested with git tools. The
