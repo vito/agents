@@ -121,6 +121,12 @@ type AgentsDev {
     null
   }
 
+  """Check the worker role is found through the chief's own staff entry after the chief checks out a repository without staff, and survives reload there."""
+  staffRoleWithoutStaff(source: Workspace!): Void @check {
+    print(testStaffRoleWithoutStaff(source: source))
+    null
+  }
+
   """Check sandbox sessions: exec, change extraction, continued and fresh sessions."""
   sandboxSessions(source: Workspace!): Void @check {
     print(testSandboxSessions(source: source))

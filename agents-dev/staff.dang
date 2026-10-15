@@ -233,6 +233,24 @@ let recordedUris(conversation: LLM!): [String!]! {
   conversation.expertise.{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
 }
 
+# Reload, as Editor's reload does: bind `ws`, then compose every recorded
+# entry again, each looked up by its URI in `ws` and falling back to the
+# recorded entry where `ws` doesn't address it. A looked-up entry refreshes
+# its recorded one in place, so the record keeps its order.
+let reloadIn(conversation: LLM!, ws: Workspace!): LLM! {
+  let entries = conversation.expertise.{{ id, artifact.{{ uri }} }}.map { e =>
+    let found = ws.artifacts.filterUri(uri: e.artifact.uri).asExpertise.{{ id }}.map { f => f.id }
+    node(id: found[0] ?? e.id).{{ ... on Expertise! }}
+  }
+  conversation.withWorkspace(ws).compose(expertise: entries)
+}
+
+# Reload an agent's current conversation in its own bound workspace.
+let reload(agent: Agent!): LLM! {
+  let conversation = agent.snapshot.sync
+  reloadIn(conversation, conversation.workspace)
+}
+
 let systemTexts(conversation: LLM!): [String!]! {
   let texts: [String!]! = []
   conversation.messages.{{role, content.{{text}}}}
@@ -256,7 +274,7 @@ let testStaffWorker(source: Workspace!): String! {
   # Spawn inherits the chief's record minus staff's own entries, then adds
   # the worker role. A module call returns a lazy list: select once, then
   # reload each entry by ID.
-  let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ uri }} }}
+  let picked = staff.workerExpertise(chief: chief).{{ id, artifact.{{ uri }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let worker = spawnUnder(chief, llm.withWorkspace(source), "check-worker", selected);
   {
@@ -293,11 +311,11 @@ let testStaffWorker(source: Workspace!): String! {
     let scope = conversation.artifacts(include: ["staff/members"])
     assert { scope.dimensionKeys(dimension: "staff-member") == ["chief"] }
 
-    # Reload is a bare recompose of the agent's own conversation: every
-    # recorded entry is refreshed in its bound workspace, and `me` is the
-    # owning agent. The worker stays a worker: the same record, one worker
-    # prompt, no chief tools.
-    let reloaded = worker.snapshot.recompose
+    # Reload looks every recorded entry up again in the bound workspace and
+    # composes it, refreshing it in place; `me` is the owning agent. The
+    # worker stays a worker: the same record, one worker prompt, no chief
+    # tools.
+    let reloaded = reload(worker)
     assert { recordedUris(reloaded) == uris }
     let reloadedTools = reloaded.tools
     assert { reloadedTools.contains("askChief") and reloadedTools.contains("cherryPick") }
@@ -315,7 +333,7 @@ let testStaffWorker(source: Workspace!): String! {
     assert { promotedTools.contains("interruptWorker") and promotedTools.contains("sendTo") }
     assert { promotedTools.contains("askChief") }
     worker.reseed(conversation: promoted)
-    let again = worker.snapshot.recompose
+    let again = reload(worker)
     assert { recordedUris(again).length == 3 }
     assert { again.tools.contains("interruptWorker") and again.tools.contains("askChief") }
     assert { systemTexts(again).filter { t => t.contains(workerLine) }.length == 1 }
@@ -388,7 +406,7 @@ let testStaffComposition(source: Workspace!): String! {
     .asWorkspace
   let chief = llm.withWorkspace(source).spawn(name: "composition-chief", expertise: expertiseAt(source, "dag://staff/agent"))
   chief.reseed(conversation: chief.snapshot.sync.compose(expertise: expertiseAt(origin, "dag://probe/agent")))
-  let picked = staff.workerExpertise(chief: chief, source: source).{{ id, artifact.{{ moduleName }} }}
+  let picked = staff.workerExpertise(chief: chief).{{ id, artifact.{{ moduleName }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
   {
@@ -400,7 +418,7 @@ let testStaffComposition(source: Workspace!): String! {
     # The worker works in the chief's current workspace, not the origin.
     assert { conversation.workspace.file("staff/main.dang").contents == source.file("staff/main.dang").contents }
     # That workspace has no probe, so reload keeps the recorded entry.
-    let reloaded = worker.snapshot.recompose
+    let reloaded = reload(worker)
     assert { recordedUris(reloaded) == recordedUris(conversation) }
     assert { reloaded.tools.contains("originRead") and reloaded.tools.contains("askChief") }
     null
@@ -521,4 +539,91 @@ let testStaffCheckout(source: Workspace!): String! {
   chief.stop
   server.stop
   "Staff checkout adoption checks passed."
+}
+
+let testStaffRoleWithoutStaff(source: Workspace!): String! {
+  let workerLine = `Your staff name is "roleless-worker"`
+  # The checkout target installs only a probe module: no staff.
+  let tree = directory
+    .withNewFile("dagger.toml", "[modules.probe]\nsource = \"probe\"\n")
+    .withNewFile("marker", "target\n")
+    .withDirectory("probe", agentModule("probe", "Probe", "target capabilities", "targetRead"))
+  let fixtureContainer = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git", "git-daemon"])
+    .withDirectory("/repo", tree)
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", """
+      git init -b main
+      git config user.name 'Checkout Test'
+      git config user.email checkout@example.com
+      export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+      export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+      git add .
+      git commit -m target
+    """])
+  let server = contributorCheckoutServer(fixtureContainer)
+  let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
+
+  # A chief composed from this workspace checks out the staff-less fixture,
+  # adopting its probe, and continues from there.
+  let chief = llm.withWorkspace(source).spawn(
+    name: "roleless-chief",
+    expertise: expertiseAt(source, "dag://committer/agent") + expertiseAt(source, "dag://staff/agent"),
+  )
+  let worker: Agent = null;
+  {
+    # Pin the continuation: checkout is uncached.
+    let here = contributor.checkout(
+      llm: chief.snapshot.sync,
+      source: source,
+      repo: contributorCheckoutRef(repo, ""),
+    ).sync
+    assert { here.workspace.file("marker").contents == "target\n" }
+    chief.reseed(conversation: here)
+
+    # The role is found through the chief's own staff entry, not the chief's
+    # current workspace, which has no staff at all.
+    let picked = staff.workerExpertise(chief: chief).{{ id, artifact.{{ uri, moduleName }} }}
+    let modules = picked.map { e => e.artifact.moduleName }
+    assert(message: modules.join(", ")) { modules == ["committer", "probe", "staff"] }
+    let uris = picked.map { e => e.artifact.uri }
+    assert(message: uris.join(", ")) { (uris[2] ?? "").contains("staff/worker") }
+    assert { here.workspace.artifacts.filterUri(uri: "dag://staff/worker").asExpertise.{{ id }}.isEmpty }
+
+    let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+    let hired = spawnUnder(chief, llm.withWorkspace(here.workspace), "roleless-worker", selected)
+    worker = hired
+    let conversation = hired.snapshot.sync
+    let tools = conversation.tools
+    assert { tools.contains("askChief") and tools.contains("pendingOf") and tools.contains("targetRead") and tools.contains("cherryPick") }
+    assert { !tools.contains("interruptWorker") and !tools.contains("sendTo") }
+    let prompts = systemTexts(conversation)
+    assert { prompts.filter { t => t.contains(workerLine) }.length == 1 }
+    assert { !prompts.any { t => t.contains("You can hire and direct a staff") } }
+    assert { conversation.artifacts(include: ["staff/members"]).dimensionKeys(dimension: "staff-member") == ["chief"] }
+
+    # Reload in that staff-less workspace keeps the recorded role: the
+    # lookup finds no dag://staff/worker there and falls back to the record.
+    let reloaded = reload(hired)
+    assert { recordedUris(reloaded) == recordedUris(conversation) }
+    let reloadedTools = reloaded.tools
+    assert { reloadedTools.contains("askChief") and reloadedTools.contains("pendingOf") and reloadedTools.contains("targetRead") and reloadedTools.contains("cherryPick") }
+    assert { !reloadedTools.contains("interruptWorker") and !reloadedTools.contains("sendTo") }
+    let reloadedPrompts = systemTexts(reloaded)
+    assert { reloadedPrompts.filter { t => t.contains(workerLine) }.length == 1 }
+    assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
+    null
+  } rescue { e: Error => {
+    let w = worker
+    if (w != null) { w.stop }
+    chief.stop
+    server.stop
+    raise e.message
+  }}
+  let w = worker
+  if (w != null) { w.stop }
+  chief.stop
+  server.stop
+  "Staff worker role without staff checks passed."
 }
