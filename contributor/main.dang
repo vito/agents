@@ -62,8 +62,10 @@
 #   returns a continuation of the current conversation bound to that
 #   checkout. The agent keeps its own toolset — tools live on the
 #   conversation, and their `Workspace!` args simply auto-fill from the new
-#   binding — and the target workspace's agents, if it has any, are composed
-#   ON TOP (minus modules the originating workspace already provides). A
+#   binding — and the target workspace's agents, if it has any, are adopted:
+#   the recorded composition is refreshed in the target (its version of a
+#   module the agent already has wins), and its agents for modules not yet
+#   in the record are composed ON TOP. A
 #   checked-out workspace refuses export by construction, so the only way
 #   its changes leave is commit + push. The old workspace's pending edits
 #   stay behind unless named in `keep`, which overlays them onto the fresh
@@ -751,8 +753,9 @@ type Contributor {
   use detached HEAD (name a branch explicitly to push). The result reports
   the resolved SHA and branch/detached state.
 
-  When the target workspace defines agents of its own, they are composed on
-  top of your toolset, except modules your originating workspace provides.
+  When the target workspace defines agents of its own, you adopt them: where
+  it provides a module you already have, its version replaces yours, and
+  its other agents are composed on top of your toolset.
 
   The switch is one-way for this conversation: your previous workspace is
   left behind, and there is no tool to switch back. Pending changes go with
@@ -769,7 +772,6 @@ type Contributor {
   """
   checkout(
     llm: LLM!,
-    me: Agent!,
     source: Workspace!,
     """
     The repository and ref to check out, as any GitRef address, e.g.
@@ -790,9 +792,11 @@ type Contributor {
     """
     keep: [String!]! = [],
     """
-    Also compose the target workspace's own agents onto your toolset. Their
-    modules' code and prompts come from the target repository — disable this
-    when checking out a repository you do not trust.
+    Adopt the target workspace's agents: your tools are refreshed in their
+    versions from the target wherever it provides the same modules, and its
+    other agents are composed on top. Their code and prompts come from the
+    target repository — disable this when checking out a repository you do
+    not trust, and your tools keep the versions they have.
     """
     composeAgents: Boolean! = true,
   ): LLM! @cache(policy: FunctionCachePolicy.Never) {
@@ -808,58 +812,19 @@ type Contributor {
       return switched
     }
 
-    # Redundancy filter: a module name the originating workspace already
-    # composes is assumed to provide the same tools — only the target's OWN
-    # agents are layered on. (Colliding tool names among what remains get
-    # namespaced by the engine, never silently shadowed.)
-    let known = source.artifacts
-      .filterTypes(types: ["Expertise"])
-      .items.{{moduleName}}.map { a => a.moduleName }.uniq
-    # Reading the target's agents runs the target repo's module code, which
-    # can fail for reasons that shouldn't strand the checkout (a broken
-    # config, settings that need a host client): fall back to the plain
-    # switch.
-    let selection = target.artifacts.filterTypes(types: ["Expertise"])
-    known.each { name =>
-      selection = selection.withoutUri(uri: "dag://" + name + "/**")
-    }
-    # Expertise lists come back as lazy GraphQL lists; reload each by ID to
-    # pass them as a concrete [Expertise!]! argument.
-    let selected = selection.asExpertise.{{ id }} rescue {
+    # Adopting the target runs its module code, which can fail for reasons
+    # that shouldn't strand the checkout (a broken config, settings that
+    # need a host client, a module that no longer loads): fall back to the
+    # plain switch.
+    let adopted = adoptAgents(llm, target) rescue {
       e: Error => return unlayered(switched, where, plainError(e.message))
     }
-    let expertise = selected.map { node(id: _.id).{{ ... on Expertise! }} }
-    let extras = expertise.{{name}}.map { a => a.name } rescue {
-      e: Error => return unlayered(switched, where, plainError(e.message))
-    }
-    if (extras.isEmpty) {
-      print(`Checked out ${where}. Your tools now operate on this checkout; ` + "it contributes no additional agents.")
-      return switched
-    }
-    # Refresh BEFORE switching: recompose refreshes every recorded entry in
-    # the conversation's bound workspace, so doing it after
-    # withWorkspace(target) would swap your own modules for same-named
-    # (untrusted) code in the target. An empty record has nothing to
-    # refresh (and recompose refuses one).
-    let refreshed = if (llm.expertise.{{ id }}.isEmpty) {
-      llm
+    if (adopted.extras.isEmpty) {
+      print(`Checked out ${where}. Your tools now operate on this checkout, ` + "in its versions wherever it provides the same modules; it contributes no additional agents.")
     } else {
-      me.recompose(conversation: llm)
+      print(`Checked out ${where}. Your tools now operate on this checkout, ` + "in its versions wherever it provides the same modules, " + `and its own agents were composed on top: ${adopted.extras.join(", ")}.`)
     }
-    # Composition is lazy: force each step HERE, so a failure lands in its
-    # rescue instead of poisoning the continuation, and the fallback names
-    # what actually failed.
-    refreshed.model rescue {
-      e: Error => return unrefreshed(switched, where, plainError(e.message))
-    }
-    # The extras keep their own source workspace, so they still run the
-    # target's code, and they are recorded like any other entry.
-    let layered = me.compose(conversation: refreshed, expertise: expertise).withWorkspace(target)
-    layered.model rescue {
-      e: Error => return unlayered(switched, where, plainError(e.message))
-    }
-    print(`Checked out ${where}. Your tools now operate on this checkout, ` + `and its own agents were composed on top: ${extras.join(", ")}.`)
-    layered
+    adopted.conversation
   }
 
   # ---- helpers ------------------------------------------------------------
@@ -1139,19 +1104,36 @@ type Contributor {
     before + ["--repo", slug] + args.dropFirst(before.length)
   }
 
-  # A checkout with the target's own agents left out: the fallback when
-  # reading or composing them fails, which must never strand the switch
-  # itself.
-  let unlayered(switched: LLM!, where: String!, reason: String!): LLM! {
-    print(`Checked out ${where}. Your tools now operate on this checkout; ` + `its own agents could not be composed (${reason}).`)
-    switched
+  # Adopt the target's agents onto a conversation switched to it:
+  # recompose refreshes every recorded entry in the target (a module it also
+  # provides runs the target's version; one it lacks keeps the recorded
+  # entry), then compose adds the target's default agents for modules not
+  # already in the record. Matching by module rather than by entry is what
+  # keeps a role intact: a staff worker (recorded `staff/worker`) checking
+  # out a repository that installs staff must not gain `staff/agent` and
+  # become a chief. Errors propagate: checkout rescues them all at once.
+  let adoptAgents(llm: LLM!, target: Workspace!): {{conversation: LLM!, extras: [String!]!}}! {
+    let recorded = llm.expertise.{{ artifact.{{ moduleName }} }}.map { e => e.artifact.moduleName }.uniq
+    let selection = target.artifacts.filterTypes(types: ["Expertise"])
+    recorded.each { name =>
+      selection = selection.withoutUri(uri: "dag://" + name + "/**")
+    }
+    # Expertise lists come back as lazy GraphQL lists; reload each by ID to
+    # pass them as a concrete [Expertise!]! argument.
+    let expertise = selection.asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
+    let extras = expertise.{{ name }}.map { a => a.name }
+    let adopted = llm.withWorkspace(target).recompose.compose(expertise: expertise)
+    # Composition is lazy: force it HERE, so a failure reaches checkout's
+    # rescue instead of poisoning the continuation.
+    adopted.model
+    {{conversation: adopted, extras: extras}}
   }
 
-  # Refreshing your own composition before layering failed: one of your own
-  # modules no longer loads or runs in the workspace you are leaving. The
-  # target's agents were not the problem, so say so.
-  let unrefreshed(switched: LLM!, where: String!, reason: String!): LLM! {
-    print(`Checked out ${where}. Your tools now operate on this checkout, but ` + `refreshing your own tools in the workspace you left failed (${reason}), ` + "so the checkout's own agents were not composed.")
+  # A plain switch: the fallback when adopting the target's agents fails,
+  # which must never strand the checkout itself. Your tools keep the
+  # versions they had.
+  let unlayered(switched: LLM!, where: String!, reason: String!): LLM! {
+    print(`Checked out ${where}. Your tools now operate on this checkout, unchanged; ` + `its own agents could not be adopted (${reason}).`)
     switched
   }
 
@@ -1344,8 +1326,9 @@ type Contributor {
     branch. Branch refs keep their branch; tags and SHAs produce detached
     HEAD, so publishing from them needs an explicit push branch.
     Checkout reports the resolved SHA and branch/detached state. Your
-    tools come along and operate on the new checkout, and any agents the
-    target workspace itself defines are composed on top of them. The switch
+    tools come along and operate on the new checkout; where the target
+    provides the same modules, its versions replace yours, and any other
+    agents it defines are composed on top. The switch
     is one-way: your previous workspace is left behind, pending changes
     included — unless you name them in `keep` (glob patterns, like `commit`'s
     paths), which carries those files into the new checkout as uncommitted
