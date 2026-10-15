@@ -45,10 +45,6 @@ name = "context"
 is-module = true
 name = "contributor"
 
-[sdks.dang.scopes.delegate]
-is-module = true
-name = "delegate"
-
 [sdks.dang.scopes.sandbox]
 is-module = true
 name = "sandbox"

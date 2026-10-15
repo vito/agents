@@ -1,8 +1,7 @@
 # staff: let a Dagger coding agent hire and direct long-running async worker
-# agents — the async sibling of ./modules/delegate.
+# agents.
 #
-# delegate hands a subtask to a sub-agent and BLOCKS until it finishes; staff
-# spawns workers that run in the background as Agent runtimes (see
+# Staff spawns workers that run in the background as Agent runtimes (see
 # hack/designs/async-agents.md), so the chief keeps working while they do.
 # Messaging is event-driven, never blocking (hack/designs/agent-messaging.md):
 # spawn subscribes the chief to each worker's lifecycle, so completions and
