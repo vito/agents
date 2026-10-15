@@ -571,30 +571,27 @@ let testStaffRoleWithoutStaff(source: Workspace!): String! {
     name: "roleless-chief",
     expertise: expertiseAt(source, "dag://committer/agent") + expertiseAt(source, "dag://staff/agent"),
   )
-  let worker: Agent = null;
+  # Pin the continuation: checkout is uncached.
+  let here = contributor.checkout(
+    llm: chief.snapshot.sync,
+    source: source,
+    repo: contributorCheckoutRef(repo, ""),
+  ).sync
+  chief.reseed(conversation: here)
+  # The role is found through the chief's own staff entry, not the chief's
+  # current workspace, which has no staff at all.
+  let picked = staff.workerExpertise(chief: chief).{{ id, artifact.{{ uri, moduleName }} }}
+  let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+  let worker = spawnUnder(chief, llm.withWorkspace(here.workspace), "roleless-worker", selected);
   {
-    # Pin the continuation: checkout is uncached.
-    let here = contributor.checkout(
-      llm: chief.snapshot.sync,
-      source: source,
-      repo: contributorCheckoutRef(repo, ""),
-    ).sync
     assert { here.workspace.file("marker").contents == "target\n" }
-    chief.reseed(conversation: here)
-
-    # The role is found through the chief's own staff entry, not the chief's
-    # current workspace, which has no staff at all.
-    let picked = staff.workerExpertise(chief: chief).{{ id, artifact.{{ uri, moduleName }} }}
     let modules = picked.map { e => e.artifact.moduleName }
     assert(message: modules.join(", ")) { modules == ["committer", "probe", "staff"] }
     let uris = picked.map { e => e.artifact.uri }
     assert(message: uris.join(", ")) { (uris[2] ?? "").contains("staff/worker") }
     assert { here.workspace.artifacts.filterUri(uri: "dag://staff/worker").asExpertise.{{ id }}.isEmpty }
 
-    let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
-    let hired = spawnUnder(chief, llm.withWorkspace(here.workspace), "roleless-worker", selected)
-    worker = hired
-    let conversation = hired.snapshot.sync
+    let conversation = worker.snapshot.sync
     let tools = conversation.tools
     assert { tools.contains("askChief") and tools.contains("pendingOf") and tools.contains("targetRead") and tools.contains("cherryPick") }
     assert { !tools.contains("interruptWorker") and !tools.contains("sendTo") }
@@ -605,7 +602,7 @@ let testStaffRoleWithoutStaff(source: Workspace!): String! {
 
     # Reload in that staff-less workspace keeps the recorded role: the
     # lookup finds no dag://staff/worker there and falls back to the record.
-    let reloaded = reload(hired)
+    let reloaded = reload(worker)
     assert { recordedUris(reloaded) == recordedUris(conversation) }
     let reloadedTools = reloaded.tools
     assert { reloadedTools.contains("askChief") and reloadedTools.contains("pendingOf") and reloadedTools.contains("targetRead") and reloadedTools.contains("cherryPick") }
@@ -615,14 +612,12 @@ let testStaffRoleWithoutStaff(source: Workspace!): String! {
     assert { !reloadedPrompts.any { t => t.contains("You can hire and direct a staff") } }
     null
   } rescue { e: Error => {
-    let w = worker
-    if (w != null) { w.stop }
+    worker.stop
     chief.stop
     server.stop
     raise e.message
   }}
-  let w = worker
-  if (w != null) { w.stop }
+  worker.stop
   chief.stop
   server.stop
   "Staff worker role without staff checks passed."
