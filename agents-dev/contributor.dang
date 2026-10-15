@@ -59,6 +59,10 @@ let checkContributorCheckoutRefs: String! {
     .withNewFile("left.txt", "left behind\n")
     .withoutFile("delete.txt")
   let base = llm.withWorkspace(source)
+  # checkout takes the calling agent (`me`) to refresh and compose its
+  # conversation. These cases pass composeAgents: false, so it only has to
+  # exist; a check has no calling agent to auto-fill it.
+  let me = base.spawn(name: "checkout-fixture")
 
   # Go through the public continuation and inspect its bound workspace, not
   # checkout's internal preparation helper. No model calls or target agents.
@@ -95,6 +99,7 @@ let checkContributorCheckoutRefs: String! {
     # would otherwise perform another checkout instead of inspecting one.
     let switched = contributor.checkout(
       llm: base,
+      me: me,
       source: source,
       repo: contributorCheckoutRef(repo, c.ref),
       composeAgents: false,
@@ -111,6 +116,7 @@ let checkContributorCheckoutRefs: String! {
     let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
     let switched = contributor.checkout(
       llm: base,
+      me: me,
       source: source,
       repo: contributorCheckoutRef(repo, ref),
       keep: ["marker", "new.txt", "delete.txt"],
@@ -130,6 +136,7 @@ let checkContributorCheckoutRefs: String! {
   let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
   let missing = contributor.checkout(
     llm: base,
+    me: me,
     source: source,
     repo: git(repo).ref("no-such-ref", noLock: true),
     composeAgents: false,
@@ -141,6 +148,7 @@ let checkContributorCheckoutRefs: String! {
   assert(message: missing) { missing.contains("no-such-ref") }
   let unknownSha = contributor.checkout(
     llm: base,
+    me: me,
     source: source,
     repo: git(repo).ref("0000000000000000000000000000000000000001", noLock: true),
     composeAgents: false,
@@ -150,6 +158,7 @@ let checkContributorCheckoutRefs: String! {
   assert(message: unknownSha) { unknownSha.contains("cannot check out") }
   let noMatch = contributor.checkout(
     llm: base,
+    me: me,
     source: source,
     repo: git(repo).ref("v1", noLock: true),
     keep: ["absent"],
@@ -182,6 +191,7 @@ let checkContributorCheckoutRefs: String! {
   assert { tools.contains("checkout") }
   assert { !tools.contains("checkCheckoutRefs") and !tools.contains("checkMountsOutsideToolbox") }
   server.stop
+  me.stop
   "Checkout ref and keep checks passed."
 }
 

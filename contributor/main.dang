@@ -769,6 +769,7 @@ type Contributor {
   """
   checkout(
     llm: LLM!,
+    me: Agent!,
     source: Workspace!,
     """
     The repository and ref to check out, as any GitRef address, e.g.
@@ -835,14 +836,25 @@ type Contributor {
       print(`Checked out ${where}. Your tools now operate on this checkout; ` + "it contributes no additional agents.")
       return switched
     }
-    # Recompose BEFORE switching: recompose refreshes every recorded entry
-    # from the bound workspace, so doing it after withWorkspace(target)
-    # would swap the agent's own modules for same-named (untrusted) code in
-    # the target. The extras keep their own source workspace, so they still
-    # run the target's code, and they are recorded like any other entry.
-    let layered = llm.recompose(expertise: expertise).withWorkspace(target)
-    # recompose is lazy: force the composition HERE, so a failing target
-    # module lands in this rescue instead of poisoning the continuation.
+    # Refresh BEFORE switching: recompose refreshes every recorded entry in
+    # the conversation's bound workspace, so doing it after
+    # withWorkspace(target) would swap your own modules for same-named
+    # (untrusted) code in the target. An empty record has nothing to
+    # refresh (and recompose refuses one).
+    let refreshed = if (llm.expertise.{{ id }}.isEmpty) {
+      llm
+    } else {
+      me.recompose(conversation: llm)
+    }
+    # Composition is lazy: force each step HERE, so a failure lands in its
+    # rescue instead of poisoning the continuation, and the fallback names
+    # what actually failed.
+    refreshed.model rescue {
+      e: Error => return unrefreshed(switched, where, plainError(e.message))
+    }
+    # The extras keep their own source workspace, so they still run the
+    # target's code, and they are recorded like any other entry.
+    let layered = me.compose(conversation: refreshed, expertise: expertise).withWorkspace(target)
     layered.model rescue {
       e: Error => return unlayered(switched, where, plainError(e.message))
     }
@@ -1132,6 +1144,14 @@ type Contributor {
   # itself.
   let unlayered(switched: LLM!, where: String!, reason: String!): LLM! {
     print(`Checked out ${where}. Your tools now operate on this checkout; ` + `its own agents could not be composed (${reason}).`)
+    switched
+  }
+
+  # Refreshing your own composition before layering failed: one of your own
+  # modules no longer loads or runs in the workspace you are leaving. The
+  # target's agents were not the problem, so say so.
+  let unrefreshed(switched: LLM!, where: String!, reason: String!): LLM! {
+    print(`Checked out ${where}. Your tools now operate on this checkout, but ` + `refreshing your own tools in the workspace you left failed (${reason}), ` + "so the checkout's own agents were not composed.")
     switched
   }
 
