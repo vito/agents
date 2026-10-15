@@ -264,6 +264,11 @@ let testStaffWorker(source: Workspace!): String! {
     assert(message: uris.join(", ")) { uris.length == 2 and (uris[0] ?? "").contains("committer/agent") and (uris[1] ?? "").contains("staff/worker") }
 
     let parent = worker.parent
+    # A nullable object field stays a lazy selection in Dang: force a scalar
+    # off it to learn whether the parent exists.
+    parent.handle rescue {
+      e: Error => raise "the worker has no parent"
+    }
     if (parent == null) {
       raise "the worker has no parent"
     }
@@ -332,8 +337,14 @@ let testStaffWorker(source: Workspace!): String! {
 }
 
 let testStaffTools(source: Workspace!): String! {
-  # LLM.tools renders one "## <name>" heading per tool.
-  let tools = staff.agent(llm.withWorkspace(source)).tools
+  # LLM.tools renders one "## <name>" heading per tool. spawn takes the
+  # calling chief as an Agent argument, which only an owning agent supplies:
+  # compose the chief role onto a spawned agent so the conversation has one.
+  let unowned = staff.agent(llm.withWorkspace(source)).tools
+  assert { !unowned.contains("## spawn\n") and unowned.contains("## sendTo\n") }
+  let chief = llm.withWorkspace(source).spawn(name: "tools-check-chief", expertise: expertiseAt(source, "dag://staff/agent"))
+  let tools = chief.snapshot.sync.tools
+  chief.stop
   ["spawn", "sendTo", "status", "read", "interruptWorker", "pendingOf", "salvagePending"].each { name =>
     assert { tools.contains("## " + name + "\n") }
   }

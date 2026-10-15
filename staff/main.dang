@@ -683,6 +683,12 @@ type Peers {
   # The chief that spawned this worker, looked up live.
   let chief: Agent! {
     let parent = me.parent
+    # A nullable object field stays a lazy selection in Dang, so
+    # `parent == null` never holds: force a scalar off it to learn whether
+    # the parent exists. The null check stays for the type narrowing.
+    parent.handle rescue {
+      e: Error => raise `"${me.name}" has no chief: staff worker tools need the agent that spawned it`
+    }
     if (parent == null) {
       raise `"${me.name}" has no chief: staff worker tools need the agent that spawned it`
     }
