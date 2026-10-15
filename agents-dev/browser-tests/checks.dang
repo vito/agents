@@ -324,6 +324,97 @@ let testBrowserBrowsers: Void {
 let testBrowserTools: Void {
   let tools = browser.agent(llm).tools
   assert { ["prepared", "checkRunner", "checkTools", "checkWorkspace", "checkBrowsers", "checkSessionRunner", "checkSessions"].all { tool => !tools.contains(tool) } }
-  assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot", "observations", "readPage"].all { tool => tools.contains(tool) } }
+  assert { ["start", "exec", "inspect", "syncWorkspace", "sessions", "stop", "viewScreenshot", "observations", "readPage", "mountArtifacts", "unmountArtifacts"].all { tool => tools.contains(tool) } }
+  null
+}
+
+let browserPendingPaths(ws: Workspace!): [String!]! {
+  ws.git.uncommitted.diffStats.{{path}}.map { s => s.path }
+}
+
+let browserMountMissing(ws: Workspace!, path: String!): Boolean! {
+  ws.file(path).size rescue { e: Error => return true }
+  false
+}
+
+# mountArtifacts mounts retained evidence read-only into a workspace: readable
+# at the expected path with the run's bytes, visible to the contributor's gh
+# toolbox (unlike mnt/), absent from the pending changeset, and removable.
+let testBrowserArtifactMounts: Void {
+  let ws = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
+    .directory("/repo")
+    .asGit
+    .head
+    .asWorkspace
+    .withNewFile("tmp/body.md", "draft\n")
+  let pending = browserPendingPaths(ws)
+  assert { pending.contains("tmp/body.md") }
+  # Serve the page from a private fork; mounts go into ws, whose pending
+  # changeset is the baseline.
+  let site = ws.withNewFile("site/index.html", "<title>attach</title><h1>evidence</h1>")
+  let state = browserSnapshot(browser.run(site, root: "site", script: """
+    await page.goto(baseURL);
+    await screenshot('named');
+  """))
+  let id = browserObservation(state, browser)
+  let shot = state.artifact(id, "screenshot.png").digest(excludeMetadata: true)
+  let named = state.artifact(id, "named.png").digest(excludeMetadata: true)
+  let dir = "tmp/browser/" + id
+
+  # The whole run, at the default location.
+  let mounted = state.mountArtifacts(ws, id)
+  assert { mounted.file(dir + "/screenshot.png").digest(excludeMetadata: true) == shot }
+  assert { mounted.file(dir + "/named.png").digest(excludeMetadata: true) == named }
+  assert { mounted.file(dir + "/results.json").contents == state.artifact(id, "results.json").contents }
+  assert { mounted.file("tmp/body.md").contents == "draft\n" }
+  assert { browserPendingPaths(mounted) == pending }
+  assert { mounted.changes.diffStats.{{path}}.map { s => s.path } == ws.changes.diffStats.{{path}}.map { s => s.path } }
+
+  # gh reads -F files before making a request; the final missing file keeps
+  # this offline. A mounted artifact must not be the file it fails to open.
+  let gh = contributor(githubToken: setSecret("browser-mount-test-token", "not-a-real-token")).gh(
+    source: mounted,
+    args: ["api", "graphql", "-F", "shot=@" + dir + "/screenshot.png", "-F", "guard=@always-missing"],
+  ) rescue {
+    e: Error => e.message
+  }
+  assert(message: gh) { gh.contains("open always-missing: no such file or directory") }
+  assert(message: gh) { !gh.contains("open " + dir) }
+
+  let unmounted = state.unmountArtifacts(mounted, run: id)
+  assert { browserMountMissing(unmounted, dir + "/screenshot.png") }
+  assert { unmounted.file("tmp/body.md").contents == "draft\n" }
+  assert { browserPendingPaths(unmounted) == pending }
+
+  # One artifact, at the default location and at a chosen one.
+  let one = state.mountArtifacts(ws, id, path: "named.png")
+  assert { one.file(dir + "/named.png").digest(excludeMetadata: true) == named }
+  assert { browserMountMissing(one, dir + "/screenshot.png") }
+  assert { browserPendingPaths(one) == pending }
+  assert { browserMountMissing(state.unmountArtifacts(one, run: id), dir + "/named.png") }
+  let custom = state.mountArtifacts(ws, id, path: "screenshot.png", at: "docs/evidence.png")
+  assert { custom.file("docs/evidence.png").digest(excludeMetadata: true) == shot }
+  assert { browserMountMissing(state.unmountArtifacts(custom, at: "docs/evidence.png"), "docs/evidence.png") }
+  let customDir = state.mountArtifacts(ws, id, at: "evidence/")
+  assert { customDir.file("evidence/named.png").digest(excludeMetadata: true) == named }
+  assert { browserMountMissing(state.unmountArtifacts(customDir, at: "evidence"), "evidence/named.png") }
+
+  # Validation, before anything is mounted.
+  ["../x", "/abs", "a/../../b", "."].each { invalid =>
+    let rejected = state.mountArtifacts(ws, id, at: invalid).file("tmp/body.md").contents rescue { e: Error => e.message }
+    assert(message: rejected) { rejected.contains("relative workspace path") }
+  }
+  let badPath = state.mountArtifacts(ws, id, path: "../screenshot.png").file("tmp/body.md").contents rescue { e: Error => e.message }
+  assert(message: badPath) { badPath.contains("artifact path must be relative") }
+  let absent = state.mountArtifacts(ws, id, path: "absent.png").file("tmp/body.md").contents rescue { e: Error => e.message }
+  assert(message: absent) { absent.contains("no artifact absent.png") }
+  let unknown = state.mountArtifacts(ws, "missing-run").file("tmp/body.md").contents rescue { e: Error => e.message }
+  assert(message: unknown) { unknown.contains("unknown run") }
+  let neither = state.unmountArtifacts(ws).file("tmp/body.md").contents rescue { e: Error => e.message }
+  assert(message: neither) { neither.contains("exactly one of run or at") }
   null
 }
