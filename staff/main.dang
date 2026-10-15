@@ -109,7 +109,7 @@ type Staff {
     # concrete [Expertise!]! argument. Each entry keeps the workspace it was
     # composed from, so inherited tools still come from where the chief got
     # them, not from whatever worktree it operates on now.
-    let recorded = chief.snapshot.sync.expertise.{{ id, artifact.{{ moduleName, workspace.{{ id }} }} }}
+    let recorded = chief.snapshot.sync.expertise.{{ id, artifact.{{ moduleName }} }}
     let inherited = recorded
       .filter { e => e.artifact.moduleName != "staff" }
       .map { e => node(id: e.id).{{ ... on Expertise! }} }
@@ -121,11 +121,17 @@ type Staff {
     if (entry == null) {
       raise "the chief's composition records no staff entry, so there is no worker role to hire with: compose dag://staff/agent first"
     }
-    let home = entry.artifact.workspace
+    # Artifact.workspace is nullable, and in Dang a null object selected
+    # through `{{ }}` neither compares equal to null nor selects cleanly:
+    # select its id directly and treat a failure as "no workspace", keeping
+    # the original error so unrelated failures aren't masked.
+    let home = node(id: entry.id).{{ ... on Expertise! }}.artifact.workspace.id rescue {
+      e: Error => raise `the chief's staff entry records no workspace it was discovered in, so its worker role (dag://staff/worker) cannot be found (${e.message})`
+    }
     if (home == null) {
       raise "the chief's staff entry records no workspace it was discovered in, so its worker role (dag://staff/worker) cannot be found"
     }
-    let role = node(id: home.id).{{ ... on Workspace! }}.artifacts
+    let role = node(id: home).{{ ... on Workspace! }}.artifacts
       .filterUri(uri: "dag://staff/worker")
       .asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
     if (role.isEmpty) {
