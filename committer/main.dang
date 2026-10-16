@@ -46,9 +46,13 @@
 #     `cherryPickPlan(from:)` plans a harvest, `cherryPick(from:)` takes it,
 #     and `cherryPick(markers: true)` lands a conflicting commit as uncommitted
 #     edits to resolve.
+#   * `treeEqual` compares GitCommit.treeSHA, git's own tree hash, and lists
+#     the paths GitCommit.changes(against:) reports, which comes from git's
+#     tree diff and so includes mode-only and type changes.
 """
 Git operations on this workspace: review pending changes, read the checkout's
-history, restore files, commit, reset, cherry-pick, rebase, and push.
+history, restore files, commit, reset, cherry-pick, rebase, push, and compare
+commit trees.
 """
 type Committer {
   # Keep the workspace being left so reset can restore pruned history too.
@@ -1256,7 +1260,127 @@ type Committer {
     `${path} at ${target.shortSha} (${when(target.authoredDate)}) — ${subject(target.message)}` + "\n\n" + numbered.join("\n") + footer
   }
 
+  """
+  Check whether two commits have byte-identical trees — same paths, contents
+  AND file modes — by comparing their git tree hashes. Use it to prove a
+  rewritten history (a reset and re-commit, a rebase, a squash) ends at
+  exactly the tree it started from.
+
+  Prints both tree hashes and IDENTICAL, or DIFFERENT with each differing
+  path, going from `against` to `commit`: added, removed, content changed,
+  mode changed (e.g. 100644 -> 100755) or type changed. Compares committed
+  trees only; pending edits are not included.
+  """
+  treeEqual(
+    source: Workspace!,
+    """
+    The commit to check: "HEAD", a short or full hash, a branch, or a tag.
+    """
+    commit: String! = "HEAD",
+    """
+    Resolve `commit` in this git ref instead of the checkout: any GitRef
+    address, including other agents' histories (FindArtifacts lists them) and
+    workspaces a reset left behind
+    (`dag://committer/saved/head?committer-saved-workspace=<sha>`).
+    """
+    from: GitRef = null,
+    """
+    The commit to compare against, spelled like `commit`.
+    """
+    against: String! = "HEAD",
+    """
+    Resolve `against` in this git ref instead of the checkout, like `from`.
+    """
+    againstFrom: GitRef = null,
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): either ref may point at a live agent's history.
+    let headSha = if (from != null and againstFrom != null) {
+      ""
+    } else {
+      head(source).commitSHA rescue {
+        e: Error => return noHistory(e.message)
+      }
+    }
+    let ours = treeCommit(source, commit, from, headSha)
+    let theirs = treeCommit(source, against, againstFrom, headSha)
+    # The tree hash is git's own verdict on contents and modes alike.
+    let a = ours.{{sha, message, treeSHA}}
+    let b = theirs.{{sha, message, treeSHA}}
+    let header = `  commit   ${short(a.sha)}  tree ${a.treeSHA}  ${subject(a.message)}` + "\n"
+      + `  against  ${short(b.sha)}  tree ${b.treeSHA}  ${subject(b.message)}`
+    if (a.treeSHA == b.treeSHA) {
+      return "IDENTICAL trees: same paths, contents and modes.\n" + header
+    }
+    # Git's tree diff, from `against` to `commit`. A new directory is listed
+    # as "dir/" alongside its files; a removed one only as "dir/".
+    let changes = ours.changes(against: theirs).{{addedPaths, removedPaths, modifiedPaths}}
+    let entries = changes.modifiedPaths.map { p => {{kind: "M", path: p}} }
+      + changes.addedPaths.filter { p => !p.hasSuffix("/") }.map { p => {{kind: "A", path: p}} }
+      + changes.removedPaths.map { p => {{kind: "D", path: p}} }
+    let before = theirs.tree(discardGitDir: true)
+    let after = ours.tree(discardGitDir: true)
+    # Classify only what is shown: each modified row reads both sides.
+    let shown = entries.takeFirst(maxFiles).map { e =>
+      if (e.kind == "M") {
+        modifiedRow(before, after, e.path)
+      } else if (e.kind == "A") {
+        `  A  added  ${e.path}`
+      } else {
+        `  D  removed  ${e.path}`
+      }
+    }
+    let omitted = entries.length - shown.length
+    let note = if (omitted > 0) {
+      "\n" + `  ... ${toString(omitted)} more path(s) not listed`
+    } else {
+      ""
+    }
+    `DIFFERENT trees: ${toString(entries.length)} path(s) differ from ${short(b.sha)} to ${short(a.sha)}.` + "\n" + header + "\n\n" + shown.join("\n") + note
+  }
+
   # ---------------------------------------------------------------- helpers
+
+  # A commit spelled for treeEqual: resolved in `from` when given, else in
+  # the checkout (or, mid-rebase, the workspace it started from).
+  let treeCommit(source: Workspace!, spec: String!, from: GitRef, headSha: String!): GitCommit! {
+    if (from != null) {
+      return from.asRepository.commit(id: resolveSpecIn(from, spec))
+    }
+    let sha = resolveSpec(source, spec, headSha)
+    repositoryHolding(source, sha).commit(id: sha)
+  }
+
+  # A modified path as a treeEqual row: its git modes, from each side's
+  # type and owner-execute bit (what git records), and whether the bytes
+  # differ. A symlink with an unchanged mode can only have changed target.
+  let modifiedRow(before: Directory!, after: Directory!, path: String!): String! {
+    let old = before.stat(path: path, doNotFollowSymlinks: true).{{fileType, permissions}}
+    let new = after.stat(path: path, doNotFollowSymlinks: true).{{fileType, permissions}}
+    let oldMode = gitMode(old.fileType, old.permissions)
+    let newMode = gitMode(new.fileType, new.permissions)
+    if (old.fileType != new.fileType) {
+      return `  T  type ${oldMode} -> ${newMode}  ${path}`
+    }
+    let content = if (new.fileType == FileType.SYMLINK) {
+      true
+    } else {
+      before.file(path).digest(excludeMetadata: true) != after.file(path).digest(excludeMetadata: true)
+    }
+    let parts = (if (content) { ["content"] } else { [] })
+      + (if (oldMode != newMode) { [`mode ${oldMode} -> ${newMode}`] } else { [] })
+    let what = if (parts.isEmpty) { "changed" } else { parts.join(", ") }
+    `  M  ${what}  ${path}`
+  }
+
+  let gitMode(fileType: FileType, permissions: Int): String! {
+    if (fileType == FileType.SYMLINK) {
+      return "120000"
+    }
+    if (((permissions ?? 0) / 64) % 2 == 1) {
+      return "100755"
+    }
+    "100644"
+  }
 
   # Bound commit-message searches in `log`; commit resolution has no window.
   let searchWindow: Int! = 500
@@ -1952,9 +2076,13 @@ type Committer {
       it into a comparison between two commits.
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
+    - `treeEqual` — whether two commits have byte-identical trees (contents
+      and modes, by git tree hash), listing the differing paths otherwise.
+      Use it to prove a rewritten history ends at the tree it started from.
 
     REFS BY ADDRESS: `log(base:)`, `rebase(ref:)`, `cherryPickPlan(from:)`,
-    `cherryPick(from:)`, and the `from:` argument of `show`, `fileAt` and
+    `cherryPick(from:)`, `treeEqual(from:, againstFrom:)`, and the `from:`
+    argument of `show`, `fileAt` and
     `restore` take a git ref as an address string — any GitRef address,
     including other agents' histories (FindArtifacts lists them), a workspace
     a `reset` left behind
