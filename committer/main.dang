@@ -75,14 +75,22 @@ type Committer {
 
   let plumbing = ["withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState", "saved"]
 
-  # Bump version when stored fields are removed or change meaning, so older
-  # saved tool state is discarded instead of failing to load.
+  # The withTools version of this state. Bump it when stored fields are
+  # removed or change meaning, so older saved tool state is discarded instead
+  # of failing to load. Every binding must pass it, the agent entry and the
+  # continuations alike (see `continueWith`): a binding without it records
+  # version 0, and the next reload resets the state as a version change.
+  # Computed rather than a `let` field, so the constant itself is not state.
+  let toolsVersion: Int! {
+    1
+  }
+
   """
   Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
     base
-      .withTools(currentNode, except: plumbing, version: 1)
+      .withTools(currentNode, except: plumbing, version: toolsVersion)
       .withSystemPrompt(systemPrompt)
   }
 
@@ -370,7 +378,7 @@ type Committer {
     # it and the workspace through the continuation so the map persists.
     let tools = currentNode.{{... on Dagger.Committer!}}
       .withSavedWorkspace(workspace: before)
-    llm.withTools(tools, except: plumbing).withWorkspace(target)
+    continueWith(llm, tools, target)
   }
 
   # ------------------------------------------------------------ cherry-pick
@@ -828,7 +836,7 @@ type Committer {
     }
     let tools = currentNode.{{... on Dagger.Committer!}}.withoutRebaseState
     print(`Rebase aborted. Workspace restored to ${short(rebaseOldHead)}, as it was before rebase.`)
-    llm.withTools(tools, except: plumbing).withWorkspace(origin)
+    continueWith(llm, tools, origin)
   }
 
   """
@@ -1475,7 +1483,7 @@ type Committer {
         ]
       ).join("\n"),
     )
-    llm.withTools(tools, except: plumbing).withWorkspace(stopped)
+    continueWith(llm, tools, stopped)
   }
 
   let finished(
@@ -1499,7 +1507,17 @@ type Committer {
     }
     let tools = currentNode.{{... on Dagger.Committer!}}.withoutRebaseState
     print((progress + [summary]).join("\n"))
-    llm.withTools(tools, except: plumbing).withWorkspace(result)
+    continueWith(llm, tools, result)
+  }
+
+  # Hand the conversation back with both halves of a tool's result: the
+  # updated Committer state and the new workspace. A tool's return value
+  # routes one way only — a same-type Committer! rebinds the state, a
+  # Workspace! swaps the workspace — so a tool that must change both returns
+  # this continuation. Rebinding here replaces the binding wholesale, so it
+  # repeats the agent entry's except list and version.
+  let continueWith(llm: LLM!, tools: Dagger.Committer!, workspace: Workspace!): LLM! {
+    llm.withTools(tools, except: plumbing, version: toolsVersion).withWorkspace(workspace)
   }
 
   # How a ref given by address is named in rebase output: its ref name when
