@@ -27,6 +27,11 @@
 # vetting note beside it (vetting.md: "### <key>" headings, each followed by
 # a "vetted:" line). Baseline reviews sit beside it too.
 #
+# Better labels come from history: a case can pin a change (a PR or a
+# commit range) whose bugs later commits fixed, its issues vetted "real" and
+# citing the fix; or a known-clean change, with no issues and only sound
+# items, which measures noise.
+#
 # Scoring has two halves. The model-calling half, in reviewer-eval/ (run in
 # a plain-directory fixture workspace, see there for why), has a judge with
 # no tools split the review into numbered findings, then rate every finding
@@ -141,8 +146,9 @@ let reviewerEvalProblems(c: ReviewerEvalCase!): [String!]! {
   if (!c.repo.hasPrefix("https://")) {
     problems += [`repo "${c.repo}" is not an https:// git URL`]
   }
-  if (c.issues.isEmpty) {
-    problems += ["no issues"]
+  # A known-clean case has no issues, but lists what it checked.
+  if (c.issues.isEmpty and c.sound.isEmpty) {
+    problems += ["no issues and no sound items"]
   }
   let keys = c.issues.map { i => i.key } + c.sound.map { s => s.key }
   keys.uniq.each { k =>
@@ -759,6 +765,18 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let good = decodeReviewerEvalCase(reviewerEvalSyntheticCase)
   let none = reviewerEvalProblems(good)
   assert(message: none.join("\n")) { none.isEmpty }
+  # A known-clean case: no issues is fine with sound items, not without.
+  let clean = ReviewerEvalCase(
+    name: good.name, title: good.title, pr: good.pr, repo: good.repo, head: good.head, base: good.base,
+    notes: good.notes, issues: [] :: [ReviewerEvalIssue!]!, sound: good.sound,
+  )
+  let cleanProblems = reviewerEvalProblems(clean)
+  assert(message: cleanProblems.join("\n")) { cleanProblems.isEmpty }
+  let blank = ReviewerEvalCase(
+    name: good.name, title: good.title, pr: good.pr, repo: good.repo, head: good.head, base: good.base,
+    notes: good.notes, issues: [] :: [ReviewerEvalIssue!]!, sound: [] :: [ReviewerEvalSound!]!,
+  )
+  assert { reviewerEvalProblems(blank) == ["no issues and no sound items"] }
 
   # The vetting note: headings and "vetted:" lines; it fills nulls, must
   # agree with labels already set, and must list every issue.
@@ -912,5 +930,14 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   # No findings at all: nothing found, nothing wasted.
   let empty = reviewerEvalScorecard(good, "canned", "Nothing to fix.", [] :: [String!]!, ["{\"judgements\": []}"], reviewerEvalNoMeta)
   assert(message: empty.text) { empty.text.contains(reviewerEvalRow("confirmed recall", {{hit: 0, total: 2, percent: 0}})) and empty.text.contains(reviewerEvalNumberRow("findings", "0", "the review is 3 words")) }
+  # A known-clean case: there is nothing to recall, and what is raised is
+  # scored on its value alone.
+  let cleanCard: {{headline: {{valueScore: Int!, noise: Int!, confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!}}!, soundContradictions: Int!}}! = JSON.decode(
+    reviewerEvalScorecard(clean, "canned", "x y", ["one", "two"], [
+      "{\"judgements\": [" + reviewerEvalVote(1, "none", "speed-bump", false) + ", " + reviewerEvalVote(2, "s", "guardrail", true) + "]}",
+    ], reviewerEvalNoMeta).json
+  )
+  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.valueScore == -4 and cleanCard.headline.noise == 3 and cleanCard.soundContradictions == 1 }
+  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.confirmedRecall == {{hit: 0, total: 0, percent: 0}} }
   "Reviewer eval scoring checks passed."
 }

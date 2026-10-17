@@ -154,14 +154,17 @@ let renderCase(caseText: String!): String! {
     `- ${i.key} (${i.kind})` + "\n  locations: " + where + "\n  summary: " + i.summary
   }
   let sound = c.sound.map { s => `- ${s.key}: ${s.summary}` }
+  # A known-clean case has no issues; say so rather than print nothing.
+  let issueText = if (issues.isEmpty) { "(none)" } else { issues.join("\n") }
+  let soundText = if (sound.isEmpty) { "(none)" } else { sound.join("\n") }
   [
     `Pull request: ${c.title} (${c.pr})`,
     "",
     "Known issues (unvetted: compiled from earlier reviews, not ground truth):",
-    issues.join("\n"),
+    issueText,
     "",
     "Sound items (checked and found correct):",
-    sound.join("\n"),
+    soundText,
   ].join("\n")
 }
 
