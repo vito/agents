@@ -30,8 +30,9 @@
 #
 # Better labels come from history: a case can pin a change (a PR or a
 # commit range) whose bugs later commits fixed, its issues vetted "real" and
-# citing the fix; or a known-clean change, with no issues and only sound
-# items, which measures noise.
+# citing the fix; or a known-clean change that nothing in history fixed,
+# with mostly sound items (and at most an issue or two that holds by
+# inspection), which measures noise.
 #
 # Scoring has two halves. The model-calling half, in reviewer-eval/ (run in
 # a plain-directory fixture workspace, see there for why), has a judge with
