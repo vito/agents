@@ -65,10 +65,11 @@
 """
 How deep a review goes. QUICK: one general adversarial finder, one voter per
 finding. STANDARD: three finders (general, behavior changes, design and
-claims); an IMPORTANT finding needs two of three voters, a CONCERN both of
-two, a NIT its one voter. DEEP: five finders (adds correctness and
-security); IMPORTANT three of five, CONCERN two of three, NIT one of one.
-Every finder also has a general mandate besides its angle.
+claims); an IMPORTANT finding needs two of three voters, a CONCERN two of
+two (a third breaks a split), a NIT its one voter. DEEP: five finders
+(adds correctness and security); IMPORTANT three of five, CONCERN two of
+three, NIT one of one. Every finder also has a general mandate besides its
+angle.
 """
 enum Depth {
   QUICK
@@ -239,8 +240,9 @@ type Screened {
   """
   dropped: [String!]! = []
   """
-  Findings merged into another as duplicates, each as "<where> (<finder>)
-  into <where>: <why>": exact ones by the screen, the rest by the triage.
+  Findings merged into another as duplicates: "<where> (<finder>) into
+  <where>: identical" for each exact one the screen merged, and "<where>
+  (<finders>), ... into <where>: <why>" for each group the triage merged.
   """
   merged: [String!]! = []
   """
@@ -278,6 +280,10 @@ type Judged {
 """
 How a depth runs: finder angles, and voters and quorum per severity a
 finding is voted on at (the finder's, or the highest of a merged group's).
+A tier's tie-break voters are asked only when the first voters split short
+of the quorum and the tie-break could still reach it, so "2 voters, quorum
+2, 1 tie-break" decides like two of three at the cost of two when they
+agree.
 """
 type Plan {
   angles: [String!]!
@@ -285,6 +291,7 @@ type Plan {
   importantQuorum: Int!
   concernVoters: Int!
   concernQuorum: Int!
+  concernTieBreak: Int!
   nitVoters: Int!
   nitQuorum: Int!
   """
@@ -312,6 +319,7 @@ type Reviewer {
   let replayFinders: [String!]! = []
   let replayTriage: String! = ""
   let replayVoters: [String!]! = []
+  let replayTieBreaks: [String!]! = []
   let replaySynthesis: String! = ""
 
   # Public for self-calls, roles or checks; never tools.
@@ -418,8 +426,8 @@ type Reviewer {
     """
     QUICK (one finder, one voter per finding), STANDARD (three finders;
     three voters for an IMPORTANT finding, two of them must confirm; two for
-    a CONCERN, both must; one for a NIT) or DEEP (five finders; five, three
-    and one voters, quorums three, two and one).
+    a CONCERN, both must, with a third on a split; one for a NIT) or DEEP
+    (five finders; five, three and one voters, quorums three, two and one).
     """
     depth: Depth! = Depth.STANDARD,
   ): Reviewer! @cache(policy: FunctionCachePolicy.Never) {
@@ -472,13 +480,32 @@ type Reviewer {
     } else {
       runAgents(headWs, voterExp, voterNames, voterTasks, replayVoters)
     }
-    let judged = judge(plan, screened.kept, votes)
+    # A split a tier can still settle gets its tie-break voters, all at once.
+    let splits = tieBreaks(plan, screened.kept, votes)
+    let breakNames: [String!]! = []
+    let breakTasks: [String!]! = []
+    splits.each { b =>
+      let f = voted[b.index]
+      if (f != null) {
+        let task = voterTask(f, s)
+        voterSlots(b.extra).each { j =>
+          breakNames += [`voter-${toString(b.index + 1)}-${toString(votersFor(plan, f.severity) + j + 1)}`]
+          breakTasks += [task]
+        }
+      }
+    }
+    let breaks = if (breakNames.isEmpty) {
+      [] :: [String!]!
+    } else {
+      runAgents(headWs, voterExp, breakNames, breakTasks, replayTieBreaks)
+    }
+    let judged = judge(plan, screened.kept, votes, breaks)
 
     # 4. Sum up: one sub-agent, no vote.
     let synthesis = runAgents(headWs, synthExp, ["synthesizer"], [synthesisTask(s, reportable(s, judged.confirmed), screened.checked)], [replaySynthesis])[0] ?? ""
 
     # 5. Reconciliation and the summary.
-    let ran = agentCounts(plan.angles.length, screened.triaged, votes.length, true)
+    let ran = agentCounts(plan.angles.length, screened.triaged, votes.length + breaks.length, true)
     let next = settle(s, plan, screened, judged, synthesis, composedFrom, ran, "")
     print(next.lastSummary)
     next
@@ -546,6 +573,8 @@ type Reviewer {
   (omitted: nothing is merged beyond exact duplicates, as when no triage
   runs). `voterReplies` holds, for each finding left after the triage in
   order, as many voter replies as its severity's tier at the depth asks;
+  `tieBreakReplies`, for each finding whose voters split short of a quorum
+  their tier's tie-break could still reach, in order, that many more.
   `synthesisReply` is the synthesizer's (omitted: no synthesis section).
   Plumbing; public so the deterministic half of the pipeline can be checked
   without a model.
@@ -559,6 +588,7 @@ type Reviewer {
     finderReplies: [String!]!,
     triageReply: String = null,
     voterReplies: [String!]!,
+    tieBreakReplies: [String!]! = [],
     synthesisReply: String = null,
   ): Reviewer! {
     let s = prepare(source, head, base, briefing)
@@ -566,25 +596,27 @@ type Reviewer {
     let evidenced = screen(s, plan, finderReplies)
     let triageRan: String = if (evidenced.kept.length < 2) { null } else { triageReply }
     let screened = applyTriage(s, evidenced, triageRan)
-    let judged = judge(plan, screened.kept, voterReplies)
-    let ran = agentCounts(finderReplies.length, screened.triaged, voterReplies.length, synthesisReply != null)
+    let judged = judge(plan, screened.kept, voterReplies, tieBreakReplies)
+    let ran = agentCounts(finderReplies.length, screened.triaged, voterReplies.length + tieBreakReplies.length, synthesisReply != null)
     settle(s, plan, screened, judged, synthesisReply, ["(canned replies)"], ran, "")
   }
 
   """
   Make `review` spawn its sub-agents on `recording/` models that replay the
   given final replies, in spawn order (the triage, when two or more
-  findings hold; voters: per finding, in order; then the synthesizer). The
+  findings hold; voters: per finding, in order; tie-break voters, per split
+  finding, in order; then the synthesizer). The
   recordings reproduce each sub-agent's history, so `origin` must name the
   agent whose turn sends the tasks ("" for none). Plumbing for the
   recorded-turn pipeline check.
   """
-  withRecordedReplies(origin: String!, finders: [String!]!, voters: [String!]!, synthesis: String! = "", triageReply: String! = ""): Reviewer! {
+  withRecordedReplies(origin: String!, finders: [String!]!, voters: [String!]!, synthesis: String! = "", triageReply: String! = "", tieBreakers: [String!]! = []): Reviewer! {
     self.replaying = true
     self.replayOrigin = origin
     self.replayFinders = finders
     self.replayTriage = triageReply
     self.replayVoters = voters
+    self.replayTieBreaks = tieBreakers
     self.replaySynthesis = synthesis
     self
   }
@@ -778,7 +810,7 @@ type Reviewer {
       notes += ["Triage: " + screened.triageNote]
     }
     if (!screened.merged.isEmpty) {
-      notes += [`Merged as duplicates (${toString(screened.merged.length)}): ` + screened.merged.join("; ")]
+      notes += ["Merged as duplicates: " + screened.merged.join("; ")]
     }
     if (!dropped.isEmpty) {
       notes += [`Dropped by the evidence checks (${toString(dropped.length)}): ` + dropped.join("; ")]
@@ -935,28 +967,53 @@ let planFor(depth: Depth!): Plan! {
   case (depth) {
     Depth.QUICK => Plan(
       angles: ["general"],
-      importantVoters: 1, importantQuorum: 1, concernVoters: 1, concernQuorum: 1, nitVoters: 1, nitQuorum: 1,
+      importantVoters: 1, importantQuorum: 1, concernVoters: 1, concernQuorum: 1, concernTieBreak: 0, nitVoters: 1, nitQuorum: 1,
       maxVoted: 8,
       label: "QUICK depth (1 voter per finding)",
     )
     Depth.DEEP => Plan(
       angles: ["general", "behavior", "design", "correctness", "security"],
-      importantVoters: 5, importantQuorum: 3, concernVoters: 3, concernQuorum: 2, nitVoters: 1, nitQuorum: 1,
+      importantVoters: 5, importantQuorum: 3, concernVoters: 3, concernQuorum: 2, concernTieBreak: 0, nitVoters: 1, nitQuorum: 1,
       maxVoted: 20,
       label: "DEEP depth (votes needed: important 3 of 5, concern 2 of 3, nit 1 of 1)",
     )
     else => Plan(
       angles: ["general", "behavior", "design"],
-      importantVoters: 3, importantQuorum: 2, concernVoters: 2, concernQuorum: 2, nitVoters: 1, nitQuorum: 1,
+      importantVoters: 3, importantQuorum: 2, concernVoters: 2, concernQuorum: 2, concernTieBreak: 1, nitVoters: 1, nitQuorum: 1,
       maxVoted: 12,
-      label: "STANDARD depth (votes needed: important 2 of 3, concern 2 of 2, nit 1 of 1)",
+      label: "STANDARD depth (votes needed: important 2 of 3, concern 2 of 2 or 2 of 3 on a split, nit 1 of 1)",
     )
   }
 }
 
+# Tie-break voters a severity's tier asks for on a split.
+let tieBreakFor(plan: Plan!, severity: Severity!): Int! {
+  if (severity == Severity.CONCERN) { plan.concernTieBreak } else { 0 }
+}
+
+# The voted findings (by index) whose first voters split short of their
+# tier's quorum while its tie-break voters could still reach it, each with
+# how many tie-break voters to ask.
+let tieBreaks(plan: Plan!, kept: [Finding!]!, votes: [String!]!): [{{index: Int!, extra: Int!}}!]! {
+  let out: [{{index: Int!, extra: Int!}}!]! = []
+  let offset = 0
+  kept.takeFirst(plan.maxVoted).each { f, i =>
+    let asked = votersFor(plan, f.severity)
+    let quorum = quorumFor(plan, f.severity)
+    let extra = tieBreakFor(plan, f.severity)
+    let yes = votes.dropFirst(offset).takeFirst(asked).filter { r => parseVote(r).confirm }.length
+    offset += asked
+    if (extra > 0 and yes > 0 and yes < quorum and yes + extra >= quorum) {
+      out += [{{index: i, extra: extra}}]
+    }
+  }
+  out
+}
+
 # Voters per finding by the severity it is voted on at: a bug or
 # regression is worth three independent checks, a design question two
-# that must agree, a quick fix one. PREEXISTING is never voted on as such.
+# (and a tie-break when they split), a quick fix one. PREEXISTING is never
+# voted on as such.
 let votersFor(plan: Plan!, severity: Severity!): Int! {
   if (severity == Severity.NIT) {
     plan.nitVoters
@@ -1329,9 +1386,12 @@ let applyTriage(s: Subject!, screened: Screened!, reply: String): Screened! {
         let rep = kept[g.keep] ?? f
         let others = g.members.filter { m => m != g.keep }.map { m => kept[m] ?? f }
         let why = if (g.why == "") { "the same problem" } else { clip(g.why, maxWhyChars) }
-        others.each { o =>
-          merged += [`${o.path}:${toString(o.line)} (${o.finder}) into ${rep.path}:${toString(rep.line)}: ${why}`]
+        let wheres = others.map { o => `${o.path}:${toString(o.line)}` }.uniq
+        let absorbed = wheres.map { w =>
+          let by = others.filter { o => `${o.path}:${toString(o.line)}` == w }.map { o => o.finder }.uniq
+          `${w} (${by.join(", ")})`
         }
+        merged += [`${absorbed.join(", ")} into ${rep.path}:${toString(rep.line)}: ${why}`]
         out += [mergeGroup(s, rep, others)]
       }
     } else {
@@ -1344,7 +1404,7 @@ let applyTriage(s: Subject!, screened: Screened!, reply: String): Screened! {
   )
 }
 
-let maxWhyChars: Int! = 80
+let maxWhyChars: Int! = 60
 
 let decodeTriage(body: String!): [{{findings: [Int!], keep: Int, why: String}}!]! {
   let p: {{groups: [{{findings: [Int!], keep: Int, why: String}}!]}}! = JSON.decode(body)
@@ -1411,21 +1471,29 @@ let severityRank(severity: Severity!): Int! {
 
 # Step 3's tally: a finding is confirmed when its severity tier's quorum of
 # its voters confirm it (votes come in order, as many per finding as its
-# tier asks). Its severity is the voters' most common call (ties keep the
-# finder's), but voters can raise it only to a tier whose quorum their
+# tier asks; `breaks` holds the tie-break votes, in order, for the findings
+# tieBreaks picks). Its severity is the voters' most common call (ties keep
+# the finder's), but voters can raise it only to a tier whose quorum their
 # confirmations meet: one nit voter calling it IMPORTANT does not make it
 # so. One with no cited location in a hunk is PREEXISTING unless that
 # quorum of its voters also say the change caused it.
-let judge(plan: Plan!, kept: [Finding!]!, votes: [String!]!): Judged! {
+let judge(plan: Plan!, kept: [Finding!]!, votes: [String!]!, breaks: [String!]!): Judged! {
   let confirmed: [Finding!]! = []
   let belowQuorum: [String!]! = []
+  let split = tieBreaks(plan, kept, votes)
   let offset = 0
+  let breakOffset = 0
   kept.takeFirst(plan.maxVoted).each { f, i =>
-    let asked = votersFor(plan, f.severity)
+    let first = votersFor(plan, f.severity)
     let quorum = quorumFor(plan, f.severity)
-    let mine = votes.dropFirst(offset).takeFirst(asked).map { r => parseVote(r) }
-    offset += asked
-    let yes = mine.filter { v => v.confirm }
+    let mine = votes.dropFirst(offset).takeFirst(first)
+    offset += first
+    let extras = split.filter { b => b.index == i }.map { b => b.extra }
+    let extra = extras[0] ?? 0
+    let more = breaks.dropFirst(breakOffset).takeFirst(extra)
+    breakOffset += extra
+    let asked = first + more.length
+    let yes = (mine + more).map { r => parseVote(r) }.filter { v => v.confirm }
     if (yes.length >= quorum) {
       let said = judgedSeverity(f.severity, yes.map { v => v.severity })
       let called = if (quorumFor(plan, said) > yes.length) { f.severity } else { said }
