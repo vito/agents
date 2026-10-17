@@ -53,7 +53,9 @@
 # when the item is vetted "sound" (the author confirms it holds), or when
 # the item is unvetted and the judge's majority is false or speed-bump;
 # otherwise the judge's value stands. Sound items take a `vetted` label as
-# issues do: null, "sound" or "dismiss" (not a trap at all).
+# issues do: null, "sound" or "dismiss" (not a trap at all, and not shown
+# to the judge). A later contradiction of the same item is a duplicate
+# unless the item is vetted sound.
 # checkReviewerEvalScoring covers it on canned judge replies.
 #
 # The functions that call models (reviewerEval, reviewerEvalScore in
@@ -394,6 +396,18 @@ let reviewerEvalInvoke(source: Workspace!, agents: [String!]!, input: Directory!
     .contents
 }
 
+# What the judge sees of a case (see renderCase in reviewer-eval/): the
+# vetting note applied, and no sound item vetted "dismiss", which is no
+# trap and so must not be shown as correct.
+let reviewerEvalJudgeCase(c: ReviewerEvalCase!): String! {
+  JSON.encode({{
+    title: c.title,
+    pr: c.pr,
+    issues: c.issues.map { i => {{key: i.key, kind: i.kind, locations: i.locations, summary: i.summary}} },
+    sound: c.sound.filter { s => (s.vetted ?? "") != "dismiss" }.map { s => {{key: s.key, summary: s.summary}} },
+  }})
+}
+
 # Score a review's text: judge it (model calls), then the arithmetic.
 # `meta` is extra provenance for the scorecard, as name/value pairs.
 let scoreReviewerEvalText(
@@ -414,7 +428,7 @@ let scoreReviewerEvalText(
   }
   let slots = [1, 2, 3, 4, 5, 6, 7, 8, 9].takeFirst(samples)
   let input = directory
-    .withFile("case.json", source.file(reviewerEvalCasePath(name)))
+    .withNewFile("case.json", reviewerEvalJudgeCase(c))
     .withNewFile("review.md", review)
     .withNewFile("params.json", JSON.encode({{slots: slots, model: judgeModel, nonce: Random.string}}))
   let judged: {{model: String!, findings: [String!]!, judgements: [String!]!}}! = JSON.decode(
@@ -615,7 +629,12 @@ let reviewerEvalScorecard(
     } else if (soundKeys.contains(match)) {
       let vettedSound = reviewerEvalSoundVettedOf(c, match)
       let judgedValue = value
-      let o = reviewerEvalSoundOverride(vettedSound, judgedValue)
+      let soundAgain = vettedSound != "sound" and contradictions.any { s => s.key == match }
+      let o = if (soundAgain) {
+        {{value: "duplicate", note: "sound-contradiction, an earlier finding contradicted this item"}}
+      } else {
+        reviewerEvalSoundOverride(vettedSound, judgedValue)
+      }
       contradictions += [{{
         finding: i + 1, key: match, vetted: if (vettedSound == "") { "unvetted" } else { vettedSound },
         judged: judgedValue, value: o.value,
@@ -1002,19 +1021,20 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert(message: card.text) { card.text.contains("1/7 findings unanimous") and card.text.contains("judge: canned") }
 
   # Sound contradictions, three samples each: only a vetted-sound item, or
-  # a speed bump against an unvetted one, makes a finding false; none of
-  # them is recall.
+  # a speed bump against an unvetted one, makes a finding false; a second
+  # contradiction of an item that is not vetted sound is a duplicate; none
+  # of them is recall.
   #   1: s/guidance x3                        -> unvetted: guidance stands
-  #   2: s/speed-bump s/speed-bump s/guidance -> unvetted speed bump: false
-  #   3: t/guidance x3                        -> vetted sound: false
-  #   4: u/speed-bump x3                      -> vetted dismiss: speed-bump stands
-  #   5: u/guardrail t/guardrail u/guardrail  -> u, vetted dismiss: guardrail stands
+  #   2: t/guidance x3                        -> vetted sound: false
+  #   3: u/speed-bump x3                      -> vetted dismiss: speed-bump stands
+  #   4: s/speed-bump s/speed-bump s/guidance -> s again: duplicate
+  #   5: t/guardrail u/guardrail t/guardrail  -> t again, vetted sound: false
   let soundReplies = [
-    ["guidance", "speed-bump", "guidance", "speed-bump", "guardrail"],
-    ["guidance", "speed-bump", "guidance", "speed-bump", "guardrail"],
-    ["guidance", "guidance", "guidance", "speed-bump", "guardrail"],
+    ["guidance", "guidance", "speed-bump", "speed-bump", "guardrail"],
+    ["guidance", "guidance", "speed-bump", "speed-bump", "guardrail"],
+    ["guidance", "guidance", "speed-bump", "guidance", "guardrail"],
   ].map { vs, k =>
-    let keys = ["s", "s", "t", "u", if (k == 1) { "t" } else { "u" }]
+    let keys = ["s", "t", "u", "s", if (k == 1) { "u" } else { "t" }]
     "{\"judgements\": [" + vs.map { v, j => reviewerEvalVote(j + 1, keys[j] ?? "none", v, false) }.join(", ") + "]}"
   }
   let soundCard = reviewerEvalScorecard(good, "canned", "x", ["one", "two", "three", "four", "five"], soundReplies, reviewerEvalNoMeta)
@@ -1025,27 +1045,35 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     judged: [{{value: String!, match: String!}}!]!,
   }}! = JSON.decode(soundCard.json)
   let smsg = soundCard.text + "\n" + soundCard.json
-  assert(message: smsg) { sc.judged.map { f => f.match } == ["s", "s", "t", "u", "u"] and sc.matched == [] }
-  assert(message: smsg) { sc.judged.map { f => f.value } == ["guidance", "false", "false", "speed-bump", "guardrail"] }
-  # guidance +1, false -2, false -2, speed-bump -1, guardrail +3: -1.
-  assert(message: smsg) { sc.headline.valueScore == -1 and sc.headline.noise == 3 and sc.headline.speedBumps == 1 and sc.headline.falseFindings == 2 }
+  assert(message: smsg) { sc.judged.map { f => f.match } == ["s", "t", "u", "s", "t"] and sc.matched == [] }
+  assert(message: smsg) { sc.judged.map { f => f.value } == ["guidance", "false", "speed-bump", "duplicate", "false"] }
+  # guidance +1, false -2, speed-bump -1, duplicate -1, false -2: -5.
+  assert(message: smsg) { sc.headline.valueScore == -5 and sc.headline.noise == 3 and sc.headline.speedBumps == 1 and sc.headline.falseFindings == 2 }
   assert(message: smsg) {
     sc.soundContradictions == [
       {{finding: 1, key: "s", vetted: "unvetted", judged: "guidance", value: "guidance"}},
-      {{finding: 2, key: "s", vetted: "unvetted", judged: "speed-bump", value: "false"}},
-      {{finding: 3, key: "t", vetted: "sound", judged: "guidance", value: "false"}},
-      {{finding: 4, key: "u", vetted: "dismiss", judged: "speed-bump", value: "speed-bump"}},
-      {{finding: 5, key: "u", vetted: "dismiss", judged: "guardrail", value: "guardrail"}},
+      {{finding: 2, key: "t", vetted: "sound", judged: "guidance", value: "false"}},
+      {{finding: 3, key: "u", vetted: "dismiss", judged: "speed-bump", value: "speed-bump"}},
+      {{finding: 4, key: "s", vetted: "unvetted", judged: "speed-bump", value: "duplicate"}},
+      {{finding: 5, key: "t", vetted: "sound", judged: "guardrail", value: "false"}},
     ]
   }
   assert(message: smsg) {
-    soundCard.text.contains("sound contradictions: #1 s (unvetted): guidance, #2 s (unvetted): speed-bump -> false, " +
-      "#3 t (sound): guidance -> false, #4 u (dismiss): speed-bump, #5 u (dismiss): guardrail")
+    soundCard.text.contains("sound contradictions: #1 s (unvetted): guidance, #2 t (sound): guidance -> false, " +
+      "#3 u (dismiss): speed-bump, #4 s (unvetted): speed-bump -> duplicate, #5 t (sound): guardrail -> false")
   }
   assert(message: smsg) { soundCard.text.contains("#1 guidance · s (sound-contradiction, unvetted: judged on its value)") }
-  assert(message: smsg) { soundCard.text.contains("#2 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
-  assert(message: smsg) { soundCard.text.contains("#3 false · t (sound-contradiction, vetted sound)") }
-  assert(message: smsg) { soundCard.text.contains("#4 speed-bump · u (sound-contradiction, vetted dismiss: judged on its value)") }
+  assert(message: smsg) { soundCard.text.contains("#2 false · t (sound-contradiction, vetted sound)") }
+  assert(message: smsg) { soundCard.text.contains("#3 speed-bump · u (sound-contradiction, vetted dismiss: judged on its value)") }
+  assert(message: smsg) { soundCard.text.contains("#4 duplicate · s (sound-contradiction, an earlier finding contradicted this item)") }
+  # A speed bump against an unvetted sound item counts as false.
+  let bump = reviewerEvalScorecard(good, "canned", "x", ["one"], ["{\"judgements\": [" + reviewerEvalVote(1, "s", "speed-bump", false) + "]}"], reviewerEvalNoMeta)
+  assert(message: bump.text) { bump.text.contains("#1 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
+  # The judge sees the case without the sound items vetted dismiss.
+  let judgeCase: {{title: String!, issues: [{{key: String!}}!]!, sound: [{{key: String!}}!]!}}! = JSON.decode(reviewerEvalJudgeCase(good))
+  assert(message: JSON.encode(judgeCase)) {
+    judgeCase.title == "Synthetic case" and judgeCase.issues.length == 5 and judgeCase.sound == [{{key: "s"}}, {{key: "t"}}]
+  }
 
   # Nothing vetted yet: the vetted line says so.
   let unvetted = decodeReviewerEvalCase(reviewerEvalSyntheticCase.replace("\"vetted\": \"real\"", "\"vetted\": null"))
