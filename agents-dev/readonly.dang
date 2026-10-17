@@ -131,6 +131,13 @@ let testContributorReadonly(source: Workspace!): String! {
     ["api", "repos/o/r/issues", "--raw-field=title=x"],
     ["api", "--input", "body.json", "repos/o/r/issues"],
     ["api", "graphql", "-f", "query=mutation { x }"],
+    # Combined short flags and decoys consumed as another flag's value.
+    ["api", "-iXPUT", "repos/o/r/pulls/1/merge"],
+    ["api", "-iX", "PUT", "repos/o/r/pulls/1/merge"],
+    ["api", "repos/o/r/issues", "-iftitle=x"],
+    ["api", "-XPUT", "repos/o/r/pulls/1/merge", "-q", "-XGET"],
+    ["api", "--method", "PUT", "repos/o/r/pulls/1/merge", "-H", "--method=GET"],
+    ["api", "repos/o/r/issues", "extra/positional"],
     ["api", "-X", "GET", "graphql", "-f", "query={ viewer { login } }"],
   ]
   writes.each { args =>
@@ -151,6 +158,7 @@ let testContributorReadonly(source: Workspace!): String! {
     ["issue", "list", "--repo", "cli/cli"],
     ["search", "issues", "readonly"],
     ["api", "repos/cli/cli"],
+    ["api", "-i", "--paginate", "repos/cli/cli/pulls", "-q", "-XPUT", "-H", "Accept: application/json"],
   ].each { args =>
     let result = ghResult(reader, ws, args)
     assert(message: args.join(" ") + ": " + result) { !readOnlyRefused(result) }
@@ -214,6 +222,11 @@ let testCommitterReadonly(source: Workspace!): String! {
   ["status", "diff", "commit", "reset", "log", "show", "cherryPick", "rebase"].each { n =>
     assert(message: roNames.join(", ")) { roNames.contains(n) }
   }
+  # Its prompt does not teach the push it lacks.
+  let roPrompts = systemTexts(ro).join("\n")
+  assert(message: roPrompts) { roPrompts.contains("`cherryPick` — take commits") }
+  assert(message: roPrompts) { !roPrompts.contains("`push` — publish") and !roPrompts.contains("call to publish") }
+  assert { systemTexts(full).join("\n").contains("`push` — publish") }
 
   # A tool that returns the conversation rebinds the toolset itself. Through
   # the read-only object, reset keeps push hidden; the same call through the
