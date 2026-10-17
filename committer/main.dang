@@ -1557,7 +1557,14 @@ type Committer {
       # Rewinding detached HEAD, so a bare `push` has no branch to go to:
       # spell out the call, branch included.
       let target = if (branch == "") { "<branch>" } else { branch }
-      `Rebased onto ${onto} (${short(ontoSha)}): HEAD ${short(oldHead)} -> ${short(newHead)}, ` + `${toString(onTop)} commit(s) on top. ` + (if (branch == "") { "HEAD is detached; " } else { `HEAD is detached from ${branch}; ` }) + `to publish, push(branch: "${target}", expectedRemoteSHA: "<the sha the remote branch has now>") — ` + `the lease is required because the branch's history was rewritten (${short(oldHead)} if nothing was pushed since).`
+      let detached = if (branch == "") { "HEAD is detached; " } else { `HEAD is detached from ${branch}; ` }
+      # The read-only role has no push: its work leaves through a harvest.
+      let publish = if (readOnlyMode) {
+        "in this read-only role your commits leave through whoever harvests them, not a push."
+      } else {
+        `to publish, push(branch: "${target}", expectedRemoteSHA: "<the sha the remote branch has now>") — ` + `the lease is required because the branch's history was rewritten (${short(oldHead)} if nothing was pushed since).`
+      }
+      `Rebased onto ${onto} (${short(ontoSha)}): HEAD ${short(oldHead)} -> ${short(newHead)}, ` + `${toString(onTop)} commit(s) on top. ` + detached + publish
     }
     let tools = currentNode.{{... on Dagger.Committer!}}.withoutRebaseState
     print((progress + [summary]).join("\n"))
