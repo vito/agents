@@ -129,6 +129,8 @@ let checkReviewerScreening: String! {
   assert(message: summary) { summary.contains("votes: 1/1 confirmed") }
   # The mechanical drops, each with its reason.
   assert(message: summary) { summary.contains("Dropped by the evidence checks (5):") }
+  # The duplicate is merged, and listed so a distinct claim is not lost.
+  assert(message: summary) { summary.contains("Merged into an earlier finding quoting the same code (1):\n  - calc.py:2 (general): " + reviewerDiscountClaim) }
   assert(message: summary) { summary.contains("calc.py:2 (general): style only (naming)") }
   assert(message: summary) { summary.contains("nope.py:1 (general): path does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:99 (general): line does not exist at head") }
@@ -293,6 +295,29 @@ let checkReviewerConcerns: String! {
     voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true)],
   ).lastSummary
   assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 nit" and sloppy.contains("though the change causes it") }
+
+  # A location's line given as text still reads ("2-3" is line 2); a line
+  # that reads as neither number nor text loses the locations, so the
+  # review is incomplete rather than a clean pass that closes findings.
+  let texted = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"findings\": [{\"severity\": \"CONCERN\", \"claim\": \"" + reviewerConcernClaim + "\", \"category\": \"design\", \"locations\": [{\"path\": \"calc.py\", \"line\": \"2-3\", \"evidence\": \"rate = percent / 10\"}]}]}"],
+    voterReplies: [reviewerCausedVote("CONFIRM", "CONCERN", true)],
+  ).lastSummary
+  assert(message: texted) { (texted.split("\n")[0] ?? "") == "1 concern" and texted.contains("- calc.py:2 — " + reviewerConcernClaim) }
+  let unreadable = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"findings\": [{\"severity\": \"CONCERN\", \"claim\": \"x\", \"category\": \"design\", \"locations\": [{\"path\": \"calc.py\", \"line\": {\"from\": 2}, \"evidence\": \"rate = percent / 10\"}]}]}"],
+    voterReplies: [],
+  ).lastSummary
+  assert(message: unreadable) { (unreadable.split("\n")[1] ?? "").hasPrefix("Incomplete: a finder did not answer") }
+  assert(message: unreadable) { unreadable.contains("finder \"general\": its findings' locations could not be read") and unreadable.contains("(no location) (general): no location") }
 
   # With nothing found, the synthesis still leads; a prose or failed
   # synthesizer reply is shown for what it is.
