@@ -139,6 +139,36 @@ type AgentsDev {
     null
   }
 
+  """Check the reviewer's evidence checks, severity tagging from hunks, REVIEW.md skips and nit cap, and summary wording (empty case too), on canned replies."""
+  reviewerScreening: Void @check {
+    print(checkReviewerScreening)
+    null
+  }
+
+  """Check reviewer fingerprints survive line shifts, and re-reviews reconcile: unreproduced findings FIXED, resolved ones kept RESOLVED."""
+  reviewerReconcile: Void @check {
+    print(checkReviewerReconcile)
+    null
+  }
+
+  """Check reviewer sub-agents inherit the caller's composition minus staff and reviewer, with read-only contributor and committer, plus the role."""
+  reviewerComposition(source: Workspace!): Void @check {
+    print(checkReviewerComposition(source))
+    null
+  }
+
+  """Check the reviewer's tools: review, findingsList and resolve; roles and plumbing stay out."""
+  reviewerTools(source: Workspace!): Void @check {
+    print(checkReviewerTools(source))
+    null
+  }
+
+  """Check the whole review pipeline on recorded sub-agent turns: parallel finders, evidence checks, voters, severity and the summary."""
+  reviewerPipeline(source: Workspace!): Void @check {
+    print(checkReviewerPipeline(source))
+    null
+  }
+
   """Check sandbox sessions: exec, change extraction, continued and fresh sessions."""
   sandboxSessions(source: Workspace!): Void @check {
     print(testSandboxSessions(source: source))

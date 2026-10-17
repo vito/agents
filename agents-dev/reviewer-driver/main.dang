@@ -1,0 +1,134 @@
+# reviewer-driver: the recorded-turn pipeline check for the reviewer module,
+# run by agents-dev's reviewerPipeline as a module of a plain-directory
+# fixture workspace (this module, reviewer, committer and contributor).
+#
+# A plain directory on purpose: the engine gates LLM.loop/step made from a
+# git-sourced module behind an interactive "Allow LLM access?" prompt
+# (core/llm.go LLM.allowed), which a check cannot answer. An agent's loop
+# runs under the client that started it, so the sub-agents must be spawned
+# and sent their tasks from modules loaded here, not from agents-dev.
+#
+# No model is called: reviewer's withRecordedReplies makes `review` spawn
+# each finder and voter on a `recording/` model that replays its history and
+# a canned final reply. Everything else is the real pipeline: composition
+# from the caller's record, parallel finders, mechanical evidence checks,
+# voters, severity from hunks, and the summary.
+type ReviewerDriver {
+  """
+  A STANDARD review of a fixture range: three finders in parallel (one
+  finding duplicated across two finders, one with evidence that is not in
+  the file), three voters for each surviving finding, and the summary.
+  """
+  pipeline(source: Workspace!): Void @check {
+    let repo = container
+      .from("alpine:3.22")
+      .withExec(["apk", "add", "--no-cache", "git"])
+      .withWorkdir("/repo")
+      .withExec(["sh", "-eu", "-c", fixtureScript])
+      .directory("/repo")
+      .asGit
+    let entries = entriesAt(source, "dag://committer/agent")
+      + entriesAt(source, "dag://contributor/agent")
+      + entriesAt(source, "dag://reviewer/agent")
+    # The recorded task messages carry the attribution header of whichever
+    # agent runs this check (CallerAgent propagates into module calls).
+    let from = callingAgentName("reviewer-origin-probe")
+    let chief = llm.withWorkspace(source).spawn(name: "review-chief", expertise: entries)
+
+    let discount = finding("calc.py", 2, discountClaim, "rate = percent / 10", "correctness")
+    let finders = [
+      findings([discount, finding("calc.py", 2, "percent is divided by one hundred too often", "rate = percent / 100", "correctness")]),
+      findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security")]),
+      findings([discount, finding("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "fit")]),
+    ]
+    let voters = [
+      vote("CONFIRM"), vote("CONFIRM"), vote("CONFIRM"),
+      vote("CONFIRM"), vote("REJECT"), vote("CONFIRM"),
+      vote("REJECT"), vote("REJECT"), vote("CONFIRM"),
+    ]
+    # One selection, so the uncached review runs exactly once.
+    let out = reviewer
+      .withRecordedReplies(origin: from, finders: finders, voters: voters)
+      .review(caller: chief, source: source, head: repo.branch("feature"), base: repo.branch("main"), depth: ReviewerDepth.STANDARD)
+      .{{ summary: lastSummary, open: findingsList(status: ReviewerFindingStatus.OPEN) }} rescue {
+        e: Error => {
+          chief.stop
+          raise "review failed: " + e.message
+        }
+      }
+    chief.stop
+
+    let summary = out.summary
+    print(summary)
+    assert(message: summary) { (summary.split("\n")[0] ?? "") == "1 important, 1 pre-existing" }
+    assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim) }
+    assert(message: summary) { summary.contains("votes: 3/3 confirmed · correctness (correctness)") }
+    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim) and summary.contains("votes: 2/3 confirmed · security (security)") }
+    assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") and summary.contains("quoted evidence does not appear") }
+    assert(message: summary) { summary.contains("Below quorum (2 of 3): calc.py:8 (1/3 confirmed)") }
+    assert(message: summary) { !summary.contains("failed:") }
+    # The output names what the sub-agents were composed from.
+    let composedLines = summary.split("\n").filter { l => l.hasPrefix("Sub-agents composed from: ") }
+    let composed = composedLines[0] ?? ""
+    ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/voter"].each { u =>
+      assert(message: composed) { composed.contains(u) }
+    }
+    ["committer/agent", "contributor/agent", "reviewer/agent"].each { u =>
+      assert(message: composed) { !composed.contains(u) }
+    }
+    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 2 }
+    null
+  }
+}
+
+let discountClaim: String! = "percent / 10 divides by ten instead of a hundred, so a 50 percent discount takes off five times the total"
+let evalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
+
+let fixtureScript: String! = """
+  git init -q -b main
+  git config user.name 'Review Test'
+  git config user.email review@example.com
+  export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+  export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+  printf '%s\n' 'def total(items):' '    result = 0' '    for item in items:' '        result += item.price' '    return result' '' 'def one():' '    return 1' '' 'def two():' '    return 2' '' 'def legacy(x):' '    return eval(x)' > calc.py
+  git add .
+  git commit -q -m 'fixture: base'
+  git checkout -q -b feature
+  { printf '%s\n' 'def discount(total, percent):' '    rate = percent / 10' '    return total - total * rate' ''; cat calc.py; } > calc.new
+  mv calc.new calc.py
+  git commit -q -am 'calc: add discount'
+"""
+
+let finding(path: String!, line: Int!, claim: String!, evidence: String!, category: String!): String! {
+  JSON.encode({{path: path, line: line, claim: claim, evidence: evidence, category: category, severity: "IMPORTANT"}})
+}
+
+let findings(items: [String!]!): String! {
+  "{\"findings\": [" + items.join(", ") + "]}"
+}
+
+let vote(verdict: String!): String! {
+  JSON.encode({{verdict: verdict, severity: "IMPORTANT", reason: "checked in the workspace"}})
+}
+
+let entriesAt(ws: Workspace!, uri: String!): [Expertise!]! {
+  ws.artifacts.filterUri(uri: uri).asExpertise.{{ id }}.map { node(id: _.id).{{ ... on Expertise! }} }
+}
+
+# The name of the agent on whose behalf this code runs, as a send from here
+# attributes it, or "" when no agent is calling. A throwaway agent with an
+# empty recording receives one message (its first step then fails) and the
+# recorded message's origin names the sender.
+let callingAgentName(label: String!): String! {
+  let probe = llm.withModel("recording/" + "[]".toBase64).spawn(name: label)
+  probe.send("who is calling?")
+  probe.wait
+  let msgs = probe.snapshot.sync.messages.{{ id }}
+  probe.stop
+  let first = msgs[0]
+  if (first == null) {
+    raise "the origin probe recorded no message"
+  }
+  let name = node(id: first.id).{{ ... on LLMMessage! }}.origin.agentName rescue { e: Error => "" }
+  name ?? ""
+}

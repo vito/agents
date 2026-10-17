@@ -1,0 +1,328 @@
+# Reviewer checks without model calls. tallyReplies runs everything `review`
+# does after its sub-agents reply (evidence checks, voting, severity,
+# reconciliation, the summary) on canned replies; composition and the tool
+# surface are inspected directly. The recorded-turn pipeline check, which
+# does spawn sub-agents, runs through agents-dev/reviewer-driver.
+
+# A git fixture: `main`, `feature` (adds discount() on top of calc.py, which
+# keeps a pre-existing eval far from the change, plus a file REVIEW.md
+# skips), and `shifted` (feature plus three lines at the top of calc.py, so
+# every line below moves).
+let reviewerFixture: {{main: GitRef!, feature: GitRef!, shifted: GitRef!}}! {
+  let repo = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", reviewerFixtureScript])
+    .directory("/repo")
+    .asGit
+  {{main: repo.branch("main"), feature: repo.branch("feature"), shifted: repo.branch("shifted")}}
+}
+
+let reviewerFixtureScript: String! = """
+  git init -q -b main
+  git config user.name 'Review Test'
+  git config user.email review@example.com
+  export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+  export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+  printf '%s\n' 'def total(items):' '    result = 0' '    for item in items:' '        result += item.price' '    return result' '' 'def one():' '    return 1' '' 'def two():' '    return 2' '' 'def legacy(x):' '    return eval(x)' > calc.py
+  printf '%s\n' '# Review rules' '' '- skip: generated/**' '- nit cap: 1' > REVIEW.md
+  printf '%s\n' 'Money is always a Decimal.' > CLAUDE.md
+  mkdir generated
+  echo one > generated/out.txt
+  git add .
+  git commit -q -m 'fixture: base'
+  git checkout -q -b feature
+  { printf '%s\n' 'def discount(total, percent):' '    rate = percent / 10' '    return total - total * rate' ''; cat calc.py; } > calc.new
+  mv calc.new calc.py
+  echo two > generated/out.txt
+  git commit -q -am 'calc: add discount'
+  git checkout -q -b shifted
+  { printf '%s\n' '# calc: pricing helpers' '# (header added later)' ''; cat calc.py; } > calc.new
+  mv calc.new calc.py
+  git commit -q -am 'calc: add a header'
+"""
+
+# One finding as a finder reports it.
+let reviewerFindingJson(path: String!, line: Int!, claim: String!, evidence: String!, category: String!, severity: String!): String! {
+  JSON.encode({{path: path, line: line, claim: claim, evidence: evidence, category: category, severity: severity}})
+}
+
+let reviewerFindingsReply(findings: [String!]!): String! {
+  "{\"findings\": [" + findings.join(", ") + "]}"
+}
+
+let reviewerVote(verdict: String!, severity: String!): String! {
+  JSON.encode({{verdict: verdict, severity: severity, reason: "checked"}})
+}
+
+# The fingerprint findingsList prints for the finding at `where` (path:line).
+let reviewerFingerprintAt(listing: String!, where: String!): String! {
+  let pattern = "  " + where.replace(".", "\\.") + "  \\[([0-9a-f]+)\\]"
+  let m = listing.match(pattern :: Regexp!)
+  if (m != null) { m.captures[0] ?? "" } else { "" }
+}
+
+let reviewerDiscountClaim: String! = "percent / 10 divides by ten instead of a hundred, so a 50 percent discount takes off five times the total"
+let reviewerEvalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
+
+let checkReviewerScreening: String! {
+  let fx = reviewerFixture
+  let finder = reviewerFindingsReply([
+    # Real, cited one line off: anchored where the evidence is (line 2).
+    reviewerFindingJson("calc.py", 3, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+    # The same finding again: one finding.
+    reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+    # Real nits; whitespace in the quote does not matter. The cap is 1.
+    reviewerFindingJson("calc.py", 3, "the parameter total shadows the function total, so discount cannot call it", "  return total -   total * rate ", "correctness", "NIT"),
+    reviewerFindingJson("calc.py", 1, "discount does not validate percent, so a negative value raises the price", "def discount(total, percent):", "correctness", "NIT"),
+    # Pre-existing: outside every hunk. Multi-line quote, read-tool prefixes.
+    reviewerFindingJson("calc.py", 18, reviewerEvalClaim, "    17→def legacy(x):\n    18→    return eval(x)", "security", "IMPORTANT"),
+    # Real but voted down.
+    reviewerFindingJson("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "correctness", "IMPORTANT"),
+    # Dropped mechanically.
+    reviewerFindingJson("calc.py", 2, "rate is a vague name", "rate = percent / 10", "naming", "NIT"),
+    reviewerFindingJson("nope.py", 1, "nope.py is broken", "x = 1", "correctness", "IMPORTANT"),
+    reviewerFindingJson("calc.py", 99, "line 99 is broken", "rate = percent / 10", "correctness", "IMPORTANT"),
+    reviewerFindingJson("calc.py", 18, "legacy evaluates y", "return eval(y)", "security", "IMPORTANT"),
+    reviewerFindingJson("generated/out.txt", 1, "generated output is stale", "two", "correctness", "IMPORTANT"),
+  ])
+  let votes = [
+    reviewerVote("CONFIRM", "IMPORTANT"),
+    reviewerVote("CONFIRM", "NIT"),
+    "CONFIRM. It is a nit.",
+    reviewerVote("CONFIRM", "IMPORTANT"),
+    reviewerVote("REJECT", "IMPORTANT"),
+  ]
+  let reviewed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [finder],
+    voterReplies: votes,
+  )
+  let summary = reviewed.lastSummary
+  let open = reviewed.findingsList(status: ReviewerFindingStatus.OPEN)
+  let lines = summary.split("\n")
+  assert(message: summary) { (lines[0] ?? "") == "1 important, 1 nit, 1 pre-existing" }
+  # Severity sections in order, each finding as path:line with its claim.
+  assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim) }
+  assert(message: summary) { summary.contains("NIT:\n- calc.py:3 — the parameter total shadows") }
+  assert(message: summary) { summary.contains("PRE-EXISTING") and summary.contains("- calc.py:18 — " + reviewerEvalClaim) }
+  assert(message: summary) { summary.contains("votes: 1/1 confirmed") }
+  # The mechanical drops, each with its reason.
+  assert(message: summary) { summary.contains("Dropped by the evidence checks (5):") }
+  assert(message: summary) { summary.contains("calc.py:2 (general): style or cleanup only (naming)") }
+  assert(message: summary) { summary.contains("nope.py:1 (general): path does not exist at head") }
+  assert(message: summary) { summary.contains("calc.py:99 (general): line does not exist at head") }
+  assert(message: summary) { summary.contains("calc.py:18 (general): quoted evidence does not appear") }
+  assert(message: summary) { summary.contains("generated/out.txt:1 (general): path skipped per REVIEW.md") }
+  assert(message: summary) { summary.contains("Skipped per REVIEW.md: generated/out.txt") }
+  assert(message: summary) { summary.contains("Below quorum (1 of 1): calc.py:8 (0/1 confirmed)") }
+  assert(message: summary) { summary.contains("1 more nit over the nit cap (1) not reported.") }
+  assert(message: summary) { summary.contains("Reviewed ") and summary.contains("1 commit, 1 file changed, at QUICK depth") }
+  # State: exactly the three reported findings are OPEN.
+  assert(message: open) { open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 3 }
+  assert(message: open) { open.contains("OPEN  IMPORTANT  calc.py:2  [") and open.contains("OPEN  NIT  calc.py:3  [") and open.contains("OPEN  PREEXISTING  calc.py:18  [") }
+
+  # The empty case says so plainly.
+  let none = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["```json\n{\"findings\": []}\n```"],
+    voterReplies: [],
+  ).lastSummary
+  assert(message: none) { (none.split("\n")[0] ?? "") == "Nothing to fix." }
+  assert(message: none) { !none.contains("Answer every finding") }
+  # A reply without the JSON is reported, not silently empty.
+  let prose = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["Looks good to me!"],
+    voterReplies: [],
+  ).lastSummary
+  assert(message: prose) { (prose.split("\n")[0] ?? "") == "Nothing to fix." and prose.contains("finder \"general\" replied without the findings JSON") }
+  "Reviewer screening checks passed."
+}
+
+let checkReviewerReconcile: String! {
+  let fx = reviewerFixture
+  let first = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+      reviewerFindingJson("calc.py", 3, "the parameter total shadows the function total, so discount cannot call it", "return total - total * rate", "correctness", "NIT"),
+      reviewerFindingJson("calc.py", 18, reviewerEvalClaim, "return eval(x)", "security", "IMPORTANT"),
+    ])],
+    voterReplies: [reviewerVote("CONFIRM", "IMPORTANT"), reviewerVote("CONFIRM", "NIT"), reviewerVote("CONFIRM", "IMPORTANT")],
+  )
+  let before = first.findingsList(status: ReviewerFindingStatus.OPEN)
+  let discountFp = reviewerFingerprintAt(before, "calc.py:2")
+  let nitFp = reviewerFingerprintAt(before, "calc.py:3")
+  let evalFp = reviewerFingerprintAt(before, "calc.py:18")
+  assert(message: before) { discountFp != "" and nitFp != "" and evalFp != "" }
+
+  # resolve needs a reason and a known fingerprint.
+  let noReason = first.resolve(fingerprint: evalFp, reason: " ").lastSummary rescue { e: Error => e.message }
+  assert(message: noReason) { noReason.contains("needs a reason") }
+  let unknown = first.resolve(fingerprint: "000000000000", reason: "x").lastSummary rescue { e: Error => e.message }
+  assert(message: unknown) { unknown.contains("no finding with fingerprint") }
+  let resolved = first.resolve(fingerprint: evalFp, reason: "legacy only ever sees trusted input")
+
+  # Re-review after three lines were added above everything: the discount
+  # finding moved to line 5 and keeps its fingerprint, so it stays OPEN; the
+  # nit is not found again, so it is FIXED; the resolved eval finding is
+  # found again at line 21 and stays RESOLVED.
+  let again = resolved.tallyReplies(
+    source: fx.shifted.asWorkspace,
+    head: fx.shifted,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 5, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+      reviewerFindingJson("calc.py", 21, reviewerEvalClaim, "return eval(x)", "security", "IMPORTANT"),
+    ])],
+    voterReplies: [reviewerVote("CONFIRM", "IMPORTANT"), reviewerVote("CONFIRM", "IMPORTANT")],
+  )
+  let out = again.{{
+    summary: lastSummary,
+    open: findingsList(status: ReviewerFindingStatus.OPEN),
+    fixed: findingsList(status: ReviewerFindingStatus.FIXED),
+    done: findingsList(status: ReviewerFindingStatus.RESOLVED),
+    all: findingsList,
+  }}
+  assert(message: out.summary) { (out.summary.split("\n")[0] ?? "") == "1 important" }
+  assert(message: out.open) { reviewerFingerprintAt(out.open, "calc.py:5") == discountFp }
+  assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 1 }
+  assert(message: out.fixed) { reviewerFingerprintAt(out.fixed, "calc.py:3") == nitFp }
+  assert(message: out.done) { reviewerFingerprintAt(out.done, "calc.py:21") == evalFp and out.done.contains("legacy only ever sees trusted input") }
+  assert(message: out.summary) { out.summary.contains("No longer reproduced, now FIXED: " + nitFp) }
+  assert(message: out.summary) { out.summary.contains("Found again but already RESOLVED: " + evalFp) }
+  assert(message: out.all) { out.all.split("\n").filter { l => l.hasPrefix("OPEN") or l.hasPrefix("FIXED") or l.hasPrefix("RESOLVED") }.length == 3 }
+
+  # A FIXED finding that comes back is OPEN again.
+  let back = again.tallyReplies(
+    source: fx.shifted.asWorkspace,
+    head: fx.shifted,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 6, "the parameter total shadows the function total, so discount cannot call it", "return total - total * rate", "correctness", "NIT"),
+    ])],
+    voterReplies: [reviewerVote("CONFIRM", "NIT")],
+  ).findingsList(status: ReviewerFindingStatus.OPEN)
+  assert(message: back) { reviewerFingerprintAt(back, "calc.py:6") == nitFp }
+  "Reviewer reconciliation checks passed."
+}
+
+let checkReviewerComposition(source: Workspace!): String! {
+  # Default composition picks the reviewer's agent, never its roles.
+  let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "reviewer/**").items.{{ uri }}.map { a => a.uri }
+  assert(message: defaults.join(", ")) { defaults.any { u => u.contains("reviewer/agent") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/voter") } }
+
+  let chief = llm.withWorkspace(source).spawn(
+    name: "reviewer-composition-chief",
+    expertise: expertiseAt(source, "dag://committer/agent")
+      + expertiseAt(source, "dag://contributor/agent")
+      + expertiseAt(source, "dag://staff/agent")
+      + expertiseAt(source, "dag://reviewer/agent"),
+  )
+  let picked = reviewer.subagentExpertise(caller: chief, role: "finder").{{ id, artifact.{{ uri }} }}
+  let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+  let voters = reviewer.subagentExpertise(caller: chief, role: "voter").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
+  let finder = llm.withWorkspace(source).spawn(name: "reviewer-composition-finder", expertise: selected);
+  {
+    # Staff and reviewer are gone; contributor and committer are read-only.
+    let uris = picked.map { e => e.artifact.uri }
+    assert(message: uris.join(", ")) { uris.length == 3 }
+    assert(message: uris.join(", ")) { (uris[0] ?? "").contains("committer/readonly") and (uris[1] ?? "").contains("contributor/readonly") and (uris[2] ?? "").contains("reviewer/finder") }
+    assert(message: voters.join(", ")) { voters.length == 3 and (voters[2] ?? "").contains("reviewer/voter") }
+
+    let conversation = finder.snapshot.sync
+    assert(message: recordedUris(conversation).join(", ")) { recordedUris(conversation) == uris }
+    let names = composedToolNames(conversation, llm.withWorkspace(source))
+    ["gh", "reviewComments", "checkout", "commit", "cherryPick", "diff"].each { n =>
+      assert(message: names.join(", ")) { names.any { t => t == n or t.hasSuffix("_" + n) } }
+    }
+    ["push", "comment", "updateComment", "pushBranch", "review", "resolve", "spawn", "sendTo", "askChief"].each { n =>
+      assert(message: names.join(", ")) { !names.any { t => t == n or t.hasSuffix("_" + n) } }
+    }
+    let prompts = systemTexts(conversation)
+    assert { prompts.any { t => t.contains("You are a bug finder in a code review") } }
+    assert { prompts.any { t => t.contains("READ-ONLY GitHub tools") } }
+    assert { !prompts.any { t => t.contains("You can hire and direct a staff") or t.contains("You have a code reviewer") } }
+
+    # Without a reviewer entry there is no role to compose.
+    let bare = llm.withWorkspace(source).spawn(name: "reviewer-composition-bare", expertise: expertiseAt(source, "dag://committer/agent"))
+    let missing = reviewer.subagentExpertise(caller: bare, role: "finder").{{ id }}.length rescue { e: Error => -1 }
+    bare.stop
+    assert { missing == -1 }
+    null
+  } rescue { e: Error => {
+    finder.stop
+    chief.stop
+    raise e.message
+  }}
+  finder.stop
+  chief.stop
+  "Reviewer composition checks passed."
+}
+
+let checkReviewerTools(source: Workspace!): String! {
+  let plumbing = ["finder", "voter", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
+  # review takes the calling agent, which only an owning agent supplies.
+  let unowned = composedToolNames(reviewer.agent(llm.withWorkspace(source)), llm.withWorkspace(source))
+  assert(message: unowned.join(", ")) { unowned.contains("findingsList") and unowned.contains("resolve") and !unowned.contains("review") }
+  let caller = llm.withWorkspace(source).spawn(name: "reviewer-tools-caller", expertise: expertiseAt(source, "dag://reviewer/agent"))
+  let conversation = caller.snapshot.sync
+  caller.stop
+  let names = composedToolNames(conversation, llm.withWorkspace(source))
+  assert(message: names.join(", ")) { names.length == 3 and names.contains("review") and names.contains("findingsList") and names.contains("resolve") }
+  plumbing.each { n =>
+    assert(message: names.join(", ")) { !names.contains(n) }
+  }
+  assert { systemTexts(conversation).any { t => t.contains("REVIEW YOUR OWN CHANGE") } }
+  "Reviewer tool visibility checks passed."
+}
+
+# Run reviewer-driver's pipeline check (agents-dev/reviewer-driver) in a
+# plain-directory fixture workspace holding the driver, this repository's
+# reviewer, and committer and contributor for the caller to compose, so the
+# sub-agents have read-only roles to swap in.
+#
+# A plain directory, not this git checkout: LLM.allowed (core/llm.go) gates
+# LLM.loop/step made from a git-sourced module behind an interactive "Allow
+# LLM access?" prompt, which a check cannot answer, so it hangs.
+let checkReviewerPipeline(source: Workspace!): String! {
+  let fixture = directory
+    .withNewFile("dagger.toml", [
+      "[modules.committer]", `source = "committer"`, "",
+      "[modules.contributor]", `source = "contributor"`, "",
+      "[modules.reviewer]", `source = "reviewer"`, "",
+      "[modules.reviewer-driver]", `source = "driver"`, "",
+    ].join("\n"))
+    .withDirectory("committer", source.directory("/committer"))
+    .withDirectory("contributor", source.directory("/contributor"))
+    .withDirectory("reviewer", source.directory("/reviewer"))
+    .withDirectory("driver", source.directory("/agents-dev/reviewer-driver"))
+    .asWorkspace
+  let checks = fixture.artifacts.filterTypes(types: ["Check"]).filterPathPattern(pattern: "reviewer-driver/pipeline").asChecks.{{ id }}
+  assert(message: `expected one reviewer-driver/pipeline check, got ${toString(checks.length)}`) { checks.length == 1 }
+  checks.each { ref =>
+    let c = node(id: ref.id).{{ ... on Check! }}
+    if (!c.pass) {
+      let why = c.error.message rescue { e: Error => e.message }
+      raise `reviewer-driver/pipeline failed: ${why}`
+    }
+  }
+  "Reviewer pipeline checks passed."
+}
