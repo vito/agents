@@ -131,7 +131,7 @@ let checkReviewerScreening: String! {
   assert(message: summary) { summary.contains("Dropped by the evidence checks (5): ") }
   # Only the exact duplicate (same quote, same claim) merges mechanically,
   # and is listed.
-  assert(message: summary) { summary.contains("Merged as duplicates (1): calc.py:2 (general) into calc.py:2: identical") }
+  assert(message: summary) { summary.contains("Merged as duplicates: calc.py:2 (general) into calc.py:2: identical") }
   assert(message: summary) { summary.contains("calc.py:2 (general): style only (naming)") }
   assert(message: summary) { summary.contains("nope.py:1 (general): path does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:99 (general): line does not exist at head") }
@@ -451,13 +451,16 @@ let checkReviewerTriage: String! {
   # keeps the first's claim and anchor, takes the other's location and
   # the higher severity, so it gets IMPORTANT's three voters. The other
   # problem on the same line stays its own; its one voter cannot raise it
-  # past NIT. The concern misses its tier's quorum of two.
+  # past NIT. The concern's two voters split, so a third breaks the tie,
+  # and rejects it.
   let grouped = JSON.encode({{groups: [{{findings: [1, 3], keep: 1, why: "the rate divides by ten instead of a hundred"}}]}})
+  let mergedVotes = [yes, no, yes, reviewerCausedVote("CONFIRM", "IMPORTANT", true), concernYes, concernNo]
   let merged = reviewer.tallyReplies(
     source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
     finderReplies: finders,
     triageReply: grouped,
-    voterReplies: [yes, no, yes, reviewerCausedVote("CONFIRM", "IMPORTANT", true), concernYes, concernNo],
+    voterReplies: mergedVotes,
+    tieBreakReplies: [concernNo],
   )
   let summary = merged.lastSummary
   let open = merged.findingsList(status: ReviewerFindingStatus.OPEN)
@@ -465,10 +468,29 @@ let checkReviewerTriage: String! {
   assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim + "\n      rate = percent / 10\n  also at calc.py:3 · 2/3 votes · fingerprint ") }
   assert(message: summary) { summary.contains("NIT:\n- calc.py:2 — " + reviewerNegativeClaim + "\n  1/1 votes · fingerprint ") }
   assert(message: summary) { !summary.contains(reviewerOvershootClaim) }
-  assert(message: summary) { summary.contains("Merged as duplicates (1): calc.py:3 (behavior) into calc.py:2: the rate divides by ten instead of a hundred") }
-  assert(message: summary) { summary.contains("Below quorum: notes.txt:25 (1/2, needed 2)") }
-  assert(message: summary) { summary.contains(": 3 finders, triage, 6 voters; composed from") }
+  assert(message: summary) { summary.contains("Merged as duplicates: calc.py:3 (behavior) into calc.py:2: the rate divides by ten instead of a hundred") }
+  assert(message: summary) { summary.contains("Below quorum: notes.txt:25 (1/3, needed 2)") }
+  assert(message: summary) { summary.contains(": 3 finders, triage, 7 voters; composed from") }
   assert(message: open) { open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 2 }
+  # A tie-break that confirms makes it two of three.
+  let broken = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: grouped,
+    voterReplies: mergedVotes,
+    tieBreakReplies: [concernYes],
+  ).lastSummary
+  assert(message: broken) { (broken.split("\n")[0] ?? "") == "1 important, 1 concern, 1 nit" }
+  assert(message: broken) { broken.contains("CONCERN:\n- notes.txt:25 — ") and broken.contains("  2/3 votes · fingerprint ") and !broken.contains("Below quorum") }
+  # Two that agree need no third: both rejecting is final.
+  let agreed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: grouped,
+    voterReplies: [yes, no, yes, nitYes, concernNo, concernNo],
+    tieBreakReplies: [concernYes],
+  ).lastSummary
+  assert(message: agreed) { agreed.contains("Below quorum: notes.txt:25 (0/2, needed 2)") }
 
   # Out-of-range, repeated and already grouped numbers are ignored; a
   # "keep" outside its group falls back to the group's first-listed
@@ -482,7 +504,15 @@ let checkReviewerTriage: String! {
   ).lastSummary
   assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 important, 1 concern, 1 nit" }
   assert(message: sloppy) { sloppy.contains("IMPORTANT:\n- calc.py:3 — " + reviewerOvershootClaim + "\n      return total - total * rate\n  also at calc.py:2 · 3/3 votes") }
-  assert(message: sloppy) { sloppy.contains("Merged as duplicates (1): calc.py:2 (general) into calc.py:3: the same problem") }
+  assert(message: sloppy) { sloppy.contains("Merged as duplicates: calc.py:2 (general) into calc.py:3: the same problem") }
+  # A group's note names each other location once, with its finders.
+  let three = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: JSON.encode({{groups: [{{findings: [3, 1, 2], keep: 3, why: "one rate bug"}}]}}),
+    voterReplies: [yes, yes, yes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: three) { three.contains("\nMerged as duplicates: calc.py:2 (general) into calc.py:3: one rate bug") and !three.contains("calc.py:2 (general), calc.py:2") and (three.split("\n")[0] ?? "") == "1 important, 1 concern" }
 
   # A triage that fails or answers without the JSON merges nothing, and
   # says so; every finding is voted on.
