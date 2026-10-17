@@ -242,7 +242,8 @@ type Screened {
   """
   Findings merged into another as duplicates: "<where> (<finder>) into
   <where>: identical" for each exact one the screen merged, and "<where>
-  (<finders>), ... into <where>: <why>" for each group the triage merged.
+  (<finders>: "<claim, clipped>"), ... into <where>: <why>" for each group
+  the triage merged.
   """
   merged: [String!]! = []
   """
@@ -673,41 +674,57 @@ type Reviewer {
 
   # The reported findings under the fingerprints earlier reviews gave them:
   # a fingerprint seen before is that finding; failing that, an earlier
-  # finding quoting the same code at the same path that no other finding of
-  # this review already is (a new run rewords the claim, and keeps the
-  # first sighting's fingerprint), the one whose claim shares the most
-  # words with this one. So two different problems on one line each keep
-  # their own earlier finding, never collapsing into one.
+  # finding quoting the same code at the same path (a new run rewords the
+  # claim, and keeps the first sighting's fingerprint). Pairs are taken by
+  # how many claim words they share, most first, each side at most once,
+  # and a pair sharing none only when it is the one finding on that code in
+  # both reviews. So two different problems on one line each keep their own
+  # earlier finding, and a new problem never inherits an old one's status.
   let adoption(reported: [Finding!]!): [Finding!]! {
     let prior = findings.values
     let taken = reported.filter { f => findings.has(f.fingerprint) }.map { f => f.fingerprint }
-    let out: [Finding!]! = []
-    reported.each { f =>
-      if (findings.has(f.fingerprint)) {
-        out += [f]
-      } else {
+    let pairs: [{{i: Int!, fp: String!, shared: Int!, alone: Boolean!}}!]! = []
+    reported.each { f, i =>
+      if (!findings.has(f.fingerprint)) {
         let key = evidenceKey(f.path, f.evidence)
         let words = claimWords(f.claim)
-        let earlier: Finding = null
-        let bestShared = -1
-        prior.each { p =>
-          if (!taken.contains(p.fingerprint) and evidenceKey(p.path, p.evidence) == key) {
-            let shared = claimWords(p.claim).filter { w => words.contains(w) }.length
-            if (shared > bestShared) {
-              earlier = p
-              bestShared = shared
-            }
-          }
-        }
-        if (earlier != null) {
-          taken += [earlier.fingerprint]
-          out += [refingerprint(f, earlier.fingerprint)]
-        } else {
-          out += [f]
+        let mates = reported.filter { r => evidenceKey(r.path, r.evidence) == key }.length
+        let same = prior.filter { p => !taken.contains(p.fingerprint) and evidenceKey(p.path, p.evidence) == key }
+        same.each { p =>
+          let shared = claimWords(p.claim).filter { w => words.contains(w) }.length
+          pairs += [{{i: i, fp: p.fingerprint, shared: shared, alone: mates == 1 and same.length == 1}}]
         }
       }
     }
-    out
+    let assigned: [Int!]! = []
+    let assignedTo: [String!]! = []
+    loop {
+      let bestI = -1
+      let bestFp = ""
+      let bestShared = -1
+      pairs.each { p =>
+        if (!assigned.contains(p.i) and !taken.contains(p.fp) and (p.shared > 0 or p.alone) and p.shared > bestShared) {
+          bestI = p.i
+          bestFp = p.fp
+          bestShared = p.shared
+        }
+      }
+      if (bestI < 0) {
+        break
+      }
+      assigned += [bestI]
+      assignedTo += [bestFp]
+      taken += [bestFp]
+    }
+    reported.map { f, i =>
+      let fp = ""
+      assigned.each { a, k =>
+        if (a == i) {
+          fp = assignedTo[k] ?? ""
+        }
+      }
+      if (fp == "") { f } else { refingerprint(f, fp) }
+    }
   }
 
   # Step 5 of the pipeline: reconcile what was judged with state, and
@@ -1386,10 +1403,15 @@ let applyTriage(s: Subject!, screened: Screened!, reply: String): Screened! {
         let rep = kept[g.keep] ?? f
         let others = g.members.filter { m => m != g.keep }.map { m => kept[m] ?? f }
         let why = if (g.why == "") { "the same problem" } else { clip(g.why, maxWhyChars) }
+        # Each other location once, with its finders and the start of its
+        # claim, so a wrong merge never loses a finding without trace.
         let wheres = others.map { o => `${o.path}:${toString(o.line)}` }.uniq
         let absorbed = wheres.map { w =>
-          let by = others.filter { o => `${o.path}:${toString(o.line)}` == w }.map { o => o.finder }.uniq
-          `${w} (${by.join(", ")})`
+          let here = others.filter { o => `${o.path}:${toString(o.line)}` == w }
+          let by = here.map { o => o.finder }.uniq
+          let said = here[0]
+          let gist = if (said != null) { clip(firstSentence(said.claim), maxAbsorbedChars) } else { "" }
+          `${w} (${by.join(", ")}: "${gist}")`
         }
         merged += [`${absorbed.join(", ")} into ${rep.path}:${toString(rep.line)}: ${why}`]
         out += [mergeGroup(s, rep, others)]
@@ -1405,6 +1427,7 @@ let applyTriage(s: Subject!, screened: Screened!, reply: String): Screened! {
 }
 
 let maxWhyChars: Int! = 60
+let maxAbsorbedChars: Int! = 70
 
 let decodeTriage(body: String!): [{{findings: [Int!], keep: Int, why: String}}!]! {
   let p: {{groups: [{{findings: [Int!], keep: Int, why: String}}!]}}! = JSON.decode(body)
@@ -1508,16 +1531,40 @@ let judge(plan: Plan!, kept: [Finding!]!, votes: [String!]!, breaks: [String!]!)
 }
 
 # What the caps leave out of the summary: nits past the nit cap, in order,
-# and every concern but the `maxConcerns` strongest (most confirmations;
-# ties keep the earlier). Concerns are design guidance: a few strong ones
-# are worth a reader's minute, a long list is not.
+# and every concern but the `maxConcerns` strongest: the largest share of
+# its voters confirming, then the most confirmations, ties keeping the
+# earlier (so a unanimous 2/2 outranks a 2/3 that needed a tie-break).
+# Concerns are design guidance: a few strong ones are worth a reader's
+# minute, a long list is not.
 let overCaps(confirmed: [Finding!]!, nitCap: Int!): {{nits: [Finding!]!, concerns: [Finding!]!}}! {
   let nits = confirmed.filter { f => f.severity == Severity.NIT }.dropFirst(nitCap)
   let concerns = confirmed.filter { f => f.severity == Severity.CONCERN }
+  # In 60ths of the voters asked, exact for any count up to the deepest
+  # tier's five.
+  let strength = concerns.map { f =>
+    let unit = [0, 60, 30, 20, 15, 12][f.voters] ?? 0
+    f.confirmations * unit * 10 + f.confirmations
+  }
   let ranked: [Finding!]! = []
-  # Confirmations never exceed the deepest depth's five voters.
-  [5, 4, 3, 2, 1, 0].each { n =>
-    ranked += concerns.filter { f => f.confirmations == n }
+  let left = concerns.map { f, i => i }
+  loop {
+    let best = -1
+    let bestStrength = -1
+    left.each { i =>
+      let st = strength[i] ?? 0
+      if (st > bestStrength) {
+        best = i
+        bestStrength = st
+      }
+    }
+    if (best < 0) {
+      break
+    }
+    let pick = concerns[best]
+    if (pick != null) {
+      ranked += [pick]
+    }
+    left = left.filter { i => i != best }
   }
   {{nits: nits, concerns: ranked.dropFirst(maxConcerns)}}
 }
