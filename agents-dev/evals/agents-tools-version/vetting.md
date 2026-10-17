@@ -14,3 +14,20 @@ version 1, but reset, rebaseAbort and the rebase stop/finish continuations still
 rebind it at version 0 (committer/main.dang:388, :818, :1453, :1477), so the next
 reload resets its state (saved workspaces, rebase progress). The four call sites
 are outside the diff.
+
+## Sound items
+
+Things found correct when the case was compiled (not by history). Mark each
+`sound` (it holds: a finding calling it broken is false) or `dismiss` (it does
+not hold, or is no trap); left blank, a finding that contradicts it keeps the
+judge's value unless the judge rated it false or a speed bump.
+
+### staff-has-no-continuations
+vetted:
+Staff is bound with withTools only in its agent entry; its other withTools
+calls bind other objects, so its version bump needs no other change.
+
+### version-discards-stale-state
+vetted:
+A withTools version bump discards older saved tool state instead of failing to
+load it, which is the commit's stated purpose.

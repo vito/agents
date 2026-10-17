@@ -38,10 +38,12 @@
   "sound": [
     {
       "key": "lockstep-phases",
+      "vetted": null,
       "summary": "runDirectoryPhases runs each phase across every file before starting the next, so every type name is registered before any signature resolves and cross-file references in signatures and bodies work regardless of file order."
     },
     {
       "key": "local-shadows-import-in-inference",
+      "vetted": null,
       "summary": "Each file's composite env reads the shared dirEnv before the file's own imports and writes to dirEnv, so during inference a local declaration shadows an imported name and declarations stay visible to sibling files."
     }
   ]

@@ -38,10 +38,12 @@
   "sound": [
     {
       "key": "imported-module-not-mutated",
+      "vetted": null,
       "summary": "A local declaration that shadows an unqualified imported type gets a fresh module (declareLocalType) and the unqualified alias is cleared, instead of reusing and mutating the imported schema type, so a qualified reference to a shadowed name (Test.User after a local `type User`) still resolves to the imported type."
     },
     {
       "key": "all-kinds-covered",
+      "vetted": null,
       "summary": "Type, enum, scalar, interface and union declarations all go through declareLocalType, and the new gqlserver tests cover shadowing for each kind."
     }
   ]

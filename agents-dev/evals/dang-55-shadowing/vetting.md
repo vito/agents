@@ -29,3 +29,20 @@ vetted: real
 concern · minor · confirmed. The change's own golden shows `cannot use User! as
 User!`. Fixed by 9dc903dfda and af13384818, which qualify imported type names in
 diagnostics.
+
+## Sound items
+
+Things found correct when the case was compiled (not by history). Mark each
+`sound` (it holds: a finding calling it broken is false) or `dismiss` (it does
+not hold, or is no trap); left blank, a finding that contradicts it keeps the
+judge's value unless the judge rated it false or a speed bump.
+
+### imported-module-not-mutated
+vetted:
+A shadowing local declaration gets a fresh module (declareLocalType) instead of
+mutating the imported type, so Test.User still resolves to the imported one.
+
+### all-kinds-covered
+vetted:
+Type, enum, scalar, interface and union declarations all go through
+declareLocalType, and the gqlserver tests cover each kind.

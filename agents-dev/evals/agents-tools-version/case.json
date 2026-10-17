@@ -20,10 +20,12 @@
   "sound": [
     {
       "key": "staff-has-no-continuations",
+      "vetted": null,
       "summary": "Staff is bound with withTools only in its agent entry; its other withTools calls bind different objects (peers, chiefLine), so bumping Staff's version needs no other change."
     },
     {
       "key": "version-discards-stale-state",
+      "vetted": null,
       "summary": "A withTools version bump discards saved tool state from an older version instead of failing to load it, which is the commit's stated purpose (reloading sessions saved before the address/collection refactors)."
     }
   ]

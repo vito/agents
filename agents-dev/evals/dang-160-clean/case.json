@@ -10,14 +10,17 @@
   "sound": [
     {
       "key": "use-number-decode",
+      "vetted": null,
       "summary": "Execute captures the response's data as json.RawMessage and decodes it (and every unpack) with UseNumber, so numbers arrive as json.Number and integers stay exact; the declared GraphQL type then decides Int vs Float."
     },
     {
       "key": "float-and-map-arguments",
+      "vetted": null,
       "summary": "dangValueToGo now serializes FloatValue and MapValue (converting map entries recursively), so a Float result can be passed back as a Float argument; the new test round-trips averageRating through echoFloat."
     },
     {
       "key": "untyped-number-fallback",
+      "vetted": null,
       "summary": "ToValue's json.Number case is the untyped fallback: an integral number that fits an int becomes an Int, anything else a Float."
     }
   ]

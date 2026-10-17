@@ -31,3 +31,20 @@ vetted: real
 cleanup · minor · claimed. declarationPhases/bodyPhases are index slices
 (inferencePhases[:6], [6:]) that misalign silently when phases change.
 Refactored in b0c575c49b.
+
+## Sound items
+
+Things found correct when the case was compiled (not by history). Mark each
+`sound` (it holds: a finding calling it broken is false) or `dismiss` (it does
+not hold, or is no trap); left blank, a finding that contradicts it keeps the
+judge's value unless the judge rated it false or a speed bump.
+
+### lockstep-phases
+vetted:
+runDirectoryPhases runs each phase across every file before the next, so
+cross-file references work regardless of file order.
+
+### local-shadows-import-in-inference
+vetted:
+During inference each file's composite env reads the shared dirEnv before its
+own imports, so a local declaration shadows an imported name.

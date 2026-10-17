@@ -163,7 +163,7 @@ let renderCase(caseText: String!): String! {
     "Known issues (unvetted: compiled from earlier reviews, not ground truth):",
     issueText,
     "",
-    "Sound items (checked and found correct):",
+    "Sound items (checked and found correct by earlier reviews, also unvetted):",
     soundText,
   ].join("\n")
 }
@@ -261,8 +261,10 @@ let judgePrompt: String! = """
       hypothetical (other servers, future callers, "if someone ever"),
       already safe today by the finding's own account, cleanup or
       optimisation with no real payoff, or a matter of taste.
-    - "false": wrong about the code, contradicts a sound item, or too vague
-      to act on.
+    - "false": wrong about the code, contradicts a sound item with no
+      evidence of its own (sound items are unvetted too: a finding that
+      shows one wrong with a reproduction is judged on its merits), or too
+      vague to act on.
     - "duplicate": repeats an earlier finding in this list.
   - "alarmism": true when the framing or wording is out of proportion to
     the evidence: called important, critical or blocking, or worded as a

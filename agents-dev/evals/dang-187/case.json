@@ -146,22 +146,27 @@
   "sound": [
     {
       "key": "null-result-fix",
+      "vetted": null,
       "summary": "convertGraphQLResultToModule returning null for a nil result is correct, and probing only when a value leaves the chain holds up."
     },
     {
       "key": "rescue-classification",
+      "vetted": null,
       "summary": "Static rescue classification matches runtime behaviour, including (x ?? y).f and x!.f."
     },
     {
       "key": "union-id-fragments",
+      "vetted": null,
       "summary": "Union probes use per-member `... on T { id }` fragments selecting ids of one shared type, avoiding GraphQL field-merge conflicts."
     },
     {
       "key": "mutation-sent-once",
+      "vetted": null,
       "summary": "No mutation is sent twice; the mutation test enforces it."
     },
     {
       "key": "args-in-selected-chain",
+      "vetted": null,
       "summary": "An argument evaluated inside a chain that is being selected through is still probed."
     }
   ]

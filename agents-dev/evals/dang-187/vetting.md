@@ -101,3 +101,42 @@ vetted:
 docs · minor · confirmed. The skill's control-flow.md:135 lists only leaf
 fields and .{{ }} as execution points; escaping possibly-null handles are now a
 third.
+
+## Sound items
+
+Things the same two reviews checked and found correct. Mark each one after its
+`vetted:`:
+
+- `sound`: it holds, so a finding that says it is broken counts as false;
+- `dismiss`: it does not hold (or is no trap), so such a finding is judged on
+  its own value.
+
+Left blank, a finding that contradicts it is reported as a sound
+contradiction and keeps the judge's value, unless the judge rated it false or a
+speed bump.
+
+### null-result-fix
+vetted:
+convertGraphQLResultToModule returning null for a nil result is correct, and
+probing only when a value leaves the chain holds up.
+
+### rescue-classification
+vetted:
+Static rescue classification matches runtime behaviour, including (x ?? y).f
+and x!.f.
+
+### union-id-fragments
+vetted:
+Union probes use per-member `... on T { id }` fragments selecting ids of one
+shared type, avoiding field-merge conflicts.
+
+### mutation-sent-once
+vetted:
+No mutation is sent twice; the mutation test enforces it. (Two live reviewer
+runs recorded `touched.{{... on Post!}}.title` on a mutation result sending the
+mutation twice: first `{touchNode{__typename}}`, then the fragment.)
+
+### args-in-selected-chain
+vetted:
+An argument evaluated inside a chain that is being selected through is still
+probed.

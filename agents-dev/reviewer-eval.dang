@@ -22,10 +22,11 @@
 # A case lives in evals/<name>/case.json: a pull request pinned to its head
 # and merge base, its known issues (key, kind, severity, confidence,
 # vetted, locations, summary) and "sound" items, things checked and found
-# correct that act as false-positive traps. `vetted` is null until the
-# author labels an issue "real" or "dismiss", in case.json or in the
-# vetting note beside it (vetting.md: "### <key>" headings, each followed by
-# a "vetted:" line). Baseline reviews sit beside it too.
+# correct that act as false-positive traps (key, vetted, summary). `vetted`
+# is null until the author labels an issue "real" or "dismiss", or a sound
+# item "sound" or "dismiss", in case.json or in the vetting note beside it
+# (vetting.md: "### <key>" headings, each followed by a "vetted:" line).
+# Baseline reviews sit beside it too.
 #
 # Better labels come from history: a case can pin a change (a PR or a
 # commit range) whose bugs later commits fixed, its issues vetted "real" and
@@ -42,11 +43,18 @@
 # majority of samples gave, else "disputed" (alarmism: true only on a strict
 # majority); an unparseable or unknown answer is "unjudged". The
 # deterministic half is here: the majorities, then mechanical overrides (a
-# later finding on an already matched issue is a duplicate; one matching a
-# sound item is false; one matching an issue vetted "dismiss" is a speed
-# bump, and one matching an issue vetted "real" is at least guidance), the
-# arithmetic and the scorecard. checkReviewerEvalScoring covers it on canned
-# judge replies.
+# later finding on an already matched issue is a duplicate; one matching an
+# issue vetted "dismiss" is a speed bump, and one matching an issue vetted
+# "real" is at least guidance), the arithmetic and the scorecard.
+#
+# A finding matching a sound item is a sound contradiction, listed on its
+# own. Sound items come from earlier reviews too, and a finding with a
+# reproduction can be the one that is right, so it counts as false only
+# when the item is vetted "sound" (the author confirms it holds), or when
+# the item is unvetted and the judge's majority is false or speed-bump;
+# otherwise the judge's value stands. Sound items take a `vetted` label as
+# issues do: null, "sound" or "dismiss" (not a trap at all).
+# checkReviewerEvalScoring covers it on canned judge replies.
 #
 # The functions that call models (reviewerEval, reviewerEvalScore in
 # main.dang) are plain functions with a required argument: never checks, and
@@ -74,6 +82,7 @@ type ReviewerEvalIssue {
 
 type ReviewerEvalSound {
   key: String!
+  vetted: String
   summary: String!
 }
 
@@ -181,6 +190,10 @@ let reviewerEvalProblems(c: ReviewerEvalCase!): [String!]! {
     }
   }
   c.sound.each { s =>
+    let vetted = s.vetted ?? ""
+    if (vetted != "" and vetted != "sound" and vetted != "dismiss") {
+      problems += [`${s.key}: vetted "${vetted}" is not null, sound or dismiss`]
+    }
     if (s.summary.trimSpace == "") {
       problems += [`${s.key}: empty summary`]
     }
@@ -233,43 +246,55 @@ let reviewerEvalVettingProblems(c: ReviewerEvalCase!, note: [{{key: String!, vet
   }
   let problems: [String!]! = []
   let keys = c.issues.map { i => i.key }
+  let soundKeys = c.sound.map { s => s.key }
   note.each { e =>
-    if (!keys.contains(e.key)) {
-      problems += [`vetting note: "${e.key}" is not an issue key`]
-    }
-    if (e.vetted != "" and e.vetted != "real" and e.vetted != "dismiss") {
-      problems += [`vetting note: ${e.key}: "${e.vetted}" is not blank, real or dismiss`]
+    if (soundKeys.contains(e.key)) {
+      if (e.vetted != "" and e.vetted != "sound" and e.vetted != "dismiss") {
+        problems += [`vetting note: ${e.key}: "${e.vetted}" is not blank, sound or dismiss`]
+      }
+    } else {
+      if (!keys.contains(e.key)) {
+        problems += [`vetting note: "${e.key}" is not an issue or sound key`]
+      }
+      if (e.vetted != "" and e.vetted != "real" and e.vetted != "dismiss") {
+        problems += [`vetting note: ${e.key}: "${e.vetted}" is not blank, real or dismiss`]
+      }
     }
   }
-  c.issues.each { i =>
+  let stored = c.issues.map { i => {{key: i.key, vetted: i.vetted ?? ""}} } + c.sound.map { s => {{key: s.key, vetted: s.vetted ?? ""}} }
+  stored.each { i =>
     let mine = note.filter { e => e.key == i.key }
     let first = mine[0]
     if (first == null) {
       problems += [`vetting note: does not list ${i.key}`]
-    } else {
-      let stored = i.vetted ?? ""
-      if (stored != "" and first.vetted != "" and stored != first.vetted) {
-        problems += [`${i.key}: vetted "${stored}" in case.json but "${first.vetted}" in the vetting note`]
-      }
+    } else if (i.vetted != "" and first.vetted != "" and i.vetted != first.vetted) {
+      problems += [`${i.key}: vetted "${i.vetted}" in case.json but "${first.vetted}" in the vetting note`]
     }
   }
   problems
 }
 
+# The note's non-blank label for `key`, else `stored`.
+let reviewerEvalNoteLabel(note: [{{key: String!, vetted: String!}}!]!, key: String!, stored: String): String {
+  let mine = note.filter { e => e.key == key and e.vetted != "" }
+  let first = mine[0]
+  if (first == null) { stored } else { first.vetted }
+}
+
 # `c` with the note's non-blank labels filled in.
 let reviewerEvalWithVetting(c: ReviewerEvalCase!, note: [{{key: String!, vetted: String!}}!]!): ReviewerEvalCase! {
   let issues = c.issues.map { i =>
-    let mine = note.filter { e => e.key == i.key and e.vetted != "" }
-    let first = mine[0]
-    let vetted: String = if (first == null) { i.vetted } else { first.vetted }
     ReviewerEvalIssue(
       key: i.key, kind: i.kind, severity: i.severity, confidence: i.confidence,
-      vetted: vetted, locations: i.locations, summary: i.summary,
+      vetted: reviewerEvalNoteLabel(note, i.key, i.vetted), locations: i.locations, summary: i.summary,
     )
+  }
+  let sound = c.sound.map { s =>
+    ReviewerEvalSound(key: s.key, vetted: reviewerEvalNoteLabel(note, s.key, s.vetted), summary: s.summary)
   }
   ReviewerEvalCase(
     name: c.name, title: c.title, pr: c.pr, repo: c.repo, head: c.head, base: c.base,
-    notes: c.notes, issues: issues, sound: c.sound,
+    notes: c.notes, issues: issues, sound: sound,
   )
 }
 
@@ -502,6 +527,30 @@ let reviewerEvalVettedOf(c: ReviewerEvalCase!, key: String!): String! {
   if (first == null) { "" } else { first.vetted ?? "" }
 }
 
+let reviewerEvalSoundVettedOf(c: ReviewerEvalCase!, key: String!): String! {
+  let mine = c.sound.filter { s => s.key == key }
+  let first = mine[0]
+  if (first == null) { "" } else { first.vetted ?? "" }
+}
+
+# A finding that contradicts a sound item: the value it scores and why.
+# Only a vetted-sound item makes it false outright. An unvetted item came
+# from an earlier review and can itself be wrong (a finding with a
+# reproduction may be the one that is right), so the judge's value stands,
+# except that a speed bump against it counts as false; a dismissed item
+# is no trap at all.
+let reviewerEvalSoundOverride(vetted: String!, value: String!): {{value: String!, note: String!}}! {
+  if (vetted == "sound") {
+    {{value: "false", note: "sound-contradiction, vetted sound"}}
+  } else if (vetted == "dismiss") {
+    {{value: value, note: "sound-contradiction, vetted dismiss: judged on its value"}}
+  } else if (value == "speed-bump") {
+    {{value: "false", note: "sound-contradiction, unvetted: a speed bump counts as false"}}
+  } else {
+    {{value: value, note: "sound-contradiction, unvetted: judged on its value"}}
+  }
+}
+
 # One scorecard row: name, hit/total, percent.
 let reviewerEvalRow(name: String!, r: {{hit: Int!, total: Int!, percent: Int!}}!): String! {
   let frac = `${toString(r.hit)}/${toString(r.total)}`
@@ -540,6 +589,9 @@ let reviewerEvalScorecard(
     id: Int!, text: String!, value: String!, alarmism: Boolean!, match: String!, note: String!,
     matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!,
   }}!]! = []
+  # Findings matched to a sound item, reported on their own: the item's
+  # vetting, the judge's majority value and the value scored.
+  let contradictions: [{{finding: Int!, key: String!, vetted: String!, judged: String!, value: String!}}!]! = []
   findings.each { text, i =>
     let votes = samples.map { s => s[i] ?? reviewerEvalUnjudged }
     let matchVotes = votes.map { v => v.match }
@@ -561,8 +613,15 @@ let reviewerEvalScorecard(
       value = "duplicate"
       note = "an earlier finding matched this issue"
     } else if (soundKeys.contains(match)) {
-      value = "false"
-      note = "contradicts a sound item"
+      let vettedSound = reviewerEvalSoundVettedOf(c, match)
+      let judgedValue = value
+      let o = reviewerEvalSoundOverride(vettedSound, judgedValue)
+      contradictions += [{{
+        finding: i + 1, key: match, vetted: if (vettedSound == "") { "unvetted" } else { vettedSound },
+        judged: judgedValue, value: o.value,
+      }}]
+      value = o.value
+      note = o.note
     } else if (isIssue) {
       let vetted = reviewerEvalVettedOf(c, match)
       if (vetted == "dismiss" and value != "speed-bump" and value != "false") {
@@ -628,7 +687,7 @@ let reviewerEvalScorecard(
       disputed: reviewerEvalCount(values, "disputed"),
       unjudged: reviewerEvalCount(values, "unjudged"),
     }},
-    soundContradictions: judged.filter { f => soundKeys.contains(f.match) }.length,
+    soundContradictions: contradictions,
     weights: {{values: reviewerEvalValueWeights, alarmism: reviewerEvalAlarmismWeight}},
     matched: hit.map { i => i.key },
     missedConfirmed: missed.filter { i => i.confidence == "confirmed" }.map { i => i.key },
@@ -674,8 +733,13 @@ let reviewerEvalScorecard(
     "",
     `values: guardrail ${toString(card.values.guardrail)}, guidance ${toString(card.values.guidance)}, ` +
       `quick-fix ${toString(card.values.quickFix)}, speed-bump ${toString(speedBumps)}, false ${toString(falses)}, ` +
-      `duplicate ${toString(card.values.duplicate)}, disputed ${toString(card.values.disputed)}, unjudged ${toString(card.values.unjudged)}` +
-      `; sound contradictions ${toString(card.soundContradictions)}`,
+      `duplicate ${toString(card.values.duplicate)}, disputed ${toString(card.values.disputed)}, unjudged ${toString(card.values.unjudged)}`,
+    "sound contradictions: " + (if (contradictions.isEmpty) { "(none)" } else {
+      contradictions.map { s =>
+        let scored = if (s.value == s.judged) { s.value } else { s.judged + " -> " + s.value }
+        `#${toString(s.finding)} ${s.key} (${s.vetted}): ${scored}`
+      }.join(", ")
+    }),
     "matched: " + (if (hit.isEmpty) { "(none)" } else { card.matched.join(", ") }),
     "missed confirmed: " + (if (missedConfirmed.isEmpty) { "(none)" } else { missedConfirmed.join(", ") }),
     "",
@@ -728,7 +792,11 @@ let reviewerEvalSyntheticCase: String! = """
       {"key": "d", "kind": "docs", "severity": "minor", "confidence": "confirmed", "locations": ["README.md"], "summary": "d is stale"},
       {"key": "e", "kind": "cleanup", "severity": "minor", "confidence": "claimed", "locations": [], "summary": "e is dead code"}
     ],
-    "sound": [{"key": "s", "summary": "s holds"}]
+    "sound": [
+      {"key": "s", "vetted": null, "summary": "s holds"},
+      {"key": "t", "vetted": "sound", "summary": "t holds"},
+      {"key": "u", "vetted": "dismiss", "summary": "u holds, or so a review said"}
+    ]
   }
 """
 
@@ -760,6 +828,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert(message: problems) { problems.contains("a: kind \"nit\" is not one of") }
   assert(message: problems) { problems.contains("a: severity \"high\" is not important or minor") }
   assert(message: problems) { problems.contains("a: vetted \"maybe\" is not null, real or dismiss") }
+  assert(message: problems) { problems.contains("u: vetted \"maybe\" is not null, sound or dismiss") }
   assert(message: problems) { problems.contains("key \"duplicate\" is reserved") }
   assert(message: problems) { !problems.contains("base") }
   let good = decodeReviewerEvalCase(reviewerEvalSyntheticCase)
@@ -779,7 +848,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert { reviewerEvalProblems(blank) == ["no issues and no sound items"] }
 
   # The vetting note: headings and "vetted:" lines; it fills nulls, must
-  # agree with labels already set, and must list every issue.
+  # agree with labels already set, and must list every issue and sound item.
   let note = reviewerEvalVettingNote([
     "# Vetting", "", "Mark each one.", "",
     "### a", "vetted: real", "bug · important", "",
@@ -787,21 +856,33 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     "### c", "Vetted: Dismiss", "",
     "### d", "vetted:  real  ", "",
     "### e", "some text", "vetted: real",
+    "", "## Sound items", "",
+    "### s", "vetted: sound", "",
+    "### t", "vetted:", "",
+    "### u", "vetted: dismiss",
   ].join("\n"))
   assert(message: JSON.encode(note)) {
     note == [
       {{key: "a", vetted: "real"}}, {{key: "b", vetted: ""}}, {{key: "c", vetted: "dismiss"}},
       {{key: "d", vetted: "real"}}, {{key: "e", vetted: "real"}},
+      {{key: "s", vetted: "sound"}}, {{key: "t", vetted: ""}}, {{key: "u", vetted: "dismiss"}},
     ]
   }
   let notProblems = reviewerEvalVettingProblems(good, note)
   assert(message: notProblems.join("\n")) { notProblems.isEmpty }
-  let vetted = reviewerEvalWithVetting(good, note).issues.map { i => i.vetted ?? "" }
+  let withNote = reviewerEvalWithVetting(good, note)
+  let vetted = withNote.issues.map { i => i.vetted ?? "" }
   assert(message: vetted.join(", ")) { vetted == ["real", "dismiss", "dismiss", "real", "real"] }
-  let clash = reviewerEvalVettingProblems(good, [{{key: "a", vetted: "dismiss"}}, {{key: "zz", vetted: "nope"}}]).join("\n")
+  let vettedSound = withNote.sound.map { s => s.vetted ?? "" }
+  assert(message: vettedSound.join(", ")) { vettedSound == ["sound", "sound", "dismiss"] }
+  let clash = reviewerEvalVettingProblems(good, [
+    {{key: "a", vetted: "dismiss"}}, {{key: "zz", vetted: "nope"}}, {{key: "t", vetted: "dismiss"}}, {{key: "s", vetted: "real"}},
+  ]).join("\n")
   assert(message: clash) { clash.contains("a: vetted \"real\" in case.json but \"dismiss\" in the vetting note") }
-  assert(message: clash) { clash.contains("\"zz\" is not an issue key") and clash.contains("zz: \"nope\" is not blank, real or dismiss") }
-  assert(message: clash) { clash.contains("does not list b") and clash.contains("does not list e") }
+  assert(message: clash) { clash.contains("\"zz\" is not an issue or sound key") and clash.contains("zz: \"nope\" is not blank, real or dismiss") }
+  assert(message: clash) { clash.contains("does not list b") and clash.contains("does not list e") and clash.contains("does not list u") }
+  assert(message: clash) { clash.contains("t: vetted \"sound\" in case.json but \"dismiss\" in the vetting note") }
+  assert(message: clash) { clash.contains("s: \"real\" is not blank, sound or dismiss") }
   assert { reviewerEvalVettingProblems(good, [] :: [{{key: String!, vetted: String!}}!]!).isEmpty }
 
   # Rounding and weights.
@@ -816,7 +897,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   #   3: d/quick-fix none/quick-fix d/quick-fix  -> d, quick-fix
   #   4: none/guidance none/speed-bump none/false -> none, disputed
   #   5: b/guidance! b/guidance! zzz/guidance!   -> b, vetted dismiss: speed-bump, alarmist
-  #   6: s/false x3                              -> sound contradiction, false (unanimous)
+  #   6: s/false x3                              -> s unvetted, judged false: false (unanimous)
   #   7: none/speed-bump x2, missing             -> none, speed-bump
   # Sample 2 is fenced and wrapped in prose, with keys and values in
   # capitals; sample 3 skips finding 7 and judges a finding 99.
@@ -854,7 +935,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
       vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!,
     }}!,
     values: {{guardrail: Int!, guidance: Int!, quickFix: Int!, speedBump: Int!, falseFinding: Int!, duplicate: Int!, disputed: Int!, unjudged: Int!}}!,
-    soundContradictions: Int!,
+    soundContradictions: [{{finding: Int!, key: String!, vetted: String!, judged: String!, value: String!}}!]!,
     matched: [String!]!,
     missedConfirmed: [String!]!,
     informational: {{
@@ -899,7 +980,8 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert(message: msg) { r.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
   assert(message: msg) { r.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} }
   assert(message: msg) { r.values == {{guardrail: 0, guidance: 1, quickFix: 1, speedBump: 2, falseFinding: 1, duplicate: 1, disputed: 1, unjudged: 0}} }
-  assert(message: msg) { r.soundContradictions == 1 and r.matched == ["a", "b", "d"] and r.missedConfirmed == [] }
+  assert(message: msg) { r.matched == ["a", "b", "d"] and r.missedConfirmed == [] }
+  assert(message: msg) { r.soundContradictions == [{{finding: 6, key: "s", vetted: "unvetted", judged: "false", value: "false"}}] }
   assert(message: msg) { r.informational.recall == {{hit: 3, total: 5, percent: 60}} and r.informational.missed == ["c", "e"] }
   assert(message: msg) { r.informational.byKind.bug == {{hit: 2, total: 2, percent: 100}} and r.informational.byKind.concern == {{hit: 0, total: 1, percent: 0}} }
   assert(message: msg) { r.informational.byKind.cleanup == {{hit: 0, total: 1, percent: 0}} and r.informational.byKind.docs == {{hit: 1, total: 1, percent: 100}} }
@@ -915,8 +997,55 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert(message: card.text) { card.text.contains("#1 guidance · a (its issue is vetted real) <- a/speed-bump, a/speed-bump, a/guardrail; alarmist 0/3") }
   assert(message: card.text) { card.text.contains("#2 duplicate ALARMIST · a (an earlier finding matched this issue)") }
   assert(message: card.text) { card.text.contains("#5 speed-bump ALARMIST · b (its issue is vetted dismiss)") }
-  assert(message: card.text) { card.text.contains("#6 false · s (contradicts a sound item)") }
+  assert(message: card.text) { card.text.contains("#6 false · s (sound-contradiction, unvetted: judged on its value)") }
+  assert(message: card.text) { card.text.contains("sound contradictions: #6 s (unvetted): false\n") }
   assert(message: card.text) { card.text.contains("1/7 findings unanimous") and card.text.contains("judge: canned") }
+
+  # Sound contradictions, three samples each: only a vetted-sound item, or
+  # a speed bump against an unvetted one, makes a finding false; none of
+  # them is recall.
+  #   1: s/guidance x3                        -> unvetted: guidance stands
+  #   2: s/speed-bump s/speed-bump s/guidance -> unvetted speed bump: false
+  #   3: t/guidance x3                        -> vetted sound: false
+  #   4: u/speed-bump x3                      -> vetted dismiss: speed-bump stands
+  #   5: u/guardrail t/guardrail u/guardrail  -> u, vetted dismiss: guardrail stands
+  let soundReplies = [
+    ["guidance", "speed-bump", "guidance", "speed-bump", "guardrail"],
+    ["guidance", "speed-bump", "guidance", "speed-bump", "guardrail"],
+    ["guidance", "guidance", "guidance", "speed-bump", "guardrail"],
+  ].map { vs, k =>
+    let keys = ["s", "s", "t", "u", if (k == 1) { "t" } else { "u" }]
+    "{\"judgements\": [" + vs.map { v, j => reviewerEvalVote(j + 1, keys[j] ?? "none", v, false) }.join(", ") + "]}"
+  }
+  let soundCard = reviewerEvalScorecard(good, "canned", "x", ["one", "two", "three", "four", "five"], soundReplies, reviewerEvalNoMeta)
+  let sc: {{
+    headline: {{valueScore: Int!, noise: Int!, speedBumps: Int!, falseFindings: Int!}}!,
+    soundContradictions: [{{finding: Int!, key: String!, vetted: String!, judged: String!, value: String!}}!]!,
+    matched: [String!]!,
+    judged: [{{value: String!, match: String!}}!]!,
+  }}! = JSON.decode(soundCard.json)
+  let smsg = soundCard.text + "\n" + soundCard.json
+  assert(message: smsg) { sc.judged.map { f => f.match } == ["s", "s", "t", "u", "u"] and sc.matched == [] }
+  assert(message: smsg) { sc.judged.map { f => f.value } == ["guidance", "false", "false", "speed-bump", "guardrail"] }
+  # guidance +1, false -2, false -2, speed-bump -1, guardrail +3: -1.
+  assert(message: smsg) { sc.headline.valueScore == -1 and sc.headline.noise == 3 and sc.headline.speedBumps == 1 and sc.headline.falseFindings == 2 }
+  assert(message: smsg) {
+    sc.soundContradictions == [
+      {{finding: 1, key: "s", vetted: "unvetted", judged: "guidance", value: "guidance"}},
+      {{finding: 2, key: "s", vetted: "unvetted", judged: "speed-bump", value: "false"}},
+      {{finding: 3, key: "t", vetted: "sound", judged: "guidance", value: "false"}},
+      {{finding: 4, key: "u", vetted: "dismiss", judged: "speed-bump", value: "speed-bump"}},
+      {{finding: 5, key: "u", vetted: "dismiss", judged: "guardrail", value: "guardrail"}},
+    ]
+  }
+  assert(message: smsg) {
+    soundCard.text.contains("sound contradictions: #1 s (unvetted): guidance, #2 s (unvetted): speed-bump -> false, " +
+      "#3 t (sound): guidance -> false, #4 u (dismiss): speed-bump, #5 u (dismiss): guardrail")
+  }
+  assert(message: smsg) { soundCard.text.contains("#1 guidance · s (sound-contradiction, unvetted: judged on its value)") }
+  assert(message: smsg) { soundCard.text.contains("#2 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
+  assert(message: smsg) { soundCard.text.contains("#3 false · t (sound-contradiction, vetted sound)") }
+  assert(message: smsg) { soundCard.text.contains("#4 speed-bump · u (sound-contradiction, vetted dismiss: judged on its value)") }
 
   # Nothing vetted yet: the vetted line says so.
   let unvetted = decodeReviewerEvalCase(reviewerEvalSyntheticCase.replace("\"vetted\": \"real\"", "\"vetted\": null"))
@@ -931,13 +1060,13 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let empty = reviewerEvalScorecard(good, "canned", "Nothing to fix.", [] :: [String!]!, ["{\"judgements\": []}"], reviewerEvalNoMeta)
   assert(message: empty.text) { empty.text.contains(reviewerEvalRow("confirmed recall", {{hit: 0, total: 2, percent: 0}})) and empty.text.contains(reviewerEvalNumberRow("findings", "0", "the review is 3 words")) }
   # A known-clean case: there is nothing to recall, and what is raised is
-  # scored on its value alone.
-  let cleanCard: {{headline: {{valueScore: Int!, noise: Int!, confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!}}!, soundContradictions: Int!}}! = JSON.decode(
+  # scored on its value alone; contradicting a vetted-sound item is false.
+  let cleanCard: {{headline: {{valueScore: Int!, noise: Int!, confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!}}!, soundContradictions: [{{key: String!}}!]!}}! = JSON.decode(
     reviewerEvalScorecard(clean, "canned", "x y", ["one", "two"], [
-      "{\"judgements\": [" + reviewerEvalVote(1, "none", "speed-bump", false) + ", " + reviewerEvalVote(2, "s", "guardrail", true) + "]}",
+      "{\"judgements\": [" + reviewerEvalVote(1, "none", "speed-bump", false) + ", " + reviewerEvalVote(2, "t", "guardrail", true) + "]}",
     ], reviewerEvalNoMeta).json
   )
-  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.valueScore == -4 and cleanCard.headline.noise == 3 and cleanCard.soundContradictions == 1 }
+  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.valueScore == -4 and cleanCard.headline.noise == 3 and cleanCard.soundContradictions == [{{key: "t"}}] }
   assert(message: JSON.encode(cleanCard)) { cleanCard.headline.confirmedRecall == {{hit: 0, total: 0, percent: 0}} }
   "Reviewer eval scoring checks passed."
 }
