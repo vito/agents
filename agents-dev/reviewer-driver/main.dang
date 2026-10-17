@@ -9,15 +9,17 @@
 # and sent their tasks from modules loaded here, not from agents-dev.
 #
 # No model is called: reviewer's withRecordedReplies makes `review` spawn
-# each finder and voter on a `recording/` model that replays its history and
-# a canned final reply. Everything else is the real pipeline: composition
-# from the caller's record, parallel finders, mechanical evidence checks,
-# voters, severity from hunks, and the summary.
+# each finder, voter and the synthesizer on a `recording/` model that
+# replays its history and a canned final reply. Everything else is the real
+# pipeline: composition from the caller's record, parallel finders,
+# mechanical evidence checks, voters, severity from hunks, the synthesis,
+# and the summary.
 type ReviewerDriver {
   """
   A STANDARD review of a fixture range: three finders in parallel (one
   finding duplicated across two finders, one with evidence that is not in
-  the file), three voters for each surviving finding, and the summary.
+  the file, a concern citing two places), three voters for each surviving
+  finding, the synthesizer, and the summary.
   """
   pipeline(source: Workspace!): Void @check {
     let repo = container
@@ -36,19 +38,28 @@ type ReviewerDriver {
     let chief = llm.withWorkspace(source).spawn(name: "review-chief", expertise: entries)
 
     let discount = finding("calc.py", 2, discountClaim, "rate = percent / 10", "correctness")
+    let concern = JSON.encode({{
+      severity: "CONCERN", claim: concernClaim, category: "design", causedByChange: true,
+      locations: [
+        {{path: "calc.py", line: 18, evidence: "return eval(x)"}},
+        {{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}},
+      ],
+    }})
     let finders = [
       findings([discount, finding("calc.py", 2, "percent is divided by one hundred too often", "rate = percent / 100", "correctness")]),
-      findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security")]),
+      findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security"), concern]),
       findings([discount, finding("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "fit")]),
     ]
     let voters = [
       vote("CONFIRM"), vote("CONFIRM"), vote("CONFIRM"),
       vote("CONFIRM"), vote("REJECT"), vote("CONFIRM"),
+      voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "IMPORTANT"),
       vote("REJECT"), vote("REJECT"), vote("CONFIRM"),
     ]
+    let synthesis = JSON.encode({{verdict: verdictText, sound: ["total() still sums prices"]}})
     # One selection, so the uncached review runs exactly once.
     let out = reviewer
-      .withRecordedReplies(origin: from, finders: finders, voters: voters)
+      .withRecordedReplies(origin: from, finders: finders, voters: voters, synthesis: synthesis)
       .review(caller: chief, source: source, head: repo.branch("feature"), base: repo.branch("main"), depth: ReviewerDepth.STANDARD)
       .{{ summary: lastSummary, open: findingsList(status: ReviewerFindingStatus.OPEN) }} rescue {
         e: Error => {
@@ -60,29 +71,34 @@ type ReviewerDriver {
 
     let summary = out.summary
     print(summary)
-    assert(message: summary) { (summary.split("\n")[0] ?? "") == "1 important, 1 pre-existing" }
+    let lines = summary.split("\n")
+    assert(message: summary) { (lines[0] ?? "") == "1 important, 1 concern, 1 pre-existing" }
+    assert(message: summary) { (lines[2] ?? "") == "Verdict: " + verdictText and (lines[3] ?? "") == "Checked and found sound:" }
     assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim) }
-    assert(message: summary) { summary.contains("votes: 3/3 confirmed · correctness (correctness)") }
-    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim) and summary.contains("votes: 2/3 confirmed · security (security)") }
+    assert(message: summary) { summary.contains("votes: 3/3 confirmed · correctness (general)") }
+    assert(message: summary) { summary.contains("CONCERN:\n- calc.py:1 — " + concernClaim) and summary.contains("  also at calc.py:18:") }
+    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim) and summary.contains("votes: 2/3 confirmed · security (behavior)") }
     assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") and summary.contains("quoted evidence does not appear") }
     assert(message: summary) { summary.contains("Below quorum (2 of 3): calc.py:8 (1/3 confirmed)") }
-    assert(message: summary) { !summary.contains("failed:") }
+    assert(message: summary) { !summary.contains("failed:") and summary.contains("are the reviewers' own reproductions") }
     # The output names what the sub-agents were composed from.
-    let composedLines = summary.split("\n").filter { l => l.hasPrefix("Sub-agents composed from: ") }
+    let composedLines = lines.filter { l => l.hasPrefix("Sub-agents composed from: ") }
     let composed = composedLines[0] ?? ""
-    ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/voter"].each { u =>
+    ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/voter", "reviewer/synthesizer"].each { u =>
       assert(message: composed) { composed.contains(u) }
     }
     ["committer/agent", "contributor/agent", "reviewer/agent"].each { u =>
       assert(message: composed) { !composed.contains(u) }
     }
-    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 2 }
+    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 3 }
     null
   }
 }
 
 let discountClaim: String! = "percent / 10 divides by ten instead of a hundred, so a 50 percent discount takes off five times the total"
 let evalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
+let concernClaim: String! = "discount assumes percent is a whole number, which no caller states"
+let verdictText: String! = "The change adds a discount helper whose rate is off by a factor of ten."
 
 let fixtureScript: String! = """
   git init -q -b main
@@ -109,6 +125,10 @@ let findings(items: [String!]!): String! {
 
 let vote(verdict: String!): String! {
   JSON.encode({{verdict: verdict, severity: "IMPORTANT", reason: "checked in the workspace"}})
+}
+
+let voteAs(verdict: String!, severity: String!): String! {
+  JSON.encode({{verdict: verdict, severity: severity, causedByChange: true, reason: "checked in the workspace"}})
 }
 
 let entriesAt(ws: Workspace!, uri: String!): [Expertise!]! {

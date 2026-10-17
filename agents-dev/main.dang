@@ -145,6 +145,12 @@ type AgentsDev {
     null
   }
 
+  """Check the reviewer's CONCERN findings (multi-location evidence, partial validation), causedByChange against PRE-EXISTING, and the synthesis section, on canned replies."""
+  reviewerConcerns: Void @check {
+    print(checkReviewerConcerns)
+    null
+  }
+
   """Check reviewer fingerprints survive line shifts, and re-reviews reconcile: unreproduced findings FIXED, resolved ones kept RESOLVED."""
   reviewerReconcile: Void @check {
     print(checkReviewerReconcile)

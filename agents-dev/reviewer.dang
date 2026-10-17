@@ -58,6 +58,20 @@ let reviewerVote(verdict: String!, severity: String!): String! {
   JSON.encode({{verdict: verdict, severity: severity, reason: "checked"}})
 }
 
+# A finding in the multi-location form, and one of its locations.
+let reviewerCitedJson(severity: String!, claim: String!, category: String!, caused: Boolean!, locations: [String!]!): String! {
+  let head = JSON.encode({{severity: severity, claim: claim, category: category, causedByChange: caused}})
+  head.trimSpace.trimSuffix("}") + ", \"locations\": [" + locations.join(", ") + "]}"
+}
+
+let reviewerLocationJson(path: String!, line: Int!, evidence: String!): String! {
+  JSON.encode({{path: path, line: line, evidence: evidence}})
+}
+
+let reviewerCausedVote(verdict: String!, severity: String!, caused: Boolean!): String! {
+  JSON.encode({{verdict: verdict, severity: severity, causedByChange: caused, reason: "checked"}})
+}
+
 # The fingerprint findingsList prints for the finding at `where` (path:line).
 let reviewerFingerprintAt(listing: String!, where: String!): String! {
   let pattern = "  " + where.replace(".", "\\.") + "  \\[([0-9a-f]+)\\]"
@@ -115,7 +129,7 @@ let checkReviewerScreening: String! {
   assert(message: summary) { summary.contains("votes: 1/1 confirmed") }
   # The mechanical drops, each with its reason.
   assert(message: summary) { summary.contains("Dropped by the evidence checks (5):") }
-  assert(message: summary) { summary.contains("calc.py:2 (general): style or cleanup only (naming)") }
+  assert(message: summary) { summary.contains("calc.py:2 (general): style only (naming)") }
   assert(message: summary) { summary.contains("nope.py:1 (general): path does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:99 (general): line does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:18 (general): quoted evidence does not appear") }
@@ -124,6 +138,11 @@ let checkReviewerScreening: String! {
   assert(message: summary) { summary.contains("Below quorum (1 of 1): calc.py:8 (0/1 confirmed)") }
   assert(message: summary) { summary.contains("1 more nit over the nit cap (1) not reported.") }
   assert(message: summary) { summary.contains("Reviewed ") and summary.contains("1 commit, 2 files changed, at QUICK depth") }
+  # No synthesizer ran, so no verdict; the reproductions note is there.
+  assert(message: summary) { !summary.contains("Verdict:") and summary.contains("are the reviewers' own reproductions") }
+  # A finding outside the hunks that no voter says the change caused is
+  # PRE-EXISTING, without the caused-by-the-change note.
+  assert(message: summary) { !summary.contains("though the change causes it") }
   # State: exactly the three reported findings are OPEN.
   assert(message: open) { open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 3 }
   assert(message: open) { open.contains("OPEN  IMPORTANT  calc.py:2  [") and open.contains("OPEN  NIT  calc.py:3  [") and open.contains("OPEN  PREEXISTING  calc.py:18  [") }
@@ -175,6 +194,142 @@ let checkReviewerScreening: String! {
   ).lastSummary
   assert(message: plus) { (plus.split("\n")[0] ?? "") == "1 important" }
   "Reviewer screening checks passed."
+}
+
+let reviewerConcernClaim: String! = "discount now trusts percent to be a whole number, an assumption no caller states, so a fraction silently becomes a tiny discount"
+
+let checkReviewerConcerns: String! {
+  let fx = reviewerFixture
+  let finder = reviewerFindingsReply([
+    # A concern citing four places: two hold (one in a hunk, so it anchors
+    # there), two do not, and those are named rather than fatal.
+    reviewerCitedJson("CONCERN", reviewerConcernClaim, "design", true, [
+      reviewerLocationJson("calc.py", 18, "return eval(x)"),
+      reviewerLocationJson("calc.py", 2, "rate = percent / 10"),
+      reviewerLocationJson("calc.py", 99, "rate = percent / 10"),
+      reviewerLocationJson("nope.py", 1, "x = 1"),
+    ]),
+    # A concern none of whose locations hold is dropped, with every reason.
+    reviewerCitedJson("CONCERN", "nothing here holds", "design", true, [
+      reviewerLocationJson("calc.py", 99, "rate = percent / 10"),
+      reviewerLocationJson("nope.py", 1, "x = 1"),
+    ]),
+    # Docs the change leaves stale: outside the hunks, but caused by the
+    # change, as the voter confirms, so not PRE-EXISTING.
+    reviewerCitedJson("NIT", "notes.txt line 10 still describes the old numbering the change replaced", "docs", true, [
+      reviewerLocationJson("notes.txt", 10, "line 10"),
+    ]),
+    # Asserted as caused by the change, but the voter says it was there
+    # before: PRE-EXISTING.
+    reviewerCitedJson("IMPORTANT", "notes.txt line 15 is out of date", "docs", true, [
+      reviewerLocationJson("notes.txt", 15, "line 15"),
+    ]),
+  ])
+  let votes = [
+    reviewerCausedVote("CONFIRM", "CONCERN", true),
+    reviewerCausedVote("CONFIRM", "NIT", true),
+    reviewerCausedVote("CONFIRM", "IMPORTANT", false),
+  ]
+  let synthesis = JSON.encode({{
+    verdict: "The change adds a discount helper, but its rate is off by a factor of ten.",
+    sound: ["total() still sums prices as before", "  ", "legacy() is untouched"],
+  }})
+  let reviewed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [finder],
+    voterReplies: votes,
+    synthesisReply: synthesis,
+  )
+  let summary = reviewed.lastSummary
+  let open = reviewed.findingsList(status: ReviewerFindingStatus.OPEN)
+  let lines = summary.split("\n")
+  assert(message: summary) { (lines[0] ?? "") == "1 concern, 1 nit, 1 pre-existing" }
+  # The synthesis sits right after the count line, sound items cleaned up.
+  assert(message: summary) { (lines[1] ?? "") == "" }
+  assert(message: summary) { (lines[2] ?? "") == "Verdict: The change adds a discount helper, but its rate is off by a factor of ten." }
+  assert(message: summary) { (lines[3] ?? "") == "Checked and found sound:" }
+  assert(message: summary) { (lines[4] ?? "") == "- total() still sums prices as before" and (lines[5] ?? "") == "- legacy() is untouched" }
+  assert(message: summary) { (lines[6] ?? "") == "" and (lines[7] ?? "").hasPrefix("Reviewed ") }
+  # The concern, between IMPORTANT and NIT, anchored in the hunk, with its
+  # other location and the ones that did not hold.
+  assert(message: summary) { summary.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n  evidence:\n      rate = percent / 10\n  also at calc.py:18:\n      return eval(x)\n") }
+  assert(message: summary) { summary.contains("  cited but not found at head: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
+  assert(message: summary) { summary.contains("votes: 1/1 confirmed · design (general)") }
+  assert(message: summary) { (summary.split("CONCERN:")[0] ?? "").contains("Sub-agents composed from") and (summary.split("CONCERN:")[1] ?? "").contains("NIT:") }
+  # The dropped concern names every location's reason.
+  assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") }
+  assert(message: summary) { summary.contains("calc.py:99 (general): no cited location holds: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
+  # Stale docs caused by the change: a NIT, marked as outside the hunks.
+  assert(message: summary) { summary.contains("NIT:\n- notes.txt:10 — ") }
+  assert(message: summary) { summary.contains("outside the change's hunks, though the change causes it: GitHub cannot anchor a line comment there") }
+  assert(message: summary) { summary.split("though the change causes it").length == 2 }
+  # Not confirmed as caused by the change: PRE-EXISTING.
+  assert(message: summary) { summary.contains("PRE-EXISTING (outside the change's hunks and not caused by it; GitHub cannot anchor a line comment there):\n- notes.txt:15 — ") }
+  assert(message: open) { open.contains("OPEN  CONCERN  calc.py:2  [") and open.contains("OPEN  NIT  notes.txt:10  [") and open.contains("OPEN  PREEXISTING  notes.txt:15  [") }
+
+  # Asserted by the finder alone is not enough: a voter who does not say the
+  # change caused it leaves the stale line PRE-EXISTING.
+  let unconfirmed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([reviewerCitedJson("NIT", "notes.txt line 10 is stale", "docs", true, [reviewerLocationJson("notes.txt", 10, "line 10")])])],
+    voterReplies: [reviewerVote("CONFIRM", "NIT")],
+  ).lastSummary
+  assert(message: unconfirmed) { (unconfirmed.split("\n")[0] ?? "") == "1 pre-existing" }
+
+  # A malformed optional field loses only itself: the finding stays, and a
+  # voter's confirmation still places it.
+  let sloppy = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"findings\": [{\"severity\": \"NIT\", \"claim\": \"notes.txt line 10 is stale\", \"category\": \"docs\", \"causedByChange\": \"yes\", \"path\": \"notes.txt\", \"line\": 10, \"evidence\": \"line 10\"}], \"checked\": [{\"what\": \"not a string\"}]}"],
+    voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true)],
+  ).lastSummary
+  assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 nit" and sloppy.contains("though the change causes it") }
+
+  # With nothing found, the synthesis still leads; a prose or failed
+  # synthesizer reply is shown for what it is.
+  let quiet = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"findings\": [], \"checked\": [\"discount handles a zero percent\"]}"],
+    voterReplies: [],
+    synthesisReply: "```json\n{\"verdict\": \"Small, and it does what it says.\", \"sound\": []}\n```",
+  ).lastSummary
+  let quietLines = quiet.split("\n")
+  assert(message: quiet) { (quietLines[0] ?? "") == "Nothing to fix." and (quietLines[2] ?? "") == "Verdict: Small, and it does what it says." }
+  assert(message: quiet) { (quietLines[3] ?? "") == "Checked and found sound: nothing listed." }
+  assert(message: quiet) { !quiet.contains("Answer every finding") }
+  let prose = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([])],
+    voterReplies: [],
+    synthesisReply: "Looks right to me.",
+  ).lastSummary
+  assert(message: prose) { (prose.split("\n")[2] ?? "") == "Verdict: Looks right to me." }
+  let failed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([])],
+    voterReplies: [],
+    synthesisReply: "REVIEWER SUB-AGENT FAILED: the model timed out",
+  ).lastSummary
+  assert(message: failed) { (failed.split("\n")[2] ?? "") == "Verdict: none; the synthesizer failed: the model timed out" }
+  "Reviewer concern, causedByChange and synthesis checks passed."
 }
 
 let checkReviewerReconcile: String! {
@@ -287,7 +442,7 @@ let checkReviewerComposition(source: Workspace!): String! {
   # Default composition picks the reviewer's agent, never its roles.
   let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "reviewer/**").items.{{ uri }}.map { a => a.uri }
   assert(message: defaults.join(", ")) { defaults.any { u => u.contains("reviewer/agent") } }
-  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/voter") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/voter") or u.contains("reviewer/synthesizer") } }
 
   let chief = llm.withWorkspace(source).spawn(
     name: "reviewer-composition-chief",
@@ -299,6 +454,7 @@ let checkReviewerComposition(source: Workspace!): String! {
   let picked = reviewer.subagentExpertise(caller: chief, role: "finder").{{ id, artifact.{{ uri }} }}
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let voters = reviewer.subagentExpertise(caller: chief, role: "voter").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
+  let synth = reviewer.subagentExpertise(caller: chief, role: "synthesizer").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
   let finder = llm.withWorkspace(source).spawn(name: "reviewer-composition-finder", expertise: selected);
   {
     # Staff and reviewer are gone; contributor and committer are read-only.
@@ -306,6 +462,7 @@ let checkReviewerComposition(source: Workspace!): String! {
     assert(message: uris.join(", ")) { uris.length == 3 }
     assert(message: uris.join(", ")) { (uris[0] ?? "").contains("committer/readonly") and (uris[1] ?? "").contains("contributor/readonly") and (uris[2] ?? "").contains("reviewer/finder") }
     assert(message: voters.join(", ")) { voters.length == 3 and (voters[2] ?? "").contains("reviewer/voter") }
+    assert(message: synth.join(", ")) { synth.length == 3 and (synth[2] ?? "").contains("reviewer/synthesizer") }
 
     let conversation = finder.snapshot.sync
     assert(message: recordedUris(conversation).join(", ")) { recordedUris(conversation) == uris }
@@ -317,7 +474,7 @@ let checkReviewerComposition(source: Workspace!): String! {
       assert(message: names.join(", ")) { !names.any { t => t == n or t.hasSuffix("_" + n) } }
     }
     let prompts = systemTexts(conversation)
-    assert { prompts.any { t => t.contains("You are a bug finder in a code review") } }
+    assert { prompts.any { t => t.contains("You are an adversarial reviewer in a code review") } }
     assert { prompts.any { t => t.contains("READ-ONLY GitHub tools") } }
     assert { !prompts.any { t => t.contains("You can hire and direct a staff") or t.contains("You have a code reviewer") } }
 
@@ -358,7 +515,7 @@ let checkReviewerComposition(source: Workspace!): String! {
 }
 
 let checkReviewerTools(source: Workspace!): String! {
-  let plumbing = ["finder", "voter", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
+  let plumbing = ["finder", "voter", "synthesizer", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
   # review takes the calling agent, which only an owning agent supplies.
   let unowned = composedToolNames(reviewer.agent(llm.withWorkspace(source)), llm.withWorkspace(source))
   assert(message: unowned.join(", ")) { unowned.contains("findingsList") and unowned.contains("resolve") and !unowned.contains("review") }
@@ -370,7 +527,7 @@ let checkReviewerTools(source: Workspace!): String! {
   plumbing.each { n =>
     assert(message: names.join(", ")) { !names.contains(n) }
   }
-  assert { systemTexts(conversation).any { t => t.contains("REVIEW YOUR OWN CHANGE") } }
+  assert { systemTexts(conversation).any { t => t.contains("REVIEW YOUR OWN CHANGE") and t.contains("THE REVIEWERS' REPRODUCTIONS") } }
   "Reviewer tool visibility checks passed."
 }
 
