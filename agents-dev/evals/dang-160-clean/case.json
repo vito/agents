@@ -1,0 +1,24 @@
+{
+  "name": "dang-160-clean",
+  "title": "Finish GraphQL value conversion: Float args + lossless numbers",
+  "pr": "https://github.com/vito/dang/pull/160",
+  "repo": "https://github.com/vito/dang",
+  "head": "338e5fdbf23ec6eb1687040aaf8babecc36b19b9",
+  "base": "6e8ca566d3034f10571793cacaf158e1280560ad",
+  "notes": "A known-clean change, to measure noise: vito/dang#160, +255/-84 over 7 files (162 of the added lines are gqlgen output in tests/gqlserver/generated.go). Merged 2026-06-30; as of 2026-10-17 no later commit touches pkg/querybuilder/querybuilder.go or pkg/dang/builtins.go, and none of the later commits to pkg/dang/eval.go fixes number or argument conversion. No known issues: absence of a follow-up fix is not proof of correctness, so a well-argued finding can still be guidance, but a good review should say the change is fine and raise little.",
+  "issues": [],
+  "sound": [
+    {
+      "key": "use-number-decode",
+      "summary": "Execute captures the response's data as json.RawMessage and decodes it (and every unpack) with UseNumber, so numbers arrive as json.Number and integers stay exact; the declared GraphQL type then decides Int vs Float."
+    },
+    {
+      "key": "float-and-map-arguments",
+      "summary": "dangValueToGo now serializes FloatValue and MapValue (converting map entries recursively), so a Float result can be passed back as a Float argument; the new test round-trips averageRating through echoFloat."
+    },
+    {
+      "key": "untyped-number-fallback",
+      "summary": "ToValue's json.Number case is the untyped fallback: an integral number that fits an int becomes an Int, anything else a Float."
+    }
+  ]
+}
