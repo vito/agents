@@ -225,7 +225,7 @@ let testCommitterReadonly(source: Workspace!): String! {
   # Its prompt does not teach the push it lacks.
   let roPrompts = systemTexts(ro).join("\n")
   assert(message: roPrompts) { roPrompts.contains("`cherryPick` — take commits") }
-  assert(message: roPrompts) { !roPrompts.contains("`push` — publish") and !roPrompts.contains("call to publish") }
+  assert(message: roPrompts) { !roPrompts.contains("`push` — publish") and !roPrompts.contains("call to publish") and !roPrompts.contains("only push when asked") }
   assert { systemTexts(full).join("\n").contains("`push` — publish") }
 
   # A tool that returns the conversation rebinds the toolset itself. Through

@@ -131,12 +131,14 @@ type Committer {
       .withSystemPrompt("This conversation is read-only toward remotes: there is no push. Commit locally; your work leaves through whoever harvests your commits.")
   }
 
-  # The full prompt minus what it says about push: its bullet, and the
-  # rebase's push hint (the read-only rebase prints a harvest note instead).
+  # The full prompt minus what it says about push: its bullet, the rebase's
+  # push hint (the read-only rebase prints a harvest note instead), and the
+  # closing advice on when to push.
   let readOnlySystemPrompt: String! {
     systemPrompt
       .replaceMatches("(?s)\\n[ \\t]*- `push` — publish.*?genuinely intended\\.", with: "")
       .replaceMatches("the finished\\s+rebase prints the `push\\(branch:, expectedRemoteSHA:\\)` call to publish\\.", with: "the finished rebase says how its commits leave.")
+      .replaceMatches("\\s+—\\s+and\\s+only\\s+push\\s+when\\s+asked:\\s+a\\s+push\\s+leaves\\s+the\\s+workspace\\s+and\\s+publishes\\s+to\\s+the\\s+remote\\.", with: ".")
   }
 
   """
