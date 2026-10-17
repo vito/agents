@@ -225,6 +225,10 @@ type Screened {
   """
   dropped: [String!]! = []
   """
+  Findings merged into an earlier one quoting the same code.
+  """
+  merged: [String!]! = []
+  """
   Whether every finder answered with findings JSON.
   """
   complete: Boolean! = true
@@ -417,7 +421,7 @@ type Reviewer {
     let judged = judge(plan, screened.kept, votes)
 
     # 4. Sum up: one sub-agent, no vote.
-    let synthesis = runAgents(headWs, synthExp, ["synthesizer"], [synthesisTask(s, judged.confirmed, screened.checked)], [replaySynthesis])[0] ?? ""
+    let synthesis = runAgents(headWs, synthExp, ["synthesizer"], [synthesisTask(s, reportable(s, judged.confirmed), screened.checked)], [replaySynthesis])[0] ?? ""
 
     # 5. Reconciliation and the summary.
     let next = settle(s, plan, screened, judged, synthesis, composedFrom, "")
@@ -552,6 +556,19 @@ type Reviewer {
     replies
   }
 
+  # What of the confirmed findings the summary will report as open: nits
+  # within the cap, and nothing an earlier review's answer RESOLVED (by
+  # fingerprint, or the same quoted code at the same path, as settle
+  # matches them). The synthesizer sees only these.
+  let reportable(s: Subject!, confirmed: [Finding!]!): [Finding!]! {
+    let cappedOut = confirmed.filter { f => f.severity == Severity.NIT }.dropFirst(s.nitCap).map { f => f.fingerprint }
+    let resolved = findings.values.filter { p => p.status == FindingStatus.RESOLVED }
+    confirmed.filter { f =>
+      let key = evidenceKey(f.path, f.evidence)
+      !cappedOut.contains(f.fingerprint) and !resolved.any { p => p.fingerprint == f.fingerprint or evidenceKey(p.path, p.evidence) == key }
+    }
+  }
+
   # Step 5 of the pipeline: reconcile what was judged with state, and
   # render the summary. `synthesis` is the synthesizer's reply, or null when
   # none ran.
@@ -626,7 +643,7 @@ type Reviewer {
 
     let lines: [String!]! = [countLine(important.length, concerns.length, nits.length, preexisting.length)]
     if (!complete) {
-      lines += ["Incomplete: a finder did not answer (see below), so what it would have found is missing, and no earlier finding was marked FIXED. Review again to cover it."]
+      lines += ["Incomplete: a finder did not answer in full (see below), so what it would have found is missing, and no earlier finding was marked FIXED. Review again to cover it."]
     }
     if (synthesis != null) {
       lines += [""] + renderSynthesis(synthesis)
@@ -652,6 +669,9 @@ type Reviewer {
     }
     if (!dropped.isEmpty) {
       notes += [`Dropped by the evidence checks (${toString(dropped.length)}):`] + dropped.map { d => "  - " + d }
+    }
+    if (!screened.merged.isEmpty) {
+      notes += [`Merged into an earlier finding quoting the same code (${toString(screened.merged.length)}):`] + screened.merged.map { d => "  - " + d }
     }
     if (!belowQuorum.isEmpty) {
       notes += [`Below quorum (${toString(plan.quorum)} of ${toString(plan.voters)}): ` + belowQuorum.join(", ")]
@@ -950,6 +970,7 @@ let failedReply: String! = "REVIEWER SUB-AGENT FAILED: "
 let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
   let kept: [Finding!]! = []
   let dropped: [String!]! = []
+  let merged: [String!]! = []
   let checked: [String!]! = []
   let complete = true
   replies.each { reply, i =>
@@ -962,6 +983,10 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
       dropped += [`finder "${angle}" replied without the findings JSON`]
     } else {
       let parsed = parseFindings(reply)
+      if (!parsed.locationsRead) {
+        complete = false
+        dropped += [`finder "${angle}": its findings' locations could not be read (a line that is not a number?)`]
+      }
       checked += parsed.checked.map { c => squash(c) }.filter { c => c != "" }.takeFirst(maxChecked)
       parsed.findings.each { r, j =>
         let claim = (r.claim ?? "").trimSpace
@@ -1012,9 +1037,13 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
             dropped += [`${where} (${angle}): ${reason}`]
           } else {
             # Two finders quoting the same code at the same path report one
-            # finding, however they word it; the first one's claim stands.
+            # finding, however they word it; the first one's claim stands,
+            # and the merge is listed so a distinct claim is not lost
+            # without trace.
             let key = evidenceKey(primary.path, primary.evidence)
-            if (!kept.any { k => evidenceKey(k.path, k.evidence) == key }) {
+            if (kept.any { k => evidenceKey(k.path, k.evidence) == key }) {
+              merged += [`${primary.path}:${toString(primary.line)} (${angle}): ${clip(claim, 160)}`]
+            } else {
               let said = (r.severity ?? "").trimSpace.toUpper
               let severity = if (said == "NIT") {
                 Severity.NIT
@@ -1047,7 +1076,7 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
       }
     }
   }
-  Screened(kept: kept, dropped: dropped, complete: complete, checked: checked)
+  Screened(kept: kept, dropped: dropped, merged: merged, complete: complete, checked: checked)
 }
 
 let maxCitations: Int! = 5
@@ -1230,11 +1259,15 @@ let readsAsFindings(reply: String!): Boolean! {
 
 # The findings' core fields decide whether the reply is an answer at all.
 # The optional ones (causedByChange, locations, checked) are decoded on their
-# own, so a malformed one loses only itself, never the finder's findings.
+# own, so a malformed one never makes the reply unreadable. Locations decode
+# with lines as numbers, else as text ("42" or "42-44"); when neither reads,
+# `locationsRead` is false and the screen counts the finder as incomplete,
+# since findings citing only those locations are lost.
 let parseFindings(reply: String!): {{
   findings: [{{path: String, line: Int, claim: String, evidence: String, category: String, severity: String}}!]!,
   caused: [Boolean!]!,
   locations: [[{{path: String, line: Int, evidence: String}}!]!]!,
+  locationsRead: Boolean!,
   checked: [String!]!,
 }}! {
   let raw = jsonBody(reply)
@@ -1248,9 +1281,12 @@ let parseFindings(reply: String!): {{
     raise "the reply has no `findings` list"
   }
   let caused = decodeCaused(body) rescue { e: Error => [] :: [Boolean!]! }
-  let locations = decodeLocations(body) rescue { e: Error => [] :: [[{{path: String, line: Int, evidence: String}}!]!]! }
+  let numbered = decodeLocations(body) rescue { e: Error => null }
+  let texted = if (numbered == null) { decodeTextLocations(body) rescue { e: Error => null } } else { null }
+  let none: [[{{path: String, line: Int, evidence: String}}!]!]! = []
+  let locations = numbered ?? (texted ?? none)
   let checked = decodeChecked(body) rescue { e: Error => [] :: [String!]! }
-  {{findings: listed, caused: caused, locations: locations, checked: checked}}
+  {{findings: listed, caused: caused, locations: locations, locationsRead: numbered != null or texted != null, checked: checked}}
 }
 
 let decodeCaused(body: String!): [Boolean!]! {
@@ -1261,6 +1297,17 @@ let decodeCaused(body: String!): [Boolean!]! {
 let decodeLocations(body: String!): [[{{path: String, line: Int, evidence: String}}!]!]! {
   let p: {{findings: [{{locations: [{{path: String, line: Int, evidence: String}}!]}}!]}}! = JSON.decode(body)
   (p.findings ?? []).map { f => f.locations ?? [] }
+}
+
+let decodeTextLocations(body: String!): [[{{path: String, line: Int, evidence: String}}!]!]! {
+  let p: {{findings: [{{locations: [{{path: String, line: String, evidence: String}}!]}}!]}}! = JSON.decode(body)
+  (p.findings ?? []).map { f =>
+    (f.locations ?? []).map { l =>
+      let m = (l.line ?? "").match(`^\s*(\d+)`)
+      let n: Int = if (m != null) { toInt(m.captures[0] ?? "0") } else { 0 }
+      {{path: l.path, line: n, evidence: l.evidence}}
+    }
+  }
 }
 
 let decodeChecked(body: String!): [String!]! {
