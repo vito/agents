@@ -149,6 +149,8 @@ let checkReviewerScreening: String! {
     voterReplies: [],
   ).lastSummary
   assert(message: prose) { (prose.split("\n")[0] ?? "") == "Nothing to fix." and prose.contains("finder \"general\" replied without the findings JSON") }
+  assert(message: prose) { (prose.split("\n")[1] ?? "").hasPrefix("Incomplete: a finder did not answer") }
+  assert(message: none) { !none.contains("Incomplete") }
 
   # Prose votes: a refusal that mentions confirming is not a confirmation.
   let refused = reviewer.tallyReplies(

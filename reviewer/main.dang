@@ -546,6 +546,9 @@ type Reviewer {
     let preexisting = open.filter { f => f.severity == Severity.PREEXISTING }
 
     let lines: [String!]! = [countLine(important.length, nits.length, preexisting.length)]
+    if (!complete) {
+      lines += ["Incomplete: a finder did not answer (see below), so what it would have found is missing, and no earlier finding was marked FIXED. Review again to cover it."]
+    }
     let rangeLine = `Reviewed ${shortSha(s.forkSha)}..${shortSha(s.headSha)} (merge base..head): ` +
       `${plural(s.commits.length, "commit")}, ${plural(s.files.length, "file")} changed, at ${plan.label}.`
     lines += ["", rangeLine]
