@@ -661,7 +661,7 @@ type Reviewer {
     lines += renderGroup("CONCERN", concerns)
     lines += renderGroup("NIT", nits)
     lines += renderGroup("PRE-EXISTING (outside the change's hunks and not caused by it; GitHub cannot anchor a line comment there)", preexisting)
-    if (synth != null) {
+    if (synth != null and !synth.sound.isEmpty) {
       lines += [""] + synth.sound
     }
     let rangeLine = `Reviewed ${shortSha(s.forkSha)}..${shortSha(s.headSha)} (merge base..head): ` +

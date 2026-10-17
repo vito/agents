@@ -390,6 +390,7 @@ let checkReviewerConcerns: String! {
     synthesisReply: "REVIEWER SUB-AGENT FAILED: the model timed out",
   ).lastSummary
   assert(message: failed) { (failed.split("\n")[2] ?? "") == "Verdict: none; the synthesizer failed: the model timed out" }
+  assert(message: failed) { !failed.contains("\n\n\n") and !prose.contains("\n\n\n") }
   "Reviewer concern, causedByChange and synthesis checks passed."
 }
 
