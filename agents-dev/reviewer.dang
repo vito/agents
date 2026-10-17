@@ -296,6 +296,41 @@ let checkReviewerConcerns: String! {
   ).lastSummary
   assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 nit" and sloppy.contains("though the change causes it") }
 
+  # Each finding says why it is worth the time; nits are compact quick
+  # fixes, without a quoted evidence block.
+  let worthy = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"findings\": [{\"severity\": \"NIT\", \"claim\": \"notes.txt line 10 still uses the old numbering; renumber it\", \"worth\": \"readers follow the notes\", \"category\": \"docs\", \"locations\": [{\"path\": \"notes.txt\", \"line\": 10, \"evidence\": \"line 10\"}, {\"path\": \"notes.txt\", \"line\": 11, \"evidence\": \"line 11\"}]}]}"],
+    voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true)],
+  ).lastSummary
+  assert(message: worthy) { worthy.contains("NIT:\n- notes.txt:10 — notes.txt line 10 still uses the old numbering; renumber it\n  worth it: readers follow the notes\n  also at notes.txt:11\n  outside the change's hunks") }
+  assert(message: worthy) { !worthy.contains("evidence:") }
+
+  # At most three concerns, the strongest: of four confirmed at STANDARD,
+  # the one with two of three votes goes.
+  let four = reviewerFindingsReply([
+    reviewerCitedJson("CONCERN", "concern one", "design", true, [reviewerLocationJson("calc.py", 1, "def discount(total, percent):")]),
+    reviewerCitedJson("CONCERN", "concern two", "design", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
+    reviewerCitedJson("CONCERN", "concern three", "design", true, [reviewerLocationJson("calc.py", 3, "return total - total * rate")]),
+    reviewerCitedJson("CONCERN", "concern four", "design", true, [reviewerLocationJson("notes.txt", 25, "changed")]),
+  ])
+  let yes = reviewerCausedVote("CONFIRM", "CONCERN", true)
+  let no = reviewerCausedVote("REJECT", "CONCERN", true)
+  let capped = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    depth: ReviewerDepth.STANDARD,
+    finderReplies: [four, reviewerFindingsReply([]), reviewerFindingsReply([])],
+    voterReplies: [yes, yes, no, yes, yes, yes, yes, yes, yes, yes, yes, yes],
+  ).lastSummary
+  assert(message: capped) { (capped.split("\n")[0] ?? "") == "3 concerns" }
+  assert(message: capped) { !capped.contains("— concern one") and capped.contains("— concern two") and capped.contains("— concern four") }
+  assert(message: capped) { capped.contains("1 weaker concern over the concern cap (3) not reported: calc.py:1") }
+
   # A location's line given as text still reads ("2-3" is line 2); a line
   # that reads as neither number nor text loses the locations, so the
   # review is incomplete rather than a clean pass that closes findings.
