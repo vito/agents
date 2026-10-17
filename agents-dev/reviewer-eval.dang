@@ -385,15 +385,20 @@ let reviewerEvalEditorSource(source: Workspace!): String! {
 }
 
 # Evaluate reviewer-eval's `fn` in the fixture and read its result file, in
-# one query so the uncached function runs exactly once.
+# one query so the uncached function runs exactly once: a bare type
+# assertion (`... on File!`) and then `.contents` would be two queries,
+# each evaluating the function, so two full reviews per eval.
 let reviewerEvalInvoke(source: Workspace!, agents: [String!]!, input: Directory!, fn: String!): String! {
-  reviewerEvalFixture(source, agents, input)
+  let read = reviewerEvalFixture(source, agents, input)
     .artifacts
     .filterUri(uri: "dag://reviewer-eval/" + fn)
     .one
     .value
-    .{{ ... on File! }}
-    .contents
+    .{{ ... on File {{ contents }} }}
+  case (read) {
+    f: File => f.contents
+    else => raise `reviewer-eval/${fn} did not return a file`
+  }
 }
 
 # What the judge sees of a case (see renderCase in reviewer-eval/): the
