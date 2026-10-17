@@ -310,7 +310,27 @@ let reviewerEvalFixture(source: Workspace!, agents: [String!]!, input: Directory
       dir = dir.withDirectory(m, source.directory("/" + m))
     }
   }
+  # The workspace's GitHub token setting, so the sub-agents' read-only gh
+  # is authenticated as it is in the workspace itself.
+  let token = reviewerEvalGithubToken(source)
+  if (agents.contains("contributor") and token != "") {
+    toml += ["[modules.contributor.settings]", "githubToken = " + JSON.encode(token), ""]
+  }
   dir.withNewFile("dagger.toml", toml.join("\n")).asWorkspace
+}
+
+# The contributor's githubToken setting in the workspace's dagger.toml (a
+# secret reference such as "cmd://gh auth token"), or "".
+let reviewerEvalGithubToken(source: Workspace!): String! {
+  let cfg: {{modules: {{contributor: {{settings: {{githubToken: String}}}}}}!}}! = TOML.decode(source.file("dagger.toml").contents) rescue {
+    e: Error => return ""
+  }
+  let contributor = cfg.modules.contributor
+  if (contributor == null) {
+    return ""
+  }
+  let settings = contributor.settings
+  if (settings == null) { "" } else { settings.githubToken ?? "" }
 }
 
 # What a review's caller composes besides reviewer: committer and
@@ -542,7 +562,7 @@ let reviewerEvalScorecard(
       if (vetted == "dismiss" and value != "speed-bump" and value != "false") {
         value = "speed-bump"
         note = "its issue is vetted dismiss"
-      } else if (vetted == "real" and (value == "speed-bump" or value == "false")) {
+      } else if (vetted == "real" and value != "guardrail" and value != "guidance" and value != "quick-fix") {
         value = "guidance"
         note = "its issue is vetted real"
       }
@@ -717,6 +737,10 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let names = source.directory("agents-dev/evals").entries.map { e => e.trimSuffix("/") }
   assert(message: names.join(", ")) { names.contains("dang-187") }
   names.each { n => loadReviewerEvalCase(source, n) }
+  # What a live run's fixture carries over from this workspace's dagger.toml.
+  let editor = reviewerEvalEditorSource(source)
+  let token = reviewerEvalGithubToken(source)
+  assert(message: editor + " / " + token) { editor.contains("editor") and token != "" }
 
   # Validation catches what it should.
   let bad = decodeReviewerEvalCase(reviewerEvalSyntheticCase
