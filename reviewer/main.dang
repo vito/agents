@@ -602,15 +602,16 @@ type Reviewer {
         if (m == "contributor" or m == "committer") {
           # Never a write tool: whatever entry of these modules the caller
           # holds, the sub-agent gets the module's read-only role, from where
-          # the entry was discovered. A module without one is left out.
+          # the entry was discovered, else from where reviewer's entry was
+          # (that workspace may predate the role). A module with no role in
+          # either is left out rather than composed with its write tools.
           if (!readonly.contains(m)) {
             readonly += [m]
             let where = node(id: e.id).{{ ... on Expertise! }}.artifact.workspace.id rescue {
               err: Error => null
             }
-            if (where != null) {
-              picked += expertiseIn(where, `dag://${m}/readonly`)
-            }
+            let own = if (where != null) { expertiseIn(where, `dag://${m}/readonly`) } else { [] :: [Expertise!]! }
+            picked += if (own.isEmpty) { expertiseIn(home, `dag://${m}/readonly`) } else { own }
           }
         } else {
           picked += [node(id: e.id).{{ ... on Expertise! }}]

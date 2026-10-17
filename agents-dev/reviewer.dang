@@ -266,6 +266,26 @@ let checkReviewerComposition(source: Workspace!): String! {
     let missing = reviewer.subagentExpertise(caller: bare, role: "finder").{{ id }}.length rescue { e: Error => -1 }
     bare.stop
     assert { missing == -1 }
+
+    # A committer entry discovered in a workspace whose committer has no
+    # read-only role (an older one) gets the role from where reviewer's
+    # entry came from, never the full agent.
+    let older = directory
+      .withNewFile("dagger.toml", "[modules.committer]\nsource = \"committer\"\n")
+      .withDirectory("committer", agentModule("committer", "Committer", "older committer", "olderRead"))
+      .asWorkspace
+    let mixed = llm.withWorkspace(source).spawn(
+      name: "reviewer-composition-mixed",
+      expertise: expertiseAt(older, "dag://committer/agent") + expertiseAt(source, "dag://reviewer/agent"),
+    )
+    let fallback = reviewer.subagentExpertise(caller: mixed, role: "voter").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri } rescue {
+      err: Error => {
+        mixed.stop
+        raise err.message
+      }
+    }
+    mixed.stop
+    assert(message: fallback.join(", ")) { fallback.length == 2 and (fallback[0] ?? "").contains("committer/readonly") and (fallback[1] ?? "").contains("reviewer/voter") }
     null
   } rescue { e: Error => {
     finder.stop
