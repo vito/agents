@@ -79,6 +79,18 @@ type AgentsDev {
     null
   }
 
+  """Check the read-only contributor role: exactly the read tools, sticky through recomposition and reload, gh write verbs refused, no agent adoption on checkout."""
+  contributorReadonly(source: Workspace!): Void @check {
+    print(testContributorReadonly(source: source))
+    null
+  }
+
+  """Check the read-only committer role: no push, kept through reset's own rebind, recomposition and reload."""
+  committerReadonly(source: Workspace!): Void @check {
+    print(testCommitterReadonly(source: source))
+    null
+  }
+
   """Check the escape hatches' glob filtering and literal internal drift paths without model calls."""
   staffFiltering(source: Workspace!): Void @check {
     print(testStaffFiltering(source: source))

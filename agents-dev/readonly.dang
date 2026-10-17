@@ -1,0 +1,231 @@
+# Read-only roles, without model calls: what a conversation composed through
+# `dag://contributor/readonly` or `dag://committer/readonly` can call, that
+# it stays read-only through later compositions, reloads and tools that
+# rebind their own toolset, and that the bound objects refuse writes. Every
+# refusal happens before gh or git runs, so no request reaches a remote; the
+# GitHub token is fake.
+
+# The tool names LLM.tools renders, one "## <name>" heading per tool.
+let toolNames(tools: String!): [String!]! {
+  tools.split("\n").filter { l => l.hasPrefix("## ") }.map { l => l.trimPrefix("## ").trimSpace }
+}
+
+# Names in `conversation`'s toolset that a bare conversation lacks: what its
+# composition contributed.
+let composedToolNames(conversation: LLM!, bare: LLM!): [String!]! {
+  let baseline = toolNames(bare.tools)
+  toolNames(conversation.tools).filter { n => !baseline.contains(n) }
+}
+
+let readOnlyRefused(result: String!): Boolean! {
+  result.contains("not available in read-only mode")
+}
+
+# gh's result, or the error it raised.
+let ghResult(c: Contributor!, ws: Workspace!, args: [String!]!): String! {
+  c.gh(source: ws, args: args) rescue { e: Error => e.message }
+}
+
+let testContributorReadonly(source: Workspace!): String! {
+  let readOnlyTools = ["gh", "reviewComments", "mount", "unmount", "checkout"]
+  let writeTools = ["comment", "updateComment", "pushBranch"]
+
+  # Default composition picks the full agent, never the read-only role.
+  let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "contributor/**").items.{{ uri }}.map { a => a.uri }
+  assert(message: defaults.join(", ")) { defaults.any { u => u.contains("contributor/agent") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("contributor/readonly") } }
+
+  let bare = llm.withWorkspace(source)
+  let full = bare.compose(expertise: expertiseAt(source, "dag://contributor/agent"))
+  let ro = bare.compose(expertise: expertiseAt(source, "dag://contributor/readonly"))
+
+  # The full agent has the write tools; the read-only role has EXACTLY the
+  # read tools, so a write tool added to Contributor later fails this check
+  # until it is classified.
+  let fullNames = composedToolNames(full, bare)
+  writeTools.each { n => assert(message: fullNames.join(", ")) { fullNames.contains(n) } }
+  assert(message: fullNames.join(", ")) { !fullNames.contains("readonly") and !fullNames.contains("asReadOnly") }
+  let roNames = composedToolNames(ro, bare)
+  assert(message: roNames.join(", ")) { roNames.length == readOnlyTools.length }
+  readOnlyTools.each { n => assert(message: roNames.join(", ")) { roNames.contains(n) } }
+  assert(message: recordedUris(ro).join(", ")) { recordedUris(ro).length == 1 and (recordedUris(ro)[0] ?? "").contains("contributor/readonly") }
+  let prompts = systemTexts(ro)
+  assert { prompts.any { t => t.contains("READ-ONLY GitHub tools") } }
+  assert { !prompts.any { t => t.contains("`comment` and\n`updateComment` post") } }
+
+  # Sticky: composing the full agent onto a read-only conversation (what an
+  # editor install or a checkout adoption does) adds no write tool, and a
+  # reload — which reruns every recorded contributor entry — keeps it so.
+  let thenFull = ro.compose(expertise: expertiseAt(source, "dag://contributor/agent"))
+  assert(message: recordedUris(thenFull).join(", ")) { recordedUris(thenFull).length == 2 }
+  let thenFullNames = composedToolNames(thenFull, bare)
+  writeTools.each { n => assert(message: thenFullNames.join(", ")) { !thenFullNames.contains(n) } }
+  let reloaded = reloadIn(thenFull, source)
+  let reloadedNames = composedToolNames(reloaded, bare)
+  writeTools.each { n => assert(message: reloadedNames.join(", ")) { !reloadedNames.contains(n) } }
+  assert(message: reloadedNames.join(", ")) { reloadedNames.contains("gh") }
+  # The reverse order: read-only composed onto a full conversation wins, and
+  # survives a reload that reruns both entries.
+  let demoted = full.compose(expertise: expertiseAt(source, "dag://contributor/readonly"))
+  let demotedNames = composedToolNames(demoted, bare)
+  writeTools.each { n => assert(message: demotedNames.join(", ")) { !demotedNames.contains(n) } }
+  let demotedReloaded = composedToolNames(reloadIn(demoted, source), bare)
+  writeTools.each { n => assert(message: demotedReloaded.join(", ")) { !demotedReloaded.contains(n) } }
+  assert(message: demotedReloaded.join(", ")) { demotedReloaded.contains("gh") }
+  # Both at once onto a full conversation: a refresh of contributor that
+  # replaces the full binding with the read-only one. The role binds with its
+  # own withTools version, so the engine resets the receiver to the read-only
+  # object rather than carrying the full one's state over.
+  let both = full.compose(expertise: expertiseAt(source, "dag://contributor/agent") + expertiseAt(source, "dag://contributor/readonly"))
+  let bothNames = composedToolNames(both, bare)
+  writeTools.each { n => assert(message: bothNames.join(", ")) { !bothNames.contains(n) } }
+  assert(message: bothNames.join(", ")) { bothNames.contains("gh") }
+
+  # gh in read-only mode: write verbs are refused before gh runs.
+  let ws = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
+    .directory("/repo")
+    .asGit
+    .head
+    .asWorkspace
+  let token = setSecret("contributor-readonly-test-token", "not-a-real-token")
+  let writable = contributor(githubToken: token)
+  let reader = writable.asReadOnly
+  let writes = [
+    ["pr", "merge", "1"],
+    ["pr", "close", "1"],
+    ["pr", "reopen", "1"],
+    ["pr", "ready", "1"],
+    ["pr", "create", "--title", "x", "--body", "y"],
+    ["pr", "edit", "1", "--add-label", "bug"],
+    ["pr", "review", "1", "--approve"],
+    ["pr", "comment", "1", "--body", "x"],
+    ["issue", "create", "--title", "x", "--body", "y"],
+    ["issue", "close", "1"],
+    ["issue", "edit", "1", "--add-label", "bug"],
+    ["run", "rerun", "1"],
+    ["run", "cancel", "1"],
+    ["workflow", "run", "ci.yml"],
+    ["repo", "fork"],
+    ["label", "create", "x"],
+    ["release", "create", "v1"],
+    ["gist", "create", "f"],
+    ["-R", "o/r", "pr", "merge", "1"],
+    ["pr", "--repo", "o/r", "merge", "1"],
+    ["pr", "--", "view"],
+    ["api", "-X", "POST", "repos/o/r/issues"],
+    ["api", "--method=PATCH", "repos/o/r/issues/1"],
+    ["api", "-XPUT", "repos/o/r/pulls/1/merge"],
+    ["api", "repos/o/r/issues", "-f", "title=x"],
+    ["api", "repos/o/r/issues", "-Ftitle=x"],
+    ["api", "repos/o/r/issues", "--raw-field=title=x"],
+    ["api", "--input", "body.json", "repos/o/r/issues"],
+    ["api", "graphql", "-f", "query=mutation { x }"],
+    ["api", "-X", "GET", "graphql", "-f", "query={ viewer { login } }"],
+  ]
+  writes.each { args =>
+    let result = ghResult(reader, ws, args)
+    assert(message: args.join(" ") + ": " + result) { readOnlyRefused(result) }
+  }
+  # Reads get past the gate. Explicit GET with fields: gh reads the -F file
+  # before any request, so the missing file proves the gate let it through
+  # without touching the network. The others may reach GitHub with the fake
+  # token; whatever they fail with, it is not the read-only gate.
+  let getFields = ghResult(reader, ws, ["api", "-X", "GET", "search/issues", "-F", "q=@always-missing"])
+  assert(message: getFields) { !readOnlyRefused(getFields) and getFields.contains("always-missing") }
+  [
+    ["pr", "view", "1", "--repo", "cli/cli"],
+    ["pr", "diff", "1", "--repo", "cli/cli"],
+    ["issue", "list", "--repo", "cli/cli"],
+    ["search", "issues", "readonly"],
+    ["api", "repos/cli/cli"],
+  ].each { args =>
+    let result = ghResult(reader, ws, args)
+    assert(message: args.join(" ") + ": " + result) { !readOnlyRefused(result) }
+  }
+  # The full contributor is unaffected: the same implicit-POST call reaches gh.
+  let fullPost = ghResult(writable, ws, ["api", "repos/o/r/issues", "-F", "title=@always-missing"])
+  assert(message: fullPost) { !readOnlyRefused(fullPost) and fullPost.contains("always-missing") }
+
+  # The hidden write tools refuse too, should anything bind them anyway.
+  let commented = reader.comment(source: ws, target: "1", body: ":robot: hi") rescue { e: Error => e.message }
+  assert(message: commented) { readOnlyRefused(commented) }
+  let updated = reader.updateComment(source: ws, target: "1", oldText: "a", newText: "b") rescue { e: Error => e.message }
+  assert(message: updated) { readOnlyRefused(updated) }
+  let pushed = reader.pushBranch(source: ws, repo: "o/r", branch: "x") rescue { e: Error => e.message }
+  assert(message: pushed) { readOnlyRefused(pushed) }
+
+  # checkout in read-only mode never adopts the target's agents.
+  let tree = directory
+    .withNewFile("dagger.toml", "[modules.extra]\nsource = \"extra\"\n")
+    .withNewFile("marker", "target\n")
+    .withDirectory("extra", agentModule("extra", "Extra", "extra capabilities", "extraRead"))
+  let fixtureContainer = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git", "git-daemon"])
+    .withDirectory("/repo", tree)
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", """
+      git init -b main
+      git config user.name 'Checkout Test'
+      git config user.email checkout@example.com
+      export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+      export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+      git add .
+      git commit -m target
+    """])
+  let server = contributorCheckoutServer(fixtureContainer)
+  let repo = server.endpoint(port: 9418, scheme: "git") + "/repo"
+  let switched = reader.checkout(llm: ro, source: source, repo: contributorCheckoutRef(repo, "")).sync
+  assert { switched.workspace.file("marker").contents == "target\n" }
+  assert(message: recordedUris(switched).join(", ")) { recordedUris(switched) == recordedUris(ro) }
+  assert { !switched.tools.contains("extraRead") }
+  # The same checkout through the full contributor adopts it.
+  let adopted = writable.checkout(llm: full, source: source, repo: contributorCheckoutRef(repo, "")).sync
+  assert { adopted.tools.contains("extraRead") }
+  server.stop
+
+  "Contributor read-only role checks passed."
+}
+
+let testCommitterReadonly(source: Workspace!): String! {
+  let bare = llm.withWorkspace(source)
+  let full = bare.compose(expertise: expertiseAt(source, "dag://committer/agent"))
+  let ro = bare.compose(expertise: expertiseAt(source, "dag://committer/readonly"))
+  let fullNames = composedToolNames(full, bare)
+  let roNames = composedToolNames(ro, bare)
+  assert(message: fullNames.join(", ")) { fullNames.contains("push") }
+  assert(message: fullNames.join(", ")) { !fullNames.contains("readonly") and !fullNames.contains("asReadOnly") }
+  # Everything but push: the read-only toolset is the full one minus push.
+  assert(message: roNames.join(", ")) { !roNames.contains("push") }
+  assert(message: roNames.join(", ")) { roNames.length == fullNames.length - 1 }
+  ["status", "diff", "commit", "reset", "log", "show", "cherryPick", "rebase"].each { n =>
+    assert(message: roNames.join(", ")) { roNames.contains(n) }
+  }
+
+  # A tool that returns the conversation rebinds the toolset itself. Through
+  # the read-only object, reset keeps push hidden; the same call through the
+  # full object hands the conversation a full binding — which is why hiding
+  # tools with a one-off withTools(except:) on top of a composition would not
+  # hold, and why the role lives in the object's state.
+  let reader = committer.asReadOnly
+  let afterReset = composedToolNames(reader.reset(llm: ro, source: source, commit: "HEAD"), bare)
+  assert(message: afterReset.join(", ")) { !afterReset.contains("push") and afterReset.contains("commit") }
+  let viaFull = composedToolNames(committer.reset(llm: ro, source: source, commit: "HEAD"), bare)
+  assert(message: viaFull.join(", ")) { viaFull.contains("push") }
+
+  # Sticky across a later composition of the full agent, and its reload.
+  let thenFull = ro.compose(expertise: expertiseAt(source, "dag://committer/agent"))
+  let thenFullNames = composedToolNames(thenFull, bare)
+  assert(message: thenFullNames.join(", ")) { !thenFullNames.contains("push") and thenFullNames.contains("commit") }
+  let reloadedNames = composedToolNames(reloadIn(thenFull, source), bare)
+  assert(message: reloadedNames.join(", ")) { !reloadedNames.contains("push") and reloadedNames.contains("commit") }
+
+  # The hidden push refuses too.
+  let pushed = reader.push(source: source, branch: "readonly-check") rescue { e: Error => e.message }
+  assert(message: pushed) { readOnlyRefused(pushed) }
+  "Committer read-only role checks passed."
+}
