@@ -1,0 +1,48 @@
+{
+  "name": "dang-59-file-local-imports",
+  "title": "feat: file-local imports + LSP performance (first 8 commits)",
+  "pr": "https://github.com/vito/dang/compare/f60848c5ff6ea19875310b5d4249c124011134e1...1058f48268e5984d5e97fc7f832b84a42c6219ae",
+  "repo": "https://github.com/vito/dang",
+  "head": "1058f48268e5984d5e97fc7f832b84a42c6219ae",
+  "base": "f60848c5ff6ea19875310b5d4249c124011134e1",
+  "notes": "vito/dang#59 up to 1058f48, its 8th of 13 commits, before the fixes: +498/-181 over 13 files (make imports file-local, focused LSP inference, parse/mtime caches). Ground truth from history: the PR's later commits fixed the issues below, the bugs each with a regression test that fails at this head, so they are vetted real; the fixing commits are cited in each summary. PR #59 merged with all of them (head b0c575c).",
+  "issues": [
+    {
+      "key": "imports-shared-at-runtime",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/eval.go:2101", "pkg/dang/eval.go:2148"],
+      "summary": "Imports are file-local only during inference (as RunDir's new doc comment says): evaluation still flattens every file's forms into one masterBlock against a shared evalEnv, so imports from one file are installed for all of them and the runtime disagrees with the types. With a.dang `import Dagger` and b.dang `pub container: String! = \"local\"; pub useContainer: String! = container`, inference types b's container as String!, but at runtime SlotDecl.Eval finds the imported `container` already bound and keeps it, so useContainer is a Dagger Container. Fixed by a83340ce72 (fix(dang): scope imports file-locally at runtime: per-file evaluation through a CompositeEvalEnv, with TestRunDirImportedValueDoesNotShadowLocalDeclaration), then b0ffce338a (imports are not 'local' at eval time, for a file that imports and declares the same name)."
+    },
+    {
+      "key": "focused-inference-skips-sibling-variables",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/dir_inference.go:141", "pkg/dang/dir_inference.go:150"],
+      "summary": "InferDirectoryFilesFocused runs only the declaration phases for sibling files, but an unannotated computed variable (`pub answer = \"ok\".toUpper` in defs.dang) gets its type from the body-inference variables phase, not from variable signatures. So when main.dang (`pub use: String! = answer`) is the active LSP buffer, a valid directory that RunDir accepts shows a spurious `\"answer\" not found` diagnostic. Fixed by 131c9eaf7e (fix(lsp): infer sibling variable bodies), which runs the variables phase for siblings too and adds TestDiagnosticsResolvesUnannotatedSiblingVars."
+    },
+    {
+      "key": "phase-groups-by-index",
+      "kind": "cleanup",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": "real",
+      "locations": ["pkg/dang/dir_inference.go:127", "pkg/dang/dir_inference.go:131"],
+      "summary": "declarationPhases = inferencePhases[:6] and bodyPhases = inferencePhases[6:] are hardcoded index slices into the phase list, so adding or reordering a phase silently misaligns both groups. Refactored in b0c575c49b (refactor(dang): name phase groups, not indices), which defines the groups as named slices and concatenates them."
+    }
+  ],
+  "sound": [
+    {
+      "key": "lockstep-phases",
+      "summary": "runDirectoryPhases runs each phase across every file before starting the next, so every type name is registered before any signature resolves and cross-file references in signatures and bodies work regardless of file order."
+    },
+    {
+      "key": "local-shadows-import-in-inference",
+      "summary": "Each file's composite env reads the shared dirEnv before the file's own imports and writes to dirEnv, so during inference a local declaration shadows an imported name and declarations stay visible to sibling files."
+    }
+  ]
+}

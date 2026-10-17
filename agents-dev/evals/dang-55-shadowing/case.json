@@ -1,0 +1,48 @@
+{
+  "name": "dang-55-shadowing",
+  "title": "fix(dang): shadow imported types locally",
+  "pr": "https://github.com/vito/dang/commit/d7b82e009e594336af9a0ace05ac67cc105a1b68",
+  "repo": "https://github.com/vito/dang",
+  "head": "d7b82e009e594336af9a0ace05ac67cc105a1b68",
+  "base": "8406a0c64f2fe197106acdc71d16ee2e8bba901e",
+  "notes": "The first commit of vito/dang#55 (fixes #52), reviewed alone: +396/-50 over 5 files. Ground truth from history: later commits in the same PR fixed each issue below, each adding a regression test or golden that fails at this head, so they are vetted real and, where a test reproduces them, confirmed. The fixing commits are cited in each summary; PR #55 merged with all of them (head dcc8f89).",
+  "issues": [
+    {
+      "key": "fragment-resolves-local-type",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/ast_expressions.go:1183"],
+      "summary": "inferInlineFragments resolves a fragment's type condition with modEnv.NamedType, the ambient environment, so once a local `type User` shadows the imported Test.User, `... on User` on a Test union or interface (search(...), node(id:)) picks the LOCAL User: fields that exist only on the local type (`origin`) are accepted in the fragment, and real Test.User fields (`age`) are rejected. Fixed by fdc3b6e0de (fix(dang): resolve fragments via receiver), which resolves the condition from the receiver's members/implementers and adds tests/test_inline_fragment_import_shadowing.dang plus two error goldens."
+    },
+    {
+      "key": "constant-annotation-before-hoist",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/block.go:261", "pkg/dang/block.go:264", "pkg/dang/block.go:588"],
+      "summary": "Local type names are only hoisted (Hoist pass 0) inside the types phase, which InferFormsWithPhases runs after the constants phase. So a constant annotated with a shadowed name and declared before the type, `pub maybe: User = null` above a local `type User`, binds to the imported Test.User, and `pub echoed: User = maybe` then fails as a mismatch between the imported and the local User: shadowing works or not depending on declaration order. Fixed by dcc8f89dfd (fix(dang): hoist local type names earlier), which adds a 'type names' phase right after imports, with tests/test_imported_type_shadowing_annotation.dang and an env_test assertion."
+    },
+    {
+      "key": "indistinguishable-type-errors",
+      "kind": "concern",
+      "severity": "minor",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["tests/testdata/import_shadowing_local_distinct.golden"],
+      "summary": "Now that a local type and an imported one can share a name, mismatch errors print both unqualified: the change's own golden shows `cannot use User! as User!`, `cannot use Status! as Status!`, `cannot use [SearchResult!]! as [SearchResult!]!`, which tell the user nothing. Fixed by 9dc903dfda (fix(dang): qualify imported type errors) and af13384818 (fix(dang): qualify type display paths), which render imported types as `Test.User!` and update the golden."
+    }
+  ],
+  "sound": [
+    {
+      "key": "imported-module-not-mutated",
+      "summary": "A local declaration that shadows an unqualified imported type gets a fresh module (declareLocalType) and the unqualified alias is cleared, instead of reusing and mutating the imported schema type, so a qualified reference to a shadowed name (Test.User after a local `type User`) still resolves to the imported type."
+    },
+    {
+      "key": "all-kinds-covered",
+      "summary": "Type, enum, scalar, interface and union declarations all go through declareLocalType, and the new gqlserver tests cover shadowing for each kind."
+    }
+  ]
+}
