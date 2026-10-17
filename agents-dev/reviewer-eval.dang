@@ -448,8 +448,10 @@ let runReviewerEval(source: Workspace!, name: String!, depth: ReviewerEvalDepth!
     .withNewFile("params.json", JSON.encode({{depth: toString(depth), agents: agents, nonce: Random.string}}))
   let ran: {{review: String!, model: String!, seconds: Int!}}! = JSON.decode(reviewerEvalInvoke(source, agents, input, "run"))
   print("--- review ---\n" + ran.review + "\n--- end review ---")
-  let composedLines = ran.review.split("\n").filter { l => l.hasPrefix("Sub-agents composed from: ") }
-  let composed = (composedLines[0] ?? "(not reported)").trimPrefix("Sub-agents composed from: ")
+  # The summary's footer line names what the sub-agents were composed from:
+  # "...; composed from a, b. Failing tests ...".
+  let footer = ran.review.match(`composed from (.+?)\.(?:\s|$)`)
+  let composed = if (footer != null) { footer.captures[0] ?? "(not reported)" } else { "(not reported)" }
   let model = if (ran.model == "") { "(default model)" } else { ran.model }
   let scored = scoreReviewerEvalText(source, name, ran.review, `reviewer at ${toString(depth)}`, samples, judgeModel, [
     {{name: "reviewer model", value: model}},

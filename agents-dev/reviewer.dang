@@ -126,25 +126,34 @@ let checkReviewerScreening: String! {
   assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim) }
   assert(message: summary) { summary.contains("NIT:\n- calc.py:3 — the parameter total shadows") }
   assert(message: summary) { summary.contains("PRE-EXISTING") and summary.contains("- calc.py:18 — " + reviewerEvalClaim) }
-  assert(message: summary) { summary.contains("votes: 1/1 confirmed") }
-  # The mechanical drops, each with its reason.
-  assert(message: summary) { summary.contains("Dropped by the evidence checks (5):") }
-  # The duplicate is merged, and listed so a distinct claim is not lost.
-  assert(message: summary) { summary.contains("Merged into an earlier finding quoting the same code (1):\n  - calc.py:2 (general): " + reviewerDiscountClaim) }
+  assert(message: summary) { summary.contains("1/1 votes · fingerprint ") }
+  # The mechanical drops, each with its reason, on one line.
+  assert(message: summary) { summary.contains("Dropped by the evidence checks (5): ") }
+  # Only the exact duplicate (same quote, same claim) merges mechanically,
+  # and is listed.
+  assert(message: summary) { summary.contains("Merged as duplicates (1): calc.py:2 (general) into calc.py:2: identical") }
   assert(message: summary) { summary.contains("calc.py:2 (general): style only (naming)") }
   assert(message: summary) { summary.contains("nope.py:1 (general): path does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:99 (general): line does not exist at head") }
   assert(message: summary) { summary.contains("calc.py:18 (general): quoted evidence does not appear") }
   assert(message: summary) { summary.contains("generated/out.txt:1 (general): path skipped per REVIEW.md") }
   assert(message: summary) { summary.contains("Skipped per REVIEW.md: generated/out.txt") }
-  assert(message: summary) { summary.contains("Below quorum (1 of 1): calc.py:8 (0/1 confirmed)") }
+  assert(message: summary) { summary.contains("Below quorum: calc.py:8 (0/1, needed 1)") }
   assert(message: summary) { summary.contains("1 more nit over the nit cap (1) not reported.") }
-  assert(message: summary) { summary.contains("Reviewed ") and summary.contains("1 commit, 2 files changed, at QUICK depth") }
-  # No synthesizer ran, so no verdict; the reproductions note is there.
-  assert(message: summary) { !summary.contains("Verdict:") and summary.contains("are the reviewers' own reproductions") }
+  # One footer line: range, depth, the sub-agents and what failing tests
+  # under them are.
+  let footers = lines.filter { l => l.hasPrefix("Reviewed ") }
+  let footer = footers[0] ?? ""
+  assert(message: summary) { footer.contains("(1 commit, 2 files changed) at QUICK depth (1 voter per finding): 1 finder, 5 voters; composed from (canned replies).") }
+  assert(message: summary) { footer.contains("are the reviewers' own reproductions") }
+  # No synthesizer ran, so no verdict.
+  assert(message: summary) { !summary.contains("Verdict:") }
   # A finding outside the hunks that no voter says the change caused is
   # PRE-EXISTING, without the caused-by-the-change note.
-  assert(message: summary) { !summary.contains("though the change causes it") }
+  assert(message: summary) { !summary.contains("caused by the change: post it") }
+  # The provenance stays in the footer, and the calling agent's prompt
+  # says how to answer findings.
+  assert(message: summary) { !summary.contains("Answer every finding") and !summary.contains("(general) ·") }
   # State: exactly the three reported findings are OPEN.
   assert(message: open) { open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 3 }
   assert(message: open) { open.contains("OPEN  IMPORTANT  calc.py:2  [") and open.contains("OPEN  NIT  calc.py:3  [") and open.contains("OPEN  PREEXISTING  calc.py:18  [") }
@@ -182,7 +191,7 @@ let checkReviewerScreening: String! {
     finderReplies: [reviewerFindingsReply([reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT")])],
     voterReplies: ["I cannot confirm this; it looks UNCONFIRMED to me."],
   ).lastSummary
-  assert(message: refused) { (refused.split("\n")[0] ?? "") == "Nothing to fix." and refused.contains("calc.py:2 (0/1 confirmed)") }
+  assert(message: refused) { (refused.split("\n")[0] ?? "") == "Nothing to fix." and refused.contains("calc.py:2 (0/1, needed 1)") }
 
   # Hunks: an added "++ plus" line reads "+++ plus" in the diff; it is
   # content, so the later hunk at line 25 still belongs to notes.txt.
@@ -256,21 +265,20 @@ let checkReviewerConcerns: String! {
   assert(message: summary) { (lines[3] ?? "") == "" and (lines[4] ?? "") == "CONCERN:" }
   assert(message: summary) { summary.contains("\n\nChecked and found sound:\n- total() still sums prices as before\n- legacy() is untouched\n\nReviewed ") }
   assert(message: summary) { (summary.split("Checked and found sound:")[0] ?? "").contains("PRE-EXISTING") }
-  # The concern, between IMPORTANT and NIT, anchored in the hunk, with its
-  # other location (unquoted) and the ones that did not hold.
-  assert(message: summary) { summary.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n  evidence:\n      rate = percent / 10\n  also at calc.py:18\n") }
-  assert(message: summary) { summary.contains("  cited but not found at head: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
-  assert(message: summary) { summary.contains("votes: 1/1 confirmed · design (general)") }
-  assert(message: summary) { (summary.split("CONCERN:")[1] ?? "").contains("Sub-agents composed from") and (summary.split("CONCERN:")[1] ?? "").contains("NIT:") }
+  # The concern, between IMPORTANT and NIT, anchored in the hunk, its quote
+  # unlabeled, then one line with its other location (unquoted), the ones
+  # that did not hold, the votes and the fingerprint.
+  assert(message: summary) { summary.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n      rate = percent / 10\n  also at calc.py:18 · cited but not found at head: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head) · 1/1 votes · fingerprint ") }
+  assert(message: summary) { (summary.split("CONCERN:")[1] ?? "").contains("composed from (canned replies)") and (summary.split("CONCERN:")[1] ?? "").contains("NIT:") }
   # The dropped concern names every location's reason.
   assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") }
   assert(message: summary) { summary.contains("calc.py:99 (general): no cited location holds: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
   # Stale docs caused by the change: a NIT, marked as outside the hunks.
   assert(message: summary) { summary.contains("NIT:\n- notes.txt:10 — ") }
-  assert(message: summary) { summary.contains("outside the change's hunks, though the change causes it: GitHub cannot anchor a line comment there") }
-  assert(message: summary) { summary.split("though the change causes it").length == 2 }
+  assert(message: summary) { summary.contains("outside the hunks but caused by the change: post it on the conversation") }
+  assert(message: summary) { summary.split("caused by the change: post it").length == 2 }
   # Not confirmed as caused by the change: PRE-EXISTING.
-  assert(message: summary) { summary.contains("PRE-EXISTING (outside the change's hunks and not caused by it; GitHub cannot anchor a line comment there):\n- notes.txt:15 — ") }
+  assert(message: summary) { summary.contains("PRE-EXISTING (outside the hunks, not caused by the change):\n- notes.txt:15 — ") }
   assert(message: open) { open.contains("OPEN  CONCERN  calc.py:2  [") and open.contains("OPEN  NIT  notes.txt:10  [") and open.contains("OPEN  PREEXISTING  notes.txt:15  [") }
 
   # Asserted by the finder alone is not enough: a voter who does not say the
@@ -295,23 +303,24 @@ let checkReviewerConcerns: String! {
     finderReplies: ["{\"findings\": [{\"severity\": \"NIT\", \"claim\": \"notes.txt line 10 is stale\", \"category\": \"docs\", \"causedByChange\": \"yes\", \"path\": \"notes.txt\", \"line\": 10, \"evidence\": \"line 10\"}], \"checked\": [{\"what\": \"not a string\"}]}"],
     voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true)],
   ).lastSummary
-  assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 nit" and sloppy.contains("though the change causes it") }
+  assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 nit" and sloppy.contains("caused by the change: post it") }
 
-  # Each finding says why it is worth the time; nits are compact quick
-  # fixes, without a quoted evidence block.
+  # Each concern or bug says why it is worth the time, above its quote;
+  # nits are compact quick fixes, without a stake or a quoted block.
   let worthy = reviewer.tallyReplies(
     source: fx.feature.asWorkspace,
     head: fx.feature,
     base: fx.main,
     depth: ReviewerDepth.QUICK,
-    finderReplies: ["{\"findings\": [{\"severity\": \"NIT\", \"claim\": \"notes.txt line 10 still uses the old numbering; renumber it\", \"worth\": \"readers follow the notes\", \"category\": \"docs\", \"locations\": [{\"path\": \"notes.txt\", \"line\": 10, \"evidence\": \"line 10\"}, {\"path\": \"notes.txt\", \"line\": 11, \"evidence\": \"line 11\"}]}]}"],
-    voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true)],
+    finderReplies: ["{\"findings\": [{\"severity\": \"NIT\", \"claim\": \"notes.txt line 10 still uses the old numbering; renumber it\", \"worth\": \"readers follow the notes\", \"category\": \"docs\", \"locations\": [{\"path\": \"notes.txt\", \"line\": 10, \"evidence\": \"line 10\"}, {\"path\": \"notes.txt\", \"line\": 11, \"evidence\": \"line 11\"}]}, {\"severity\": \"CONCERN\", \"claim\": \"" + reviewerConcernClaim + "\", \"worth\": \"callers pass fractions\", \"category\": \"design\", \"locations\": [{\"path\": \"calc.py\", \"line\": 2, \"evidence\": \"rate = percent / 10\"}]}]}"],
+    voterReplies: [reviewerCausedVote("CONFIRM", "NIT", true), reviewerCausedVote("CONFIRM", "CONCERN", true)],
   ).lastSummary
-  assert(message: worthy) { worthy.contains("NIT:\n- notes.txt:10 — notes.txt line 10 still uses the old numbering; renumber it\n  worth it: readers follow the notes\n  also at notes.txt:11\n  outside the change's hunks") }
-  assert(message: worthy) { !worthy.contains("evidence:") }
+  assert(message: worthy) { worthy.contains("NIT:\n- notes.txt:10 — notes.txt line 10 still uses the old numbering; renumber it\n  also at notes.txt:11 · outside the hunks but caused by the change: post it on the conversation · 1/1 votes · fingerprint ") }
+  assert(message: worthy) { worthy.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n  worth it: callers pass fractions\n      rate = percent / 10\n  1/1 votes · fingerprint ") }
+  assert(message: worthy) { !worthy.contains("readers follow the notes") and !worthy.contains("      line 10") }
 
-  # At most three concerns, the strongest: of four confirmed at STANDARD,
-  # the one with two of three votes goes.
+  # At most three concerns, the strongest: of four confirmed at DEEP, the
+  # one with two of three votes is only mentioned, in one line.
   let four = reviewerFindingsReply([
     reviewerCitedJson("CONCERN", "concern one", "design", true, [reviewerLocationJson("calc.py", 1, "def discount(total, percent):")]),
     reviewerCitedJson("CONCERN", "concern two", "design", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
@@ -320,17 +329,19 @@ let checkReviewerConcerns: String! {
   ])
   let yes = reviewerCausedVote("CONFIRM", "CONCERN", true)
   let no = reviewerCausedVote("REJECT", "CONCERN", true)
+  let noFindings = reviewerFindingsReply([])
   let capped = reviewer.tallyReplies(
     source: fx.feature.asWorkspace,
     head: fx.feature,
     base: fx.main,
-    depth: ReviewerDepth.STANDARD,
-    finderReplies: [four, reviewerFindingsReply([]), reviewerFindingsReply([])],
+    depth: ReviewerDepth.DEEP,
+    finderReplies: [four, noFindings, noFindings, noFindings, noFindings],
     voterReplies: [yes, yes, no, yes, yes, yes, yes, yes, yes, yes, yes, yes],
   ).lastSummary
   assert(message: capped) { (capped.split("\n")[0] ?? "") == "3 concerns" }
-  assert(message: capped) { !capped.contains("— concern one") and capped.contains("— concern two") and capped.contains("— concern four") }
-  assert(message: capped) { capped.contains("1 weaker concern over the concern cap (3) not reported: calc.py:1") }
+  assert(message: capped) { capped.contains("CONCERN:\n- calc.py:2 — concern two") and capped.contains("- calc.py:3 — concern three") and capped.contains("- notes.txt:25 — concern four") }
+  assert(message: capped) { !capped.contains("CONCERN:\n- calc.py:1") }
+  assert(message: capped) { capped.contains("3/3 votes · fingerprint ") and capped.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:1 — concern one (2/3 votes)\n") }
 
   # A location's line given as text still reads ("2-3" is line 2); a line
   # that reads as neither number nor text loses the locations, so the
@@ -392,6 +403,124 @@ let checkReviewerConcerns: String! {
   assert(message: failed) { (failed.split("\n")[2] ?? "") == "Verdict: none; the synthesizer failed: the model timed out" }
   assert(message: failed) { !failed.contains("\n\n\n") and !prose.contains("\n\n\n") }
   "Reviewer concern, causedByChange and synthesis checks passed."
+}
+
+let reviewerNegativeClaim: String! = "percent is never checked, so a negative percent raises the price instead of lowering it"
+let reviewerOvershootClaim: String! = "a 50 percent discount takes off five times the total, so the discounted price goes negative"
+
+# The triage: findings that describe the same problem merge by meaning,
+# whatever they quote; different problems quoting the same line stay
+# apart; voters per finding follow its severity's tier.
+let checkReviewerTriage: String! {
+  let fx = reviewerFixture
+  # Four findings that hold at STANDARD: the discount bug (IMPORTANT), a
+  # different problem quoting the same line (NIT), the discount bug again
+  # in other words, quoting another line (CONCERN), and a concern.
+  let finders = [
+    reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+      reviewerCitedJson("NIT", reviewerNegativeClaim, "correctness", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
+    ]),
+    reviewerFindingsReply([
+      reviewerCitedJson("CONCERN", reviewerOvershootClaim, "behavior", true, [reviewerLocationJson("calc.py", 3, "return total - total * rate")]),
+    ]),
+    reviewerFindingsReply([
+      reviewerCitedJson("CONCERN", "notes.txt line 25 lost its number, so readers cannot cite it", "docs", true, [reviewerLocationJson("notes.txt", 25, "changed")]),
+    ]),
+  ]
+  let yes = reviewerCausedVote("CONFIRM", "IMPORTANT", true)
+  let no = reviewerCausedVote("REJECT", "IMPORTANT", true)
+  let nitYes = reviewerCausedVote("CONFIRM", "NIT", true)
+  let concernYes = reviewerCausedVote("CONFIRM", "CONCERN", true)
+  let concernNo = reviewerCausedVote("REJECT", "CONCERN", true)
+
+  # Without a triage nothing merges but exact duplicates: the two problems
+  # on calc.py:2 are both voted on, and so is the restated bug. Voters per
+  # finding: three for IMPORTANT, one for the NIT, two per CONCERN.
+  let apart = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    voterReplies: [yes, yes, yes, nitYes, concernYes, concernYes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: apart) { (apart.split("\n")[0] ?? "") == "1 important, 2 concerns, 1 nit" }
+  assert(message: apart) { apart.contains("IMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim) and apart.contains("NIT:\n- calc.py:2 — " + reviewerNegativeClaim) }
+  assert(message: apart) { apart.contains("- calc.py:3 — " + reviewerOvershootClaim) and !apart.contains("Merged as duplicates") }
+  assert(message: apart) { apart.contains(": 3 finders, 8 voters; composed from") }
+
+  # The triage groups the restated bug with the first: one finding, which
+  # keeps the first's claim and anchor, takes the other's location and
+  # the higher severity, so it gets IMPORTANT's three voters. The other
+  # problem on the same line stays its own; its one voter cannot raise it
+  # past NIT. The concern misses its tier's quorum of two.
+  let grouped = JSON.encode({{groups: [{{findings: [1, 3], keep: 1, why: "the rate divides by ten instead of a hundred"}}]}})
+  let merged = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: grouped,
+    voterReplies: [yes, no, yes, reviewerCausedVote("CONFIRM", "IMPORTANT", true), concernYes, concernNo],
+  )
+  let summary = merged.lastSummary
+  let open = merged.findingsList(status: ReviewerFindingStatus.OPEN)
+  assert(message: summary) { (summary.split("\n")[0] ?? "") == "1 important, 1 nit" }
+  assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim + "\n      rate = percent / 10\n  also at calc.py:3 · 2/3 votes · fingerprint ") }
+  assert(message: summary) { summary.contains("NIT:\n- calc.py:2 — " + reviewerNegativeClaim + "\n  1/1 votes · fingerprint ") }
+  assert(message: summary) { !summary.contains(reviewerOvershootClaim) }
+  assert(message: summary) { summary.contains("Merged as duplicates (1): calc.py:3 (behavior) into calc.py:2: the rate divides by ten instead of a hundred") }
+  assert(message: summary) { summary.contains("Below quorum: notes.txt:25 (1/2, needed 2)") }
+  assert(message: summary) { summary.contains(": 3 finders, triage, 6 voters; composed from") }
+  assert(message: open) { open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 2 }
+
+  # Out-of-range, repeated and already grouped numbers are ignored; a
+  # "keep" outside its group falls back to the group's first-listed
+  # member. Here that is the restated bug, so its claim and its anchor
+  # lead, at the place of the group's earliest member.
+  let sloppy = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: "```json\n{\"groups\": [{\"findings\": [1, 9, 1]}, {\"findings\": [3, 1], \"keep\": 7}, {\"findings\": [1, 2]}]}\n```",
+    voterReplies: [yes, yes, yes, nitYes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: sloppy) { (sloppy.split("\n")[0] ?? "") == "1 important, 1 concern, 1 nit" }
+  assert(message: sloppy) { sloppy.contains("IMPORTANT:\n- calc.py:3 — " + reviewerOvershootClaim + "\n      return total - total * rate\n  also at calc.py:2 · 3/3 votes") }
+  assert(message: sloppy) { sloppy.contains("Merged as duplicates (1): calc.py:2 (general) into calc.py:3: the same problem") }
+
+  # A triage that fails or answers without the JSON merges nothing, and
+  # says so; every finding is voted on.
+  let failed = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: "REVIEWER SUB-AGENT FAILED: the model timed out",
+    voterReplies: [yes, yes, yes, nitYes, concernYes, concernYes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: failed) { (failed.split("\n")[0] ?? "") == "1 important, 2 concerns, 1 nit" }
+  assert(message: failed) { failed.contains("\nTriage: the triage failed, so only exact duplicates were merged: the model timed out") }
+  let prose = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: finders,
+    triageReply: "These all look different to me.",
+    voterReplies: [yes, yes, yes, nitYes, concernYes, concernYes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: prose) { (prose.split("\n")[0] ?? "") == "1 important, 2 concerns, 1 nit" and prose.contains("\nTriage: the triage replied without the groups JSON") }
+
+  # A re-review that rewords both problems on calc.py:2 keeps each one's
+  # earlier fingerprint, by the words their claims share: the bug stays
+  # OPEN, and the other, resolved meanwhile, stays RESOLVED.
+  let bugFp = reviewerFingerprintAt(open, "IMPORTANT  calc.py:2")
+  let otherFp = reviewerFingerprintAt(open, "NIT  calc.py:2")
+  assert(message: open) { bugFp != "" and otherFp != "" and bugFp != otherFp }
+  let again = merged.resolve(fingerprint: otherFp, reason: "callers clamp percent").tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.QUICK,
+    finderReplies: [reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 2, "a negative percent is never rejected, so it raises the price", "rate = percent / 10", "correctness", "NIT"),
+      reviewerFindingJson("calc.py", 2, "dividing by ten instead of a hundred makes a 50 percent discount take off five times the total", "rate = percent / 10", "correctness", "IMPORTANT"),
+    ])],
+    voterReplies: [nitYes, yes],
+  )
+  let out = again.{{ summary: lastSummary, open: findingsList(status: ReviewerFindingStatus.OPEN) }}
+  assert(message: out.summary) { (out.summary.split("\n")[0] ?? "") == "1 important" }
+  assert(message: out.open) { reviewerFingerprintAt(out.open, "IMPORTANT  calc.py:2") == bugFp }
+  assert(message: out.summary) { out.summary.contains("Found again but already RESOLVED: " + otherFp + " (calc.py:2: callers clamp percent)") }
+  "Reviewer triage checks passed."
 }
 
 let checkReviewerReconcile: String! {
@@ -504,7 +633,7 @@ let checkReviewerComposition(source: Workspace!): String! {
   # Default composition picks the reviewer's agent, never its roles.
   let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "reviewer/**").items.{{ uri }}.map { a => a.uri }
   assert(message: defaults.join(", ")) { defaults.any { u => u.contains("reviewer/agent") } }
-  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/voter") or u.contains("reviewer/synthesizer") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/triage") or u.contains("reviewer/voter") or u.contains("reviewer/synthesizer") } }
 
   let chief = llm.withWorkspace(source).spawn(
     name: "reviewer-composition-chief",
@@ -517,6 +646,7 @@ let checkReviewerComposition(source: Workspace!): String! {
   let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
   let voters = reviewer.subagentExpertise(caller: chief, role: "voter").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
   let synth = reviewer.subagentExpertise(caller: chief, role: "synthesizer").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
+  let triager = reviewer.subagentExpertise(caller: chief, role: "triage").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
   let finder = llm.withWorkspace(source).spawn(name: "reviewer-composition-finder", expertise: selected);
   {
     # Staff and reviewer are gone; contributor and committer are read-only.
@@ -525,6 +655,7 @@ let checkReviewerComposition(source: Workspace!): String! {
     assert(message: uris.join(", ")) { (uris[0] ?? "").contains("committer/readonly") and (uris[1] ?? "").contains("contributor/readonly") and (uris[2] ?? "").contains("reviewer/finder") }
     assert(message: voters.join(", ")) { voters.length == 3 and (voters[2] ?? "").contains("reviewer/voter") }
     assert(message: synth.join(", ")) { synth.length == 3 and (synth[2] ?? "").contains("reviewer/synthesizer") }
+    assert(message: triager.join(", ")) { triager.length == 3 and (triager[2] ?? "").contains("reviewer/triage") }
 
     let conversation = finder.snapshot.sync
     assert(message: recordedUris(conversation).join(", ")) { recordedUris(conversation) == uris }
@@ -577,7 +708,7 @@ let checkReviewerComposition(source: Workspace!): String! {
 }
 
 let checkReviewerTools(source: Workspace!): String! {
-  let plumbing = ["finder", "voter", "synthesizer", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
+  let plumbing = ["finder", "triage", "voter", "synthesizer", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
   # review takes the calling agent, which only an owning agent supplies.
   let unowned = composedToolNames(reviewer.agent(llm.withWorkspace(source)), llm.withWorkspace(source))
   assert(message: unowned.join(", ")) { unowned.contains("findingsList") and unowned.contains("resolve") and !unowned.contains("review") }

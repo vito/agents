@@ -17,9 +17,12 @@
 type ReviewerDriver {
   """
   A STANDARD review of a fixture range: three finders in parallel (one
-  finding duplicated across two finders, one with evidence that is not in
-  the file, a concern citing two places), three voters for each surviving
-  finding, the synthesizer, and the summary.
+  finding duplicated word for word across two finders, one restated in
+  other words quoting another line, a different problem quoting the same
+  line as another, one with evidence that is not in the file, a concern
+  citing two places), the triage merging the restated one, voters per
+  finding by severity (three, two or one), the synthesizer, and the
+  summary.
   """
   pipeline(source: Workspace!): Void @check {
     let repo = container
@@ -45,21 +48,29 @@ type ReviewerDriver {
         {{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}},
       ],
     }})
+    let sameLine = JSON.encode({{
+      severity: "NIT", claim: negativeClaim, category: "correctness", causedByChange: true,
+      locations: [{{path: "calc.py", line: 2, evidence: "rate = percent / 10"}}],
+    }})
     let finders = [
       findings([discount, finding("calc.py", 2, "percent is divided by one hundred too often", "rate = percent / 100", "correctness")]),
-      findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security"), concern]),
-      findings([discount, finding("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "fit")]),
+      findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security"), concern, finding("calc.py", 3, restatedClaim, "return total - total * rate", "correctness")]),
+      findings([discount, sameLine, finding("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "fit")]),
     ]
+    # Held, in order: 1 discount, 2 eval, 3 concern, 4 restated discount,
+    # 5 the other problem on calc.py:2, 6 item.price.
+    let grouped = JSON.encode({{groups: [{{findings: [1, 4], keep: 1, why: "divides by ten instead of a hundred"}}]}})
     let voters = [
       vote("CONFIRM"), vote("CONFIRM"), vote("CONFIRM"),
       vote("CONFIRM"), vote("REJECT"), vote("CONFIRM"),
-      voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "IMPORTANT"),
+      voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "CONCERN"),
+      voteAs("CONFIRM", "NIT"),
       vote("REJECT"), vote("REJECT"), vote("CONFIRM"),
     ]
     let synthesis = JSON.encode({{verdict: verdictText, sound: ["total() still sums prices"]}})
     # One selection, so the uncached review runs exactly once.
     let out = reviewer
-      .withRecordedReplies(origin: from, finders: finders, voters: voters, synthesis: synthesis)
+      .withRecordedReplies(origin: from, finders: finders, voters: voters, synthesis: synthesis, triageReply: grouped)
       .review(caller: chief, source: source, head: repo.branch("feature"), base: repo.branch("main"), depth: ReviewerDepth.STANDARD)
       .{{ summary: lastSummary, open: findingsList(status: ReviewerFindingStatus.OPEN) }} rescue {
         e: Error => {
@@ -72,31 +83,42 @@ type ReviewerDriver {
     let summary = out.summary
     print(summary)
     let lines = summary.split("\n")
-    assert(message: summary) { (lines[0] ?? "") == "1 important, 1 concern, 1 pre-existing" }
+    assert(message: summary) { (lines[0] ?? "") == "1 important, 1 concern, 1 nit, 1 pre-existing" }
     assert(message: summary) { (lines[2] ?? "") == "Verdict: " + verdictText and (lines[4] ?? "") == "IMPORTANT:" }
     assert(message: summary) { summary.contains("\n\nChecked and found sound:\n- total() still sums prices\n\nReviewed ") }
-    assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim) }
-    assert(message: summary) { summary.contains("votes: 3/3 confirmed · correctness (general)") }
-    assert(message: summary) { summary.contains("CONCERN:\n- calc.py:1 — " + concernClaim) and summary.contains("  also at calc.py:18\n") }
-    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim) and summary.contains("votes: 2/3 confirmed · security (behavior)") }
+    # The restated bug merged into the first, by the triage: one entry,
+    # both locations, IMPORTANT's three voters.
+    assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim + "\n      rate = percent / 10\n  also at calc.py:3 · 3/3 votes · fingerprint ") }
+    assert(message: summary) { !summary.contains(restatedClaim) }
+    # The other problem quoting the same line survives as its own NIT, on
+    # its one voter; the concern on its two.
+    assert(message: summary) { summary.contains("NIT:\n- calc.py:2 — " + negativeClaim + "\n  1/1 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("CONCERN:\n- calc.py:1 — " + concernClaim) and summary.contains("  also at calc.py:18 · 2/2 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim + "\n      return eval(x)\n  2/3 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("Merged as duplicates (2): calc.py:2 (design) into calc.py:2: identical; calc.py:3 (behavior) into calc.py:2: divides by ten instead of a hundred") }
     assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") and summary.contains("quoted evidence does not appear") }
-    assert(message: summary) { summary.contains("Below quorum (2 of 3): calc.py:8 (1/3 confirmed)") }
-    assert(message: summary) { !summary.contains("failed:") and summary.contains("are the reviewers' own reproductions") }
-    # The output names what the sub-agents were composed from.
-    let composedLines = lines.filter { l => l.hasPrefix("Sub-agents composed from: ") }
-    let composed = composedLines[0] ?? ""
-    ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/voter", "reviewer/synthesizer"].each { u =>
-      assert(message: composed) { composed.contains(u) }
+    assert(message: summary) { summary.contains("Below quorum: calc.py:8 (1/3, needed 2)") }
+    assert(message: summary) { !summary.contains("failed:") and !summary.contains("Triage:") }
+    # One footer line: the sub-agents, what they were composed from, and
+    # what failing tests under them are.
+    let footers = lines.filter { l => l.hasPrefix("Reviewed ") }
+    let footer = footers[0] ?? ""
+    assert(message: summary) { footer.contains(" at STANDARD depth (votes needed: important 2 of 3, concern 2 of 2, nit 1 of 1): 3 finders, triage, 12 voters, synthesizer; composed from ") }
+    assert(message: summary) { footer.contains("are the reviewers' own reproductions") }
+    ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/triage", "reviewer/voter", "reviewer/synthesizer"].each { u =>
+      assert(message: footer) { footer.contains(u) }
     }
     ["committer/agent", "contributor/agent", "reviewer/agent"].each { u =>
-      assert(message: composed) { !composed.contains(u) }
+      assert(message: footer) { !footer.contains(u) }
     }
-    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 3 }
+    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 4 }
     null
   }
 }
 
 let discountClaim: String! = "percent / 10 divides by ten instead of a hundred, so a 50 percent discount takes off five times the total"
+let restatedClaim: String! = "a 50 percent discount takes off five times the total, so the discounted price goes negative"
+let negativeClaim: String! = "percent is never checked, so a negative percent raises the price instead of lowering it"
 let evalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
 let concernClaim: String! = "discount assumes percent is a whole number, which no caller states"
 let verdictText: String! = "The change adds a discount helper whose rate is off by a factor of ten."

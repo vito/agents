@@ -157,6 +157,12 @@ type AgentsDev {
     null
   }
 
+  """Check the reviewer's triage merges findings that describe the same problem whatever they quote, keeps different problems on one line apart, and that voters per finding follow its severity, on canned replies."""
+  reviewerTriage: Void @check {
+    print(checkReviewerTriage)
+    null
+  }
+
   """Check reviewer sub-agents inherit the caller's composition minus staff and reviewer, with read-only contributor and committer, plus the role."""
   reviewerComposition(source: Workspace!): Void @check {
     print(checkReviewerComposition(source))
