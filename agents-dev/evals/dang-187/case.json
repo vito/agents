@@ -5,13 +5,14 @@
   "repo": "https://github.com/vito/dang",
   "head": "4e4300aec1216ffe45b82a45aebcb98a13d7d226",
   "base": "da1bed304cb80f8a2f0714f1747e7f64e03297a3",
-  "notes": "Known issues compiled from two reviews of the PR at 4e4300a: reviewer v1 at STANDARD depth, and a plain 'adversarial review <pr url>' session. 'confirmed' means a reviewer reproduced it with a test; 'claimed' means it was argued from the code but not reproduced. Labels are unvetted until the PR author confirms them.",
+  "notes": "Known issues compiled from two reviews of the PR at 4e4300a: reviewer v1 at STANDARD depth, and a plain 'adversarial review <pr url>' session. 'confirmed' means a reviewer reproduced it with a test; 'claimed' means it was argued from the code but not reproduced. Labels are unvetted until the PR author confirms them: 'vetted' is null until the author marks an issue 'real' or 'dismiss' (in vetting.md, which overrides a null here).",
   "issues": [
     {
       "key": "fragment-nesting",
       "kind": "bug",
       "severity": "important",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go:962", "pkg/dang/eval.go:1287"],
       "summary": "A probed nullable interface/union handle is swapped for one whose chain ends in an inline fragment on the concrete type, but its static type stays the interface. Multi-type inline fragments on it get nested under the concrete fragment and fail GraphQL validation ('Fragment cannot be spread here...'); a single non-matching fragment now errors instead of returning null. Also narrowTo in resolveObject's no-loader path, and `n: Node` parameters fed a probed value."
     },
@@ -20,6 +21,7 @@
       "kind": "bug",
       "severity": "important",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go", "docs/lit/language/errors.md"],
       "summary": "After a nullable object is probed and reloaded through node(id:), GraphQLError.path reports [\"node\", ...] instead of the original field path: `user(id:\"User:2\").manager.alwaysFails` gives [\"user\",\"manager\",\"alwaysFails\"], but binding the manager with let first gives [\"node\",\"alwaysFails\"]. Whether a value went through a let changes the error path, undercutting errors.md's advice to inspect e.path."
     },
@@ -28,6 +30,7 @@
       "kind": "bug",
       "severity": "minor",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go"],
       "summary": "The handle bound by a `case` type arm no longer equals the value it matched: with `let f = favoriteNode`, `case (f) { p: Post => p == f }` is false, because equality compares QueryChain pointers and resolveObject builds a new node(id:) chain. Before the PR the binding was the operand itself."
     },
@@ -36,6 +39,7 @@
       "kind": "concern",
       "severity": "important",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go"],
       "summary": "Loading through node(id:) assumes the server can load every type that implements node's return type (nodeCanReturn checks only that). Some Relay servers load only a subset, or apply different permissions than the original path. When node returns null, later non-null leaves fail with 'null is not allowed for String', far from the cause, where before the PR the original chain worked. The test server was rewritten to globally unique 'User:1' IDs to fit the assumption. Suggested: fall back to the original chain, or make load-by-ID opt-in for non-Dagger schemas."
     },
@@ -44,6 +48,7 @@
       "kind": "concern",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go", "querybuilder"],
       "summary": "The 'no error means the parent was null' rule has an exception: querybuilder.unpack steps over inline fragments, so a non-null leaf under a non-matching fragment comes back nil with no error. Safe today because every fragment on a MaybeNull chain follows a __typename check, but the soundness argument in GraphQLFunction.Call doesn't mention fragments, and a stale or wrong __typename would silently become null."
     },
@@ -52,6 +57,7 @@
       "kind": "concern",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang"],
       "summary": "isNullableObjectType excludes lists, so a nullable [User] field on an ordinary chain never compares == null, yet `user(id:\"User:1\").manager.posts.posts == null` is true because the list inherits MaybeNull. Whether a nullable list can be null depends on the path used to reach it."
     },
@@ -60,6 +66,7 @@
       "kind": "bug",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go"],
       "summary": "nodeCanReturn accepts any interface or union type unconditionally. When knowsType fails (the concrete type isn't in scope), resolveObject loads with the abstract g.TypeName, which can produce node(id:){... on SomeUnion} and fail GraphQL validation if the union doesn't overlap node's return type."
     },
@@ -68,6 +75,7 @@
       "kind": "concern",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang"],
       "summary": "selectedThrough is written onto AST nodes during Infer and never reset, so runtime correctness depends on inference having run on that exact node. Harmless while nodes aren't shared between positions or inferred concurrently; a node synthesized at eval time without the flag gets an extra (safe) probe, and nothing enforces the opposite case."
     },
@@ -76,6 +84,7 @@
       "kind": "concern",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": [],
       "summary": "The PR goes further than the Dagger Go SDK, which probes only nullable fields, fetches only id, and keeps the declared interface type. This PR also probes non-null fields selected off an unprobed nullable field, handles unions, and narrows to the concrete type (an extra query in `case` on non-null abstract types). Reasonable, but 'matches the Dagger SDKs' overstates it."
     },
@@ -84,6 +93,7 @@
       "kind": "cleanup",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go"],
       "summary": "Unneeded queries: SelectField(\"id\") re-fetches an id the handle already has in KnownID (seen in the 'probes argument expressions' test); resolveObject re-fetches id for handles with KnownID such as @expectedType loads; the list check selects __typename on every element just to learn whether the list is null."
     },
@@ -92,6 +102,7 @@
       "kind": "cleanup",
       "severity": "minor",
       "confidence": "claimed",
+      "vetted": null,
       "locations": ["pkg/dang/eval.go"],
       "summary": "In needsConcreteType, `g.MaybeNull ||` is never true: a MaybeNull handle only escapes unprobed on a mutation chain, which returns early on g.IsMutation. The accompanying comment is misleading."
     },
@@ -100,6 +111,7 @@
       "kind": "docs",
       "severity": "minor",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": ["docs/lit/graphql/interop.md"],
       "summary": "interop.md's 'Laziness' paragraph still says no request is sent until a value is forced, contradicting the new 'Nullable object fields' section right below it, which describes probes on let, argument passing, comparison, etc."
     },
@@ -108,6 +120,7 @@
       "kind": "docs",
       "severity": "minor",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": [".agents/skills/dang-language/reference/graphql.md:64"],
       "summary": "The agent skill reference still says no request is sent until a GraphQL value is forced; the PR now probes nullable object/interface/union fields when they escape the chain, and `case` with concrete patterns on abstract handles sends a query."
     },
@@ -116,6 +129,7 @@
       "kind": "docs",
       "severity": "minor",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": [".agents/skills/dang-language/reference/graphql.md:61"],
       "summary": "The agent skill reference still says mutations follow the same laziness rules as queries; the PR makes nullable object fields reached through a mutation never null-probed and stops `case` resolving concrete types there. interop.md was updated; this copy wasn't."
     },
@@ -124,6 +138,7 @@
       "kind": "docs",
       "severity": "minor",
       "confidence": "confirmed",
+      "vetted": null,
       "locations": [".agents/skills/dang-language/reference/control-flow.md:135"],
       "summary": "The agent skill reference lists only leaf fields and .{{ }} selections as GraphQL execution points; the PR adds a third (a possibly-null handle escaping the chain is probed), and rescue classification now treats it as a leaf. errors.md was updated; this twin wasn't."
     }
