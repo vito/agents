@@ -1912,6 +1912,14 @@ let voterPrompt: String! = """
   REJECT it otherwise, including when you cannot establish it. Real but
   not worth the time is a REJECT.
 
+  INTENDED MECHANISM, UNSTATED CONSEQUENCE: that a finding follows from a
+  design the change chose on purpose does not make it a REJECT. Authors
+  weigh the mechanism, not always each consequence users will see; that
+  is what a review is for. Reject it as intended only when the change's
+  own commits, docs, comments or tests already state that consequence (not
+  just the mechanism behind it). Otherwise judge it on its stake like any
+  other finding.
+
   severity is your own call, by evidence: IMPORTANT only for a bug or
   regression that you reproduced or that follows with near certainty on a
   realistic path; CONCERN for design guidance; NIT for a quick fix.
