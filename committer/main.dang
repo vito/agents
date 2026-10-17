@@ -127,8 +127,16 @@ type Committer {
   readonly(base: LLM!): LLM! {
     base
       .withTools(currentNode.{{... on Dagger.Committer!}}.asReadOnly, except: plumbing + ["push"], version: 2)
-      .withSystemPrompt(systemPrompt)
+      .withSystemPrompt(readOnlySystemPrompt)
       .withSystemPrompt("This conversation is read-only toward remotes: there is no push. Commit locally; your work leaves through whoever harvests your commits.")
+  }
+
+  # The full prompt minus what it says about push: its bullet, and the
+  # rebase's push hint (the read-only rebase prints a harvest note instead).
+  let readOnlySystemPrompt: String! {
+    systemPrompt
+      .replaceMatches("(?s)\\n[ \\t]*- `push` — publish.*?genuinely intended\\.", with: "")
+      .replaceMatches("the finished\\s+rebase prints the `push\\(branch:, expectedRemoteSHA:\\)` call to publish\\.", with: "the finished rebase says how its commits leave.")
   }
 
   """
