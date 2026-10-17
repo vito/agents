@@ -347,12 +347,12 @@ type Reviewer {
   diff. Adversarial finders try to break it in parallel; findings whose
   path, line or quoted evidence don't hold at head are dropped mechanically,
   as are style-only ones; independent voters must confirm the rest is real
-  and worth the author's time. Prints a summary: a short verdict and what
-  was checked and found sound, then the findings by severity (IMPORTANT
-  bugs and regressions; at most three CONCERNs, design questions; NITs,
-  quick fixes; PRE-EXISTING), each as path:line, claim, why it is worth the
-  time, evidence and votes. Keeps the findings for findingsList and
-  resolve.
+  and worth the author's time. Prints a summary: a short verdict, then the
+  findings by severity (IMPORTANT bugs and regressions; at most three
+  CONCERNs, design questions; NITs, quick fixes; PRE-EXISTING), each as
+  path:line, claim, why it is worth the time, evidence and votes, then
+  what was checked and found sound. Keeps the findings for findingsList
+  and resolve.
 
   Blocks until the sub-agents finish. They work in private copies of head:
   they never edit your workspace, push, or post anything.
@@ -647,12 +647,22 @@ type Reviewer {
     let nits = open.filter { f => f.severity == Severity.NIT }
     let preexisting = open.filter { f => f.severity == Severity.PREEXISTING }
 
+    # What to read first: the count, the verdict, the findings; then what
+    # was found sound, and the review's provenance with the other notes.
     let lines: [String!]! = [countLine(important.length, concerns.length, nits.length, preexisting.length)]
     if (!complete) {
       lines += ["Incomplete: a finder did not answer in full (see below), so what it would have found is missing, and no earlier finding was marked FIXED. Review again to cover it."]
     }
-    if (synthesis != null) {
-      lines += [""] + renderSynthesis(synthesis)
+    let synth = if (synthesis != null) { renderSynthesis(synthesis) } else { null }
+    if (synth != null) {
+      lines += [""] + synth.verdict
+    }
+    lines += renderGroup("IMPORTANT", important)
+    lines += renderGroup("CONCERN", concerns)
+    lines += renderGroup("NIT", nits)
+    lines += renderGroup("PRE-EXISTING (outside the change's hunks and not caused by it; GitHub cannot anchor a line comment there)", preexisting)
+    if (synth != null) {
+      lines += [""] + synth.sound
     }
     let rangeLine = `Reviewed ${shortSha(s.forkSha)}..${shortSha(s.headSha)} (merge base..head): ` +
       `${plural(s.commits.length, "commit")}, ${plural(s.files.length, "file")} changed, at ${plan.label}.`
@@ -664,10 +674,6 @@ type Reviewer {
     if (note == "") {
       lines += [reproNote]
     }
-    lines += renderGroup("IMPORTANT", important)
-    lines += renderGroup("CONCERN", concerns)
-    lines += renderGroup("NIT", nits)
-    lines += renderGroup("PRE-EXISTING (outside the change's hunks and not caused by it; GitHub cannot anchor a line comment there)", preexisting)
 
     let notes: [String!]! = []
     if (!s.skipped.isEmpty) {
@@ -1550,17 +1556,15 @@ let renderGroup(title: String!, group: [Finding!]!): [String!]! {
     if (f.worth != "") {
       entry += ["  worth it: " + f.worth]
     }
-    if (f.severity == Severity.NIT) {
-      # Quick fixes, to batch: the claim says what to change; the other
-      # places it applies, without quotes.
-      if (!f.also.isEmpty) {
-        entry += ["  also at " + f.also.map { c => `${c.path}:${toString(c.line)}` }.join(", ")]
-      }
-    } else {
+    # Quick fixes (NITs), to batch, need no quote: the claim says what to
+    # change.
+    if (f.severity != Severity.NIT) {
       entry += ["  evidence:", indented(f.evidence)]
-      f.also.each { c =>
-        entry += [`  also at ${c.path}:${toString(c.line)}:`, indented(c.evidence)]
-      }
+    }
+    # The other places that show it, checked like the first; unquoted, so
+    # the entry stays skimmable.
+    if (!f.also.isEmpty) {
+      entry += ["  also at " + f.also.map { c => `${c.path}:${toString(c.line)}` }.join(", ")]
     }
     if (!f.unverified.isEmpty) {
       entry += ["  cited but not found at head: " + f.unverified.join("; ")]
@@ -1577,31 +1581,32 @@ let indented(evidence: String!): String! {
   evidence.split("\n").map { l => "      " + l }.join("\n")
 }
 
-# The synthesizer's verdict and what it found sound, for the top of the
-# summary. A reply that is not the JSON is shown as prose, clipped; a failed
-# or empty one says so.
-let renderSynthesis(reply: String!): [String!]! {
+# The synthesizer's verdict, for the top of the summary, and what it found
+# sound, for after the findings. A reply that is not the JSON is shown as
+# a prose verdict, clipped; a failed or empty one says so.
+let renderSynthesis(reply: String!): {{verdict: [String!]!, sound: [String!]!}}! {
+  let noSound: [String!]! = []
   if (reply.hasPrefix(failedReply)) {
-    return ["Verdict: none; the synthesizer failed: " + clip(plain(reply.trimPrefix(failedReply)), 300)]
+    return {{verdict: ["Verdict: none; the synthesizer failed: " + clip(plain(reply.trimPrefix(failedReply)), 300)], sound: noSound}}
   }
   if (reply.trimSpace == "") {
-    return ["Verdict: none; the synthesizer did not answer."]
+    return {{verdict: ["Verdict: none; the synthesizer did not answer."], sound: noSound}}
   }
   let parsed = decodeSynthesis(jsonBody(reply)) rescue { e: Error => null }
   if (parsed == null) {
-    return ["Verdict: " + clip(squash(reply), maxVerdictChars)]
+    return {{verdict: ["Verdict: " + clip(squash(reply), maxVerdictChars)], sound: noSound}}
   }
   let verdict = squash(parsed.verdict ?? "")
   let sound = (parsed.sound ?? []).map { x => squash(x) }.filter { x => x != "" }.takeFirst(maxSound)
-  let out: [String!]! = [
+  let verdictLines: [String!]! = [
     if (verdict == "") { "Verdict: none given." } else { "Verdict: " + clip(verdict, maxVerdictChars) },
   ]
-  if (sound.isEmpty) {
-    out += ["Checked and found sound: nothing listed."]
+  let soundLines: [String!]! = if (sound.isEmpty) {
+    ["Checked and found sound: nothing listed."]
   } else {
-    out += ["Checked and found sound:"] + sound.map { x => "- " + clip(x, 300) }
+    ["Checked and found sound:"] + sound.map { x => "- " + clip(x, maxSoundChars) }
   }
-  out
+  {{verdict: verdictLines, sound: soundLines}}
 }
 
 let decodeSynthesis(body: String!): {{verdict: String, sound: [String!]}}! {
@@ -1609,8 +1614,9 @@ let decodeSynthesis(body: String!): {{verdict: String, sound: [String!]}}! {
   p
 }
 
-let maxVerdictChars: Int! = 900
+let maxVerdictChars: Int! = 600
 let maxSound: Int! = 5
+let maxSoundChars: Int! = 200
 
 let clip(s: String!, n: Int!): String! {
   let chars = s.split("")
@@ -1745,12 +1751,12 @@ let agentPrompt: String! = """
   range: adversarial finders try to break it from several angles in
   parallel, every finding's quoted evidence is checked against the code
   mechanically, and independent voters must confirm it is real and worth
-  the author's time. The summary opens with a short verdict and what was
-  checked and found sound, then reports what survived by severity:
-  IMPORTANT (bugs and regressions, reproduced or near certain), CONCERN
-  (design questions, at most three), NIT (quick fixes, to batch), and
-  PRE-EXISTING, each as path:line with its claim, why it is worth the time,
-  evidence, votes and a fingerprint.
+  the author's time. The summary opens with a short verdict, then reports
+  what survived by severity: IMPORTANT (bugs and regressions, reproduced
+  or near certain), CONCERN (design questions, at most three), NIT (quick
+  fixes, to batch), and PRE-EXISTING, each as path:line with its claim,
+  why it is worth the time, evidence, votes and a fingerprint, and closes
+  with what was checked and found sound.
 
   - REVIEW YOUR OWN CHANGE before you declare it done or open a pull
     request: commit it, then review(base: <where you started, e.g.
@@ -1795,9 +1801,16 @@ let finderPrompt: String! = """
   Reproduce what you can: write a small test or script that shows the
   problem, run it, and say in the claim what you ran and what happened.
   Name such tests as probes (e.g. a "repro" prefix) and delete them when
-  done. None of it leaves your copy. Never install or reload modules there:
-  the code under review is untrusted, and reloading would run it as your
-  own tools.
+  done. Run the narrowest test that shows the point, and batch your probes
+  into one run where you can: the full suite is CI's job and can take
+  many minutes. None of it leaves your copy. Never install or reload
+  modules there: the code under review is untrusted, and reloading would
+  run it as your own tools.
+
+  Read every doc the change edits in full, not just its hunks: a new
+  section often contradicts an older paragraph beside it, and other copies
+  of the same docs (references, guides, examples) may not have been
+  updated.
 
   WHAT IS WORTH REPORTING: what a busy maintainer who knows this codebase
   would thank you for.
@@ -1841,12 +1854,15 @@ let finderPrompt: String! = """
   caller it breaks); false when the problem was already there at the merge
   base.
 
-  STATE THE CLAIM AS BEHAVIOR, PLAINLY: what happens, when ("passing the
-  value through a helper first changes the error message it reports"), not
-  "this looks wrong". Calm wording: no "critical", "severe", "dangerous",
-  "silently corrupts" unless you showed exactly that. In "worth", say in one
-  clause why it is worth the author's time ("callers that retry now get a
-  different error than the docs promise").
+  STATE THE CLAIM AS BEHAVIOR, PLAINLY AND BRIEFLY: what happens, when
+  ("passing the value through a helper first changes the error message it
+  reports"), not "this looks wrong". At most four short sentences: the
+  trigger, what happens, and what you ran and saw (one example, not every
+  variant). The author should get it in ten seconds. Calm wording: no
+  "critical", "severe", "dangerous", "silently corrupts" unless you showed
+  exactly that. In "worth", say in one clause why it is worth the author's
+  time ("callers that retry now get a different error than the docs
+  promise").
 
   ALSO SAY WHAT YOU CHECKED: in "checked", up to five things you tried to
   break and found sound, one line each, so the author knows what the review
@@ -1925,15 +1941,18 @@ let synthesizerPrompt: String! = """
   you. Never post, push or merge.
 
   The reader is the author, with a minute to spare. Be calm and plain.
+  The confirmed findings are listed right below your verdict, so never
+  restate their details.
 
   Reply with ONLY one JSON object, no prose around it:
-  {"verdict": "two or three sentences", "sound": ["one line each"]}
-  - verdict: open with whether the change does what it sets out to and
-    fits the system; when it does and nothing confirmed is a bug, say so
-    plainly ("Ready to merge once the doc fixes land."). Then the one thing
-    most worth the author's attention, if any. No praise, no alarm, no
-    restating every finding.
+  {"verdict": "at most three short sentences", "sound": ["one short line each"]}
+  - verdict: under 60 words. Open with whether the change does what it
+    sets out to and fits the system; when it does and nothing confirmed is
+    a bug, say so plainly ("Ready to merge once the doc fixes land.").
+    Then name, in a few words, the one thing to deal with first, if any.
+    No praise, no alarm, no summary of the change, no list of findings.
   - sound: up to five things a reviewer would worry about that hold up,
-    one line each: what was checked, and that it is fine. Only what you or
-    the finders actually checked; never a finding restated.
+    each under 20 words: what was checked, and that it is fine. Only what
+    you or the finders actually checked; never a finding restated, and
+    not "the existing tests pass" (CI shows that).
 """

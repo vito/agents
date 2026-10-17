@@ -249,18 +249,19 @@ let checkReviewerConcerns: String! {
   let open = reviewed.findingsList(status: ReviewerFindingStatus.OPEN)
   let lines = summary.split("\n")
   assert(message: summary) { (lines[0] ?? "") == "1 concern, 1 nit, 1 pre-existing" }
-  # The synthesis sits right after the count line, sound items cleaned up.
+  # The verdict sits right after the count line, then the findings; what
+  # was found sound follows them, cleaned up, then the provenance.
   assert(message: summary) { (lines[1] ?? "") == "" }
   assert(message: summary) { (lines[2] ?? "") == "Verdict: The change adds a discount helper, but its rate is off by a factor of ten." }
-  assert(message: summary) { (lines[3] ?? "") == "Checked and found sound:" }
-  assert(message: summary) { (lines[4] ?? "") == "- total() still sums prices as before" and (lines[5] ?? "") == "- legacy() is untouched" }
-  assert(message: summary) { (lines[6] ?? "") == "" and (lines[7] ?? "").hasPrefix("Reviewed ") }
+  assert(message: summary) { (lines[3] ?? "") == "" and (lines[4] ?? "") == "CONCERN:" }
+  assert(message: summary) { summary.contains("\n\nChecked and found sound:\n- total() still sums prices as before\n- legacy() is untouched\n\nReviewed ") }
+  assert(message: summary) { (summary.split("Checked and found sound:")[0] ?? "").contains("PRE-EXISTING") }
   # The concern, between IMPORTANT and NIT, anchored in the hunk, with its
-  # other location and the ones that did not hold.
-  assert(message: summary) { summary.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n  evidence:\n      rate = percent / 10\n  also at calc.py:18:\n      return eval(x)\n") }
+  # other location (unquoted) and the ones that did not hold.
+  assert(message: summary) { summary.contains("CONCERN:\n- calc.py:2 — " + reviewerConcernClaim + "\n  evidence:\n      rate = percent / 10\n  also at calc.py:18\n") }
   assert(message: summary) { summary.contains("  cited but not found at head: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
   assert(message: summary) { summary.contains("votes: 1/1 confirmed · design (general)") }
-  assert(message: summary) { (summary.split("CONCERN:")[0] ?? "").contains("Sub-agents composed from") and (summary.split("CONCERN:")[1] ?? "").contains("NIT:") }
+  assert(message: summary) { (summary.split("CONCERN:")[1] ?? "").contains("Sub-agents composed from") and (summary.split("CONCERN:")[1] ?? "").contains("NIT:") }
   # The dropped concern names every location's reason.
   assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") }
   assert(message: summary) { summary.contains("calc.py:99 (general): no cited location holds: calc.py:99 (line does not exist at head (calc.py has 18 lines)); nope.py:1 (path does not exist at head)") }
@@ -367,7 +368,7 @@ let checkReviewerConcerns: String! {
   ).lastSummary
   let quietLines = quiet.split("\n")
   assert(message: quiet) { (quietLines[0] ?? "") == "Nothing to fix." and (quietLines[2] ?? "") == "Verdict: Small, and it does what it says." }
-  assert(message: quiet) { (quietLines[3] ?? "") == "Checked and found sound: nothing listed." }
+  assert(message: quiet) { (quietLines[3] ?? "") == "" and (quietLines[4] ?? "") == "Checked and found sound: nothing listed." }
   assert(message: quiet) { !quiet.contains("Answer every finding") }
   let prose = reviewer.tallyReplies(
     source: fx.feature.asWorkspace,
