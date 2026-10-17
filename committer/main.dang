@@ -73,14 +73,31 @@ type Committer {
   # detaches HEAD, so this is what the finished rebase names in its push hint.
   let rebaseBranch: String! = ""
 
-  let plumbing = ["withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState", "saved"]
+  let plumbing = ["withSavedWorkspace", "savedWorkspace", "withRebaseState", "withoutRebaseState", "saved", "readonly", "asReadOnly"]
+
+  # Set only by the read-only role (via asReadOnly); private and never
+  # cleared. When set, push is neither a tool nor callable.
+  let readOnlyMode: Boolean! = false
+
+  # What every binding of this toolset hides, and its withTools version.
+  # Tools that return the conversation (reset, rebase, ...) rebind the
+  # toolset themselves: they must keep the role's except list and version,
+  # or a read-only conversation would get push back after a reset, and a
+  # reload would reset the state of a binding whose version drifted.
+  let bindExcept: [String!]! {
+    if (readOnlyMode) { plumbing + ["push"] } else { plumbing }
+  }
+  let bindVersion: Int! {
+    if (readOnlyMode) { 2 } else { toolsVersion }
+  }
 
   # The withTools version of this state. Bump it when stored fields are
   # removed or change meaning, so older saved tool state is discarded instead
-  # of failing to load. Every binding must pass it, the agent entry and the
-  # continuations alike (see `continueWith`): a binding without it records
-  # version 0, and the next reload resets the state as a version change.
-  # Computed rather than a `let` field, so the constant itself is not state.
+  # of failing to load. Every binding must pass it (via bindVersion), the
+  # agent entry and the continuations alike (see `continueWith`): a binding
+  # without it records version 0, and the next reload resets the state as a
+  # version change. Computed rather than a `let` field, so the constant
+  # itself is not state.
   let toolsVersion: Int! {
     1
   }
@@ -89,9 +106,43 @@ type Committer {
   Compose the git tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
+    # Read-only is sticky, as in contributor: with the read-only role
+    # recorded, a later composition of this entry adds nothing.
+    if (readOnlyRecorded(base)) {
+      return base
+    }
     base
-      .withTools(currentNode, except: plumbing, version: toolsVersion)
+      .withTools(currentNode, except: bindExcept, version: bindVersion)
       .withSystemPrompt(systemPrompt)
+  }
+
+  """
+  The read-only role: every git tool except `push`, the one effect on a
+  remote. Local history operations (commit, reset, rebase, cherry-pick)
+  stay: they only touch this workspace.
+
+  Not @agent, so default composition never selects it; compose it by address
+  as `dag://committer/readonly` INSTEAD of `dag://committer/agent`.
+  """
+  readonly(base: LLM!): LLM! {
+    base
+      .withTools(currentNode.{{... on Dagger.Committer!}}.asReadOnly, except: plumbing + ["push"], version: 2)
+      .withSystemPrompt(systemPrompt)
+      .withSystemPrompt("This conversation is read-only toward remotes: there is no push. Commit locally; your work leaves through whoever harvests your commits.")
+  }
+
+  """
+  This toolset in read-only mode: internal plumbing for the read-only role.
+  """
+  asReadOnly: Committer! {
+    self.readOnlyMode = true
+    self
+  }
+
+  let readOnlyRecorded(base: LLM!): Boolean! {
+    base.expertise.{{ name, originalModule.{{ name }} }}.any { e =>
+      e.originalModule.name == "committer" and (e.name == "readonly" or e.name.hasSuffix(":readonly"))
+    }
   }
 
   # ------------------------------------------------------- pending changes
@@ -911,6 +962,9 @@ type Committer {
     # The HEAD probe is the same first-read guard as the history tools': a
     # workspace with no readable history gets the plain answer, not a push
     # error.
+    if (readOnlyMode) {
+      raise "push is not available in read-only mode: this role must not change any remote."
+    }
     head(source).commitSHA rescue {
       e: Error => return noHistory(e.message)
     }
@@ -1515,9 +1569,10 @@ type Committer {
   # routes one way only — a same-type Committer! rebinds the state, a
   # Workspace! swaps the workspace — so a tool that must change both returns
   # this continuation. Rebinding here replaces the binding wholesale, so it
-  # repeats the agent entry's except list and version.
+  # repeats the role's except list and version: a read-only conversation
+  # must not get push back after a reset or rebase.
   let continueWith(llm: LLM!, tools: Dagger.Committer!, workspace: Workspace!): LLM! {
-    llm.withTools(tools, except: plumbing, version: toolsVersion).withWorkspace(workspace)
+    llm.withTools(tools, except: bindExcept, version: bindVersion).withWorkspace(workspace)
   }
 
   # How a ref given by address is named in rebase output: its ref name when
