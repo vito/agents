@@ -1239,42 +1239,69 @@ type Contributor {
     false
   }
 
-  # A `gh api` call that cannot write: no graphql endpoint (queries and
-  # mutations share it), no --input body, and a GET method — explicit
-  # whenever fields are passed, since gh defaults to POST once a -f/-F
-  # field is given.
+  # A `gh api` call that cannot write, decided by an ALLOWLIST parse of the
+  # whole command line rather than by looking for write flags, which gh's
+  # parser (pflag) can hide: combined short flags (`-iXPUT`, `-iftitle=x`)
+  # and decoys consumed as another flag's value (`-q -XGET`). Every token
+  # must be the `api` command, one endpoint that is not graphql (queries and
+  # mutations share it), or a flag gh reads the way this does: read-only
+  # flags spelled alone, value flags with their value, a GET/HEAD method,
+  # and fields only with an explicit GET (gh defaults to POST once a -f/-F
+  # field is given). Anything else — --input, an unknown or combined flag,
+  # a second positional — is refused.
   let apiReadOnly(args: [String!]!): Boolean! {
-    if (args.any { a => a == "graphql" or a.hasSuffix("/graphql") }) {
-      return false
-    }
-    if (args.any { a => a == "--input" or a.hasPrefix("--input=") }) {
-      return false
-    }
-    let method = methodOf(args)
-    if (method != "" and method != "GET" and method != "HEAD") {
-      return false
-    }
-    let fields = args.any { a =>
-      a == "-f" or a == "-F" or a == "--field" or a == "--raw-field" or a.hasPrefix("--field=") or a.hasPrefix("--raw-field=") or (a.hasPrefix("-f") and !a.hasPrefix("--")) or (a.hasPrefix("-F") and !a.hasPrefix("--"))
-    }
-    !(fields and method == "")
-  }
-
-  # The last HTTP method args name (-X/--method, joined or separate),
-  # uppercased; "" when none is given.
-  let methodOf(args: [String!]!): String! {
-    let method = ""
-    args.each { t, i =>
-      let u = t.toUpper
-      if (t == "-X" or t == "--method") {
-        method = (args[i + 1] ?? "").toUpper
-      } else if (u.hasPrefix("--METHOD=")) {
-        method = u.trimPrefix("--METHOD=")
-      } else if (t.hasPrefix("-X")) {
-        method = u.trimPrefix("-X")
+    let switches = ["-i", "--include", "--paginate", "--slurp", "--silent", "--verbose"]
+    let valued = ["-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "-R", "--repo", "--hostname"]
+    let fieldFlags = ["-f", "-F", "--field", "--raw-field"]
+    let ok = true
+    let expect = ""
+    let sawApi = false
+    let endpoint = ""
+    let fields = false
+    let readMethod = false
+    args.each { t =>
+      if (!ok) {
+        null
+      } else if (expect == "value") {
+        expect = ""
+      } else if (expect == "method") {
+        expect = ""
+        let m = t.toUpper
+        if (m == "GET" or m == "HEAD") { readMethod = true } else { ok = false }
+      } else if (t == "-X" or t == "--method") {
+        expect = "method"
+      } else if (t.hasPrefix("--method=") or t.hasPrefix("-X")) {
+        let m = t.trimPrefix("--method=").trimPrefix("-X").toUpper
+        if (m == "GET" or m == "HEAD") { readMethod = true } else { ok = false }
+      } else if (valued.contains(t)) {
+        expect = "value"
+      } else if (fieldFlags.contains(t)) {
+        fields = true
+        expect = "value"
+      } else if (t.hasPrefix("--field=") or t.hasPrefix("--raw-field=")) {
+        fields = true
+      } else if (switches.contains(t)) {
+        null
+      } else if (valued.any { v => v.hasPrefix("--") and t.hasPrefix(v + "=") }) {
+        null
+      } else if (t.hasPrefix("-")) {
+        ok = false
+      } else if (!sawApi) {
+        sawApi = t == "api"
+        ok = sawApi
+      } else if (endpoint == "") {
+        endpoint = t
+      } else {
+        ok = false
       }
     }
-    method
+    if (!ok or expect != "" or endpoint == "") {
+      return false
+    }
+    if (endpoint == "graphql" or endpoint.hasSuffix("/graphql")) {
+      return false
+    }
+    !fields or readMethod
   }
 
   let readOnlyError(tool: String!): String! {
