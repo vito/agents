@@ -257,7 +257,17 @@ let checkReviewerReconcile: String! {
     finderReplies: ["I ran out of time."],
     voterReplies: [],
   )
-  let elsewhere = unanswered.tallyReplies(
+  # JSON without a findings list is no answer either.
+  let errored = unanswered.tallyReplies(
+    source: fx.shifted.asWorkspace,
+    head: fx.shifted,
+    base: fx.main,
+    depth: ReviewerDepth.QUICK,
+    finderReplies: ["{\"error\": \"timed out\"}"],
+    voterReplies: [],
+  )
+  assert(message: errored.lastSummary) { !errored.lastSummary.contains("now FIXED") and errored.lastSummary.contains("replied without the findings JSON") }
+  let elsewhere = errored.tallyReplies(
     source: fx.main.asWorkspace,
     head: fx.main,
     base: fx.main,

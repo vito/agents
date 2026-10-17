@@ -996,7 +996,10 @@ let parseFindings(reply: String!): [{{path: String, line: Int, claim: String, ev
   let wrapped: {{findings: [{{path: String, line: Int, claim: String, evidence: String, category: String, severity: String}}!]}}! = JSON.decode(body)
   let listed = wrapped.findings
   if (listed == null) {
-    return []
+    # `{"error": ...}`, a differently wrapped object, or a stray `{}` in
+    # prose is not an answer: an empty list here would count as a complete
+    # review that found nothing, and close earlier findings as FIXED.
+    raise "the reply has no `findings` list"
   }
   listed
 }
