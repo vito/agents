@@ -175,6 +175,78 @@ type AgentsDev {
     null
   }
 
+  """Check the reviewer eval's scorecard arithmetic on canned judge replies, and validate every eval case, without model calls."""
+  reviewerEvalScoring(source: Workspace!): Void @check {
+    print(checkReviewerEvalScoring(source))
+    null
+  }
+
+  # The reviewer eval (reviewer-eval.dang) calls models, so it is not a
+  # check: these are plain functions, run on demand when reviewer's prompts,
+  # tools or model change. The required case name also keeps them out of
+  # workspace artifact enumeration.
+
+  """
+  Run reviewer on an eval case (agents-dev/evals/<case>/case.json) and score
+  what it reports: each finding's value (guardrail, guidance, quick-fix,
+  speed-bump, false), alarmism, a value score, noise, length, and recall on
+  confirmed and vetted-real issues. Returns the scorecard as a table and
+  JSON, then the review. Calls models: the review's sub-agents, then the
+  judge. E.g. `dagger call agents-dev reviewer-eval --case-name dang-187`.
+  """
+  reviewerEval(
+    source: Workspace!,
+    """
+    The case: a directory name under agents-dev/evals.
+    """
+    caseName: String!,
+    """
+    The review depth.
+    """
+    depth: ReviewerEvalDepth! = ReviewerEvalDepth.STANDARD,
+    """
+    Judge samples per finding (1-9); each of a finding's match, value and
+    alarmism takes the answer a strict majority gives. Odd numbers avoid ties.
+    """
+    samples: Int! = 3,
+    """
+    The judge's model; empty for the engine's default.
+    """
+    judgeModel: String! = "",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    runReviewerEval(source, caseName, depth, samples, judgeModel)
+  }
+
+  """
+  Score any review's text (reviewer's, a baseline's, another tool's) against
+  an eval case, as reviewerEval does. Returns the scorecard as a table and JSON.
+  Calls the judge model. E.g. `dagger call agents-dev reviewer-eval-score
+  --case-name dang-187 --review agents-dev/evals/dang-187/baseline-reviewer-v1.md`.
+  """
+  reviewerEvalScore(
+    source: Workspace!,
+    """
+    The case: a directory name under agents-dev/evals.
+    """
+    caseName: String!,
+    """
+    The review to score, as text.
+    """
+    review: File!,
+    """
+    Judge samples per finding (1-9); each of a finding's match, value and
+    alarmism takes the answer a strict majority gives. Odd numbers avoid ties.
+    """
+    samples: Int! = 3,
+    """
+    The judge's model; empty for the engine's default.
+    """
+    judgeModel: String! = "",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    let scored = scoreReviewerEvalText(source, caseName, review.contents, review.name, samples, judgeModel, reviewerEvalNoMeta)
+    scored.text + "\n\n--- scorecard.json ---\n" + scored.json
+  }
+
   """Check sandbox sessions: exec, change extraction, continued and fresh sessions."""
   sandboxSessions(source: Workspace!): Void @check {
     print(testSandboxSessions(source: source))

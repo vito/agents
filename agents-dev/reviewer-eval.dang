@@ -1,0 +1,892 @@
+# Reviewer eval: score any review's text against a case, and run reviewer
+# on a case and score what it reports. "Rescore the reviewer whenever its
+# prompts, tools or model change."
+#
+# The goal is a review that is BETTER than an exhaustive essay, not one that
+# matches it: guardrails (real bugs), design guidance and obvious quick
+# fixes, without speed bumps (plausible-sounding findings that waste the
+# reader's time) or alarmism. So the headline is not recall against the
+# case's known issues, which were compiled from unvetted reviews:
+#
+# - value score: the sum over findings of their value class's weight
+#   (reviewerEvalValueWeights, plus reviewerEvalAlarmismWeight per alarmist
+#   finding), so speed bumps, false findings and alarmism cost points;
+# - noise: speed bumps + false findings + alarmist findings (lower is
+#   better);
+# - findings and the review's length in words: the reader's time;
+# - recall on confirmed issues (reproduced by a reviewer), and on issues the
+#   PR author vetted "real", once there are any.
+# Raw recall over all known issues, per kind and severity-weighted, is
+# informational only.
+#
+# A case lives in evals/<name>/case.json: a pull request pinned to its head
+# and merge base, its known issues (key, kind, severity, confidence,
+# vetted, locations, summary) and "sound" items, things checked and found
+# correct that act as false-positive traps. `vetted` is null until the
+# author labels an issue "real" or "dismiss", in case.json or in the
+# vetting note beside it (vetting.md: "### <key>" headings, each followed by
+# a "vetted:" line). Baseline reviews sit beside it too.
+#
+# Scoring has two halves. The model-calling half, in reviewer-eval/ (run in
+# a plain-directory fixture workspace, see there for why), has a judge with
+# no tools split the review into numbered findings, then rate every finding
+# N times, independently: its match (an issue key, a sound key, or none),
+# its value (guardrail, guidance, quick-fix, speed-bump, false, duplicate)
+# and whether it is alarmist. The engine offers no temperature setting, so
+# robustness comes from the vote: each field takes the answer a strict
+# majority of samples gave, else "disputed" (alarmism: true only on a strict
+# majority); an unparseable or unknown answer is "unjudged". The
+# deterministic half is here: the majorities, then mechanical overrides (a
+# later finding on an already matched issue is a duplicate; one matching a
+# sound item is false; one matching an issue vetted "dismiss" is a speed
+# bump, and one matching an issue vetted "real" is at least guidance), the
+# arithmetic and the scorecard. checkReviewerEvalScoring covers it on canned
+# judge replies.
+#
+# The functions that call models (reviewerEval, reviewerEvalScore in
+# main.dang) are plain functions with a required argument: never checks, and
+# not enumerable as workspace artifacts, so nothing runs them by accident.
+
+"""
+The depth to run reviewer at in an eval: reviewer's own Depth, which a
+function here cannot take as an argument (an external type).
+"""
+enum ReviewerEvalDepth {
+  QUICK
+  STANDARD
+  DEEP
+}
+
+type ReviewerEvalIssue {
+  key: String!
+  kind: String!
+  severity: String!
+  confidence: String!
+  vetted: String
+  locations: [String!]!
+  summary: String!
+}
+
+type ReviewerEvalSound {
+  key: String!
+  summary: String!
+}
+
+type ReviewerEvalCase {
+  name: String!
+  title: String!
+  pr: String!
+  repo: String!
+  head: String!
+  base: String!
+  notes: String
+  issues: [ReviewerEvalIssue!]!
+  sound: [ReviewerEvalSound!]!
+}
+
+let reviewerEvalKinds: [String!]! = ["bug", "concern", "cleanup", "docs"]
+let reviewerEvalValues: [String!]! = ["guardrail", "guidance", "quick-fix", "speed-bump", "false", "duplicate"]
+# Labels a key cannot take: they mean something else in a vote.
+let reviewerEvalReserved: [String!]! = ["none", "disputed", "unjudged"]
+let reviewerEvalMaxSamples: Int! = 9
+
+# The value score's weights, per finding by its value class. Change them
+# here; the scorecard prints them.
+let reviewerEvalValueWeights: [{{name: String!, weight: Int!}}!]! = [
+  {{name: "guardrail", weight: 3}},
+  {{name: "guidance", weight: 1}},
+  {{name: "quick-fix", weight: 1}},
+  {{name: "speed-bump", weight: -1}},
+  {{name: "false", weight: -2}},
+  {{name: "duplicate", weight: -1}},
+  {{name: "disputed", weight: 0}},
+  {{name: "unjudged", weight: 0}},
+]
+# Added once per alarmist finding, on top of its value's weight.
+let reviewerEvalAlarmismWeight: Int! = -1
+
+# Informational only: severity weights for the recall over unvetted labels.
+let reviewerEvalSeverityWeight(severity: String!): Int! {
+  if (severity == "important") { 3 } else { 1 }
+}
+
+let reviewerEvalValueWeight(value: String!): Int! {
+  let found = reviewerEvalValueWeights.filter { w => w.name == value }
+  let first = found[0]
+  if (first == null) { 0 } else { first.weight }
+}
+
+let reviewerEvalSigned(n: Int!): String! {
+  if (n > 0) { "+" + toString(n) } else { toString(n) }
+}
+
+let reviewerEvalWeightsText: String! {
+  reviewerEvalValueWeights
+    .filter { w => w.weight != 0 }
+    .map { w => w.name + " " + reviewerEvalSigned(w.weight) }
+    .join(", ") + ", alarmism " + reviewerEvalSigned(reviewerEvalAlarmismWeight)
+}
+
+# ------------------------------------------------------------------ cases
+
+# Everything wrong with a case, or nothing.
+let reviewerEvalProblems(c: ReviewerEvalCase!): [String!]! {
+  let problems: [String!]! = []
+  if (!c.head.containsMatch(`^[0-9a-f]{40}$`)) {
+    problems += [`head "${c.head}" is not a full 40-character commit SHA`]
+  }
+  if (!c.base.containsMatch(`^[0-9a-f]{40}$`)) {
+    problems += [`base "${c.base}" is not a full 40-character commit SHA`]
+  }
+  if (!c.repo.hasPrefix("https://")) {
+    problems += [`repo "${c.repo}" is not an https:// git URL`]
+  }
+  if (c.issues.isEmpty) {
+    problems += ["no issues"]
+  }
+  let keys = c.issues.map { i => i.key } + c.sound.map { s => s.key }
+  keys.uniq.each { k =>
+    if (keys.filter { x => x == k }.length > 1) {
+      problems += [`key "${k}" is used more than once`]
+    }
+    if (!k.containsMatch(`^[a-z0-9]+(-[a-z0-9]+)*$`)) {
+      problems += [`key "${k}" is not lowercase-kebab-case`]
+    }
+    if (reviewerEvalReserved.contains(k) or reviewerEvalValues.contains(k)) {
+      problems += [`key "${k}" is reserved`]
+    }
+  }
+  c.issues.each { i =>
+    if (!reviewerEvalKinds.contains(i.kind)) {
+      problems += [`${i.key}: kind "${i.kind}" is not one of ${reviewerEvalKinds.join(", ")}`]
+    }
+    if (i.severity != "important" and i.severity != "minor") {
+      problems += [`${i.key}: severity "${i.severity}" is not important or minor`]
+    }
+    if (i.confidence != "confirmed" and i.confidence != "claimed") {
+      problems += [`${i.key}: confidence "${i.confidence}" is not confirmed or claimed`]
+    }
+    let vetted = i.vetted ?? ""
+    if (vetted != "" and vetted != "real" and vetted != "dismiss") {
+      problems += [`${i.key}: vetted "${vetted}" is not null, real or dismiss`]
+    }
+    if (i.summary.trimSpace == "") {
+      problems += [`${i.key}: empty summary`]
+    }
+  }
+  c.sound.each { s =>
+    if (s.summary.trimSpace == "") {
+      problems += [`${s.key}: empty summary`]
+    }
+  }
+  problems
+}
+
+let reviewerEvalDir(name: String!): String! {
+  if (!name.containsMatch(`^[a-z0-9][a-z0-9-]*$`)) {
+    raise `eval case name "${name}" must be lowercase letters, digits and dashes`
+  }
+  `agents-dev/evals/${name}`
+}
+
+let reviewerEvalCasePath(name: String!): String! {
+  reviewerEvalDir(name) + "/case.json"
+}
+
+let decodeReviewerEvalCase(text: String!): ReviewerEvalCase! {
+  JSON.decode(text)
+}
+
+# The labels in a vetting note: each "### <key>" heading and the "vetted:"
+# line under it ("" when blank or missing).
+let reviewerEvalVettingNote(text: String!): [{{key: String!, vetted: String!}}!]! {
+  let out: [{{key: String!, vetted: String!}}!]! = []
+  let current = ""
+  text.split("\n").each { l =>
+    let heading = l.match(`^#{2,4}\s+([A-Za-z0-9-]+)\s*$`)
+    if (heading != null) {
+      current = heading.captures[0] ?? ""
+      out += [{{key: current, vetted: ""}}]
+    } else if (current != "") {
+      let line = l.match(`(?i)^\s*vetted:\s*(.*?)\s*$`)
+      if (line != null) {
+        let value = (line.captures[0] ?? "").toLower
+        let key = current
+        out = out.map { e => if (e.key == key) { {{key: key, vetted: value}} } else { e } }
+        current = ""
+      }
+    }
+  }
+  out
+}
+
+# What is wrong with a vetting note for `c`. An empty note (no file) is fine.
+let reviewerEvalVettingProblems(c: ReviewerEvalCase!, note: [{{key: String!, vetted: String!}}!]!): [String!]! {
+  if (note.isEmpty) {
+    return [] :: [String!]!
+  }
+  let problems: [String!]! = []
+  let keys = c.issues.map { i => i.key }
+  note.each { e =>
+    if (!keys.contains(e.key)) {
+      problems += [`vetting note: "${e.key}" is not an issue key`]
+    }
+    if (e.vetted != "" and e.vetted != "real" and e.vetted != "dismiss") {
+      problems += [`vetting note: ${e.key}: "${e.vetted}" is not blank, real or dismiss`]
+    }
+  }
+  c.issues.each { i =>
+    let mine = note.filter { e => e.key == i.key }
+    let first = mine[0]
+    if (first == null) {
+      problems += [`vetting note: does not list ${i.key}`]
+    } else {
+      let stored = i.vetted ?? ""
+      if (stored != "" and first.vetted != "" and stored != first.vetted) {
+        problems += [`${i.key}: vetted "${stored}" in case.json but "${first.vetted}" in the vetting note`]
+      }
+    }
+  }
+  problems
+}
+
+# `c` with the note's non-blank labels filled in.
+let reviewerEvalWithVetting(c: ReviewerEvalCase!, note: [{{key: String!, vetted: String!}}!]!): ReviewerEvalCase! {
+  let issues = c.issues.map { i =>
+    let mine = note.filter { e => e.key == i.key and e.vetted != "" }
+    let first = mine[0]
+    let vetted: String = if (first == null) { i.vetted } else { first.vetted }
+    ReviewerEvalIssue(
+      key: i.key, kind: i.kind, severity: i.severity, confidence: i.confidence,
+      vetted: vetted, locations: i.locations, summary: i.summary,
+    )
+  }
+  ReviewerEvalCase(
+    name: c.name, title: c.title, pr: c.pr, repo: c.repo, head: c.head, base: c.base,
+    notes: c.notes, issues: issues, sound: c.sound,
+  )
+}
+
+# The case named `name`, with its vetting note applied, validated.
+let loadReviewerEvalCase(source: Workspace!, name: String!): ReviewerEvalCase! {
+  let path = reviewerEvalCasePath(name)
+  let text = source.file(path).contents rescue {
+    e: Error => raise `no eval case "${name}" (${path}): ${e.message}`
+  }
+  let c = decodeReviewerEvalCase(text) rescue {
+    e: Error => raise `${path} does not decode: ${e.message}`
+  }
+  let noteText = source.file(reviewerEvalDir(name) + "/vetting.md").contents rescue { e: Error => "" }
+  let note = reviewerEvalVettingNote(noteText)
+  let problems = reviewerEvalProblems(c) + reviewerEvalVettingProblems(c, note)
+  if (c.name != name) {
+    problems += [`name "${c.name}" does not match its directory "${name}"`]
+  }
+  if (!problems.isEmpty) {
+    raise `${path} is malformed:` + "\n- " + problems.join("\n- ")
+  }
+  reviewerEvalWithVetting(c, note)
+}
+
+# ------------------------------------------------------------------ running
+
+# A plain-directory workspace holding reviewer-eval, this repository's
+# reviewer, the `agents` (see reviewerEvalAgents) and the inputs under
+# input/.
+let reviewerEvalFixture(source: Workspace!, agents: [String!]!, input: Directory!): Workspace! {
+  let toml: [String!]! = [
+    "[modules.reviewer]", `source = "reviewer"`, "",
+    "[modules.reviewer-eval]", `source = "reviewer-eval"`, "",
+  ]
+  let dir = directory
+    .withDirectory("reviewer", source.directory("/reviewer"))
+    .withDirectory("reviewer-eval", source.directory("/agents-dev/reviewer-eval"))
+    .withDirectory("input", input)
+  agents.each { m =>
+    if (m == "editor") {
+      toml += ["[modules.editor]", "source = " + JSON.encode(reviewerEvalEditorSource(source)), ""]
+    } else {
+      toml += [`[modules.${m}]`, `source = "${m}"`, ""]
+      dir = dir.withDirectory(m, source.directory("/" + m))
+    }
+  }
+  dir.withNewFile("dagger.toml", toml.join("\n")).asWorkspace
+}
+
+# What a review's caller composes besides reviewer: committer and
+# contributor from this workspace, so the sub-agents get their read-only
+# roles, and the editor the workspace's dagger.toml installs, for its file
+# tools.
+let reviewerEvalAgents(source: Workspace!): [String!]! {
+  let local = ["committer", "contributor"]
+  if (reviewerEvalEditorSource(source) == "") { local } else { local + ["editor"] }
+}
+
+# The editor module the workspace's dagger.toml installs, or "".
+let reviewerEvalEditorSource(source: Workspace!): String! {
+  let cfg: {{modules: {{editor: {{source: String}}}}!}}! = TOML.decode(source.file("dagger.toml").contents) rescue {
+    e: Error => return ""
+  }
+  let editor = cfg.modules.editor
+  if (editor == null) { "" } else { editor.source ?? "" }
+}
+
+# Evaluate reviewer-eval's `fn` in the fixture and read its result file, in
+# one query so the uncached function runs exactly once.
+let reviewerEvalInvoke(source: Workspace!, agents: [String!]!, input: Directory!, fn: String!): String! {
+  reviewerEvalFixture(source, agents, input)
+    .artifacts
+    .filterUri(uri: "dag://reviewer-eval/" + fn)
+    .one
+    .value
+    .{{ ... on File! }}
+    .contents
+}
+
+# Score a review's text: judge it (model calls), then the arithmetic.
+# `meta` is extra provenance for the scorecard, as name/value pairs.
+let scoreReviewerEvalText(
+  source: Workspace!,
+  name: String!,
+  review: String!,
+  label: String!,
+  samples: Int!,
+  judgeModel: String!,
+  meta: [{{name: String!, value: String!}}!]!,
+): {{text: String!, json: String!}}! {
+  let c = loadReviewerEvalCase(source, name)
+  if (samples < 1 or samples > reviewerEvalMaxSamples) {
+    raise `samples must be between 1 and ${toString(reviewerEvalMaxSamples)}`
+  }
+  if (review.trimSpace == "") {
+    raise "the review is empty"
+  }
+  let slots = [1, 2, 3, 4, 5, 6, 7, 8, 9].takeFirst(samples)
+  let input = directory
+    .withFile("case.json", source.file(reviewerEvalCasePath(name)))
+    .withNewFile("review.md", review)
+    .withNewFile("params.json", JSON.encode({{slots: slots, model: judgeModel, nonce: Random.string}}))
+  let judged: {{model: String!, findings: [String!]!, judgements: [String!]!}}! = JSON.decode(
+    reviewerEvalInvoke(source, [] :: [String!]!, input, "judge")
+  )
+  let judge = if (judged.model == "") { "(default model)" } else { judged.model }
+  reviewerEvalScorecard(c, label, review, judged.findings, judged.judgements, [{{name: "judge", value: judge}}] + meta)
+}
+
+# Run reviewer on the case and score its summary. The summary is printed as
+# soon as the review finishes, so a failed judge does not lose it.
+let runReviewerEval(source: Workspace!, name: String!, depth: ReviewerEvalDepth!, samples: Int!, judgeModel: String!): String! {
+  let c = loadReviewerEvalCase(source, name)
+  let agents = reviewerEvalAgents(source)
+  let input = directory
+    .withFile("case.json", source.file(reviewerEvalCasePath(name)))
+    .withNewFile("params.json", JSON.encode({{depth: toString(depth), agents: agents, nonce: Random.string}}))
+  let ran: {{review: String!, model: String!, seconds: Int!}}! = JSON.decode(reviewerEvalInvoke(source, agents, input, "run"))
+  print("--- review ---\n" + ran.review + "\n--- end review ---")
+  let composedLines = ran.review.split("\n").filter { l => l.hasPrefix("Sub-agents composed from: ") }
+  let composed = (composedLines[0] ?? "(not reported)").trimPrefix("Sub-agents composed from: ")
+  let model = if (ran.model == "") { "(default model)" } else { ran.model }
+  let scored = scoreReviewerEvalText(source, name, ran.review, `reviewer at ${toString(depth)}`, samples, judgeModel, [
+    {{name: "reviewer model", value: model}},
+    {{name: "composed from", value: composed}},
+    {{name: "review time", value: `${toString(ran.seconds)}s`}},
+    {{name: "range", value: `${c.base}..${c.head}`}},
+  ])
+  scored.text + "\n\n--- scorecard.json ---\n" + scored.json + "\n\n--- review ---\n" + ran.review
+}
+
+# ------------------------------------------------------------------ arithmetic
+
+# A JSON object in a reply, possibly inside a ```json fence or prose.
+let reviewerEvalJsonBody(reply: String!): String! {
+  let fenced = reply.split("```")
+  let inner = if (fenced.length >= 3) { (fenced[1] ?? "").trimPrefix("json").trimSpace } else { reply }
+  let m = inner.match(`(?s)\{.*\}`)
+  if (m != null) { m.string } else { inner.trimSpace }
+}
+
+let decodeReviewerEvalJudgements(reply: String!): [{{finding: Int, match: String, value: String, alarmism: Boolean}}!]! {
+  let wrapped: {{judgements: [{{finding: Int, match: String, value: String, alarmism: Boolean}}!]}}! = JSON.decode(reviewerEvalJsonBody(reply))
+  let listed = wrapped.judgements
+  if (listed == null) {
+    raise "no `judgements` list"
+  }
+  listed
+}
+
+let reviewerEvalUnjudged: {{match: String!, value: String!, alarm: Boolean!}}! = {{match: "unjudged", value: "unjudged", alarm: false}}
+
+# One sample's vote on each finding: the first judgement it gives the
+# finding, with a match or value it does not know read as "unjudged"; every
+# finding is unjudged in a sample that does not parse.
+let reviewerEvalSampleVotes(reply: String!, matches: [String!]!, findings: [String!]!): [{{match: String!, value: String!, alarm: Boolean!}}!]! {
+  let decoded = decodeReviewerEvalJudgements(reply) rescue {
+    e: Error => return findings.map { f => reviewerEvalUnjudged }
+  }
+  findings.map { f, i =>
+    let mine = decoded.filter { j => (j.finding ?? 0) == i + 1 }
+    let first = mine[0]
+    if (first == null) {
+      reviewerEvalUnjudged
+    } else {
+      let m = (first.match ?? "").trimSpace.toLower
+      let v = (first.value ?? "").trimSpace.toLower
+      let match = if (matches.contains(m)) { m } else { "unjudged" }
+      let value = if (reviewerEvalValues.contains(v)) { v } else { "unjudged" }
+      {{match: match, value: value, alarm: first.alarmism ?? false}}
+    }
+  }
+}
+
+# The answer a strict majority of votes gives, else "disputed".
+let reviewerEvalMajority(votes: [String!]!): String! {
+  let best = ""
+  let bestCount = 0
+  votes.uniq.each { v =>
+    let n = votes.filter { w => w == v }.length
+    if (n > bestCount) {
+      best = v
+      bestCount = n
+    }
+  }
+  if (bestCount * 2 > votes.length) { best } else { "disputed" }
+}
+
+# Rounded half up; 0 of 0 is 0.
+let reviewerEvalPercent(hit: Int!, total: Int!): Int! {
+  if (total == 0) { 0 } else { (hit * 200 + total) / (total * 2) }
+}
+
+let reviewerEvalRatio(hit: Int!, total: Int!): {{hit: Int!, total: Int!, percent: Int!}}! {
+  {{hit: hit, total: total, percent: reviewerEvalPercent(hit, total)}}
+}
+
+let reviewerEvalKindRatio(c: ReviewerEvalCase!, matched: [String!]!, kind: String!): {{hit: Int!, total: Int!, percent: Int!}}! {
+  let all = c.issues.filter { i => i.kind == kind }
+  reviewerEvalRatio(all.filter { i => matched.contains(i.key) }.length, all.length)
+}
+
+let reviewerEvalCount(labels: [String!]!, label: String!): Int! {
+  labels.filter { l => l == label }.length
+}
+
+let reviewerEvalVettedOf(c: ReviewerEvalCase!, key: String!): String! {
+  let mine = c.issues.filter { i => i.key == key }
+  let first = mine[0]
+  if (first == null) { "" } else { first.vetted ?? "" }
+}
+
+# One scorecard row: name, hit/total, percent.
+let reviewerEvalRow(name: String!, r: {{hit: Int!, total: Int!, percent: Int!}}!): String! {
+  let frac = `${toString(r.hit)}/${toString(r.total)}`
+  let pct = if (r.total == 0) { "-" } else { toString(r.percent) + "%" }
+  name.padRight(20) + frac.padRight(8) + pct.padLeft(5)
+}
+
+# One scorecard row: name, a number, a note.
+let reviewerEvalNumberRow(name: String!, n: String!, note: String!): String! {
+  name.padRight(20) + n.padLeft(5) + "   " + note
+}
+
+let reviewerEvalWords(text: String!): Int! {
+  text.splitMatches(`\s+`).filter { w => w != "" }.length
+}
+
+# The scorecard: every finding's majorities and overrides, then
+# deterministic arithmetic over the case. `replies` are the judge samples'
+# raw replies; `review` is the review's text, for its length.
+let reviewerEvalScorecard(
+  c: ReviewerEvalCase!,
+  label: String!,
+  review: String!,
+  findings: [String!]!,
+  replies: [String!]!,
+  meta: [{{name: String!, value: String!}}!]!,
+): {{text: String!, json: String!}}! {
+  let issueKeys = c.issues.map { i => i.key }
+  let soundKeys = c.sound.map { s => s.key }
+  let samples = replies.map { r => reviewerEvalSampleVotes(r, issueKeys + soundKeys + ["none"], findings) }
+
+  # Majorities per finding, in the review's order, then the overrides.
+  let matched: [String!]! = []
+  let unanimous = 0
+  let judged: [{{
+    id: Int!, text: String!, value: String!, alarmism: Boolean!, match: String!, note: String!,
+    matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!,
+  }}!]! = []
+  findings.each { text, i =>
+    let votes = samples.map { s => s[i] ?? reviewerEvalUnjudged }
+    let matchVotes = votes.map { v => v.match }
+    let valueVotes = votes.map { v => v.value }
+    let alarmVotes = votes.filter { v => v.alarm }.length
+    if (!votes.isEmpty and matchVotes.uniq.length == 1 and valueVotes.uniq.length == 1 and (alarmVotes == 0 or alarmVotes == votes.length)) {
+      unanimous += 1
+    }
+    let match = reviewerEvalMajority(matchVotes)
+    let value = reviewerEvalMajority(valueVotes)
+    let alarm = alarmVotes * 2 > votes.length
+    let note = ""
+    let isIssue = issueKeys.contains(match)
+    let again = isIssue and matched.contains(match)
+    if (isIssue and !again) {
+      matched += [match]
+    }
+    if (again) {
+      value = "duplicate"
+      note = "an earlier finding matched this issue"
+    } else if (soundKeys.contains(match)) {
+      value = "false"
+      note = "contradicts a sound item"
+    } else if (isIssue) {
+      let vetted = reviewerEvalVettedOf(c, match)
+      if (vetted == "dismiss" and value != "speed-bump" and value != "false") {
+        value = "speed-bump"
+        note = "its issue is vetted dismiss"
+      } else if (vetted == "real" and (value == "speed-bump" or value == "false")) {
+        value = "guidance"
+        note = "its issue is vetted real"
+      }
+    }
+    judged += [{{
+      id: i + 1, text: text, value: value, alarmism: alarm, match: match, note: note,
+      matchVotes: matchVotes, valueVotes: valueVotes, alarmVotes: alarmVotes,
+    }}]
+  }
+  let values = judged.map { f => f.value }
+  let alarms = judged.filter { f => f.alarmism }.length
+  let speedBumps = reviewerEvalCount(values, "speed-bump")
+  let falses = reviewerEvalCount(values, "false")
+  let score = alarms * reviewerEvalAlarmismWeight
+  values.each { v => score += reviewerEvalValueWeight(v) }
+  let words = reviewerEvalWords(review)
+
+  let hit = c.issues.filter { i => matched.contains(i.key) }
+  let missed = c.issues.filter { i => !matched.contains(i.key) }
+  let confirmed = c.issues.filter { i => i.confidence == "confirmed" }
+  let vettedReal = c.issues.filter { i => (i.vetted ?? "") == "real" }
+  let vettedDismiss = c.issues.filter { i => (i.vetted ?? "") == "dismiss" }
+  let weight = 0
+  let weightHit = 0
+  c.issues.each { i =>
+    weight += reviewerEvalSeverityWeight(i.severity)
+    if (matched.contains(i.key)) {
+      weightHit += reviewerEvalSeverityWeight(i.severity)
+    }
+  }
+
+  let card = {{
+    caseName: c.name,
+    review: label,
+    meta: meta,
+    samples: replies.length,
+    unanimous: unanimous,
+    headline: {{
+      valueScore: score,
+      noise: speedBumps + falses + alarms,
+      speedBumps: speedBumps,
+      falseFindings: falses,
+      alarmist: alarms,
+      findings: judged.length,
+      words: words,
+      confirmedRecall: reviewerEvalRatio(confirmed.filter { i => matched.contains(i.key) }.length, confirmed.length),
+      vettedRealRecall: reviewerEvalRatio(vettedReal.filter { i => matched.contains(i.key) }.length, vettedReal.length),
+      vettedDismissRaised: reviewerEvalRatio(vettedDismiss.filter { i => matched.contains(i.key) }.length, vettedDismiss.length),
+    }},
+    values: {{
+      guardrail: reviewerEvalCount(values, "guardrail"),
+      guidance: reviewerEvalCount(values, "guidance"),
+      quickFix: reviewerEvalCount(values, "quick-fix"),
+      speedBump: speedBumps,
+      falseFinding: falses,
+      duplicate: reviewerEvalCount(values, "duplicate"),
+      disputed: reviewerEvalCount(values, "disputed"),
+      unjudged: reviewerEvalCount(values, "unjudged"),
+    }},
+    soundContradictions: judged.filter { f => soundKeys.contains(f.match) }.length,
+    weights: {{values: reviewerEvalValueWeights, alarmism: reviewerEvalAlarmismWeight}},
+    matched: hit.map { i => i.key },
+    missedConfirmed: missed.filter { i => i.confidence == "confirmed" }.map { i => i.key },
+    informational: {{
+      recall: reviewerEvalRatio(hit.length, c.issues.length),
+      byKind: {{
+        bug: reviewerEvalKindRatio(c, matched, "bug"),
+        concern: reviewerEvalKindRatio(c, matched, "concern"),
+        cleanup: reviewerEvalKindRatio(c, matched, "cleanup"),
+        docs: reviewerEvalKindRatio(c, matched, "docs"),
+      }},
+      severityWeighted: reviewerEvalRatio(weightHit, weight),
+      missed: missed.map { i => i.key },
+    }},
+    judged: judged,
+  }}
+
+  let lines: [String!]! = [
+    `Reviewer eval: ${c.name} (${c.pr})`,
+    "review: " + label,
+  ]
+  meta.each { m => lines += [m.name + ": " + m.value] }
+  let vettedLine = if (vettedReal.isEmpty) {
+    "vetted-real recall  (no issue vetted real yet)"
+  } else {
+    reviewerEvalRow("vetted-real recall", card.headline.vettedRealRecall)
+  }
+  lines += [
+    `judge votes: ${toString(replies.length)} per finding, strict majority per field; ${toString(unanimous)}/${toString(judged.length)} findings unanimous`,
+    "",
+    reviewerEvalNumberRow("value score", reviewerEvalSigned(score), "(" + reviewerEvalWeightsText + ")"),
+    reviewerEvalNumberRow("noise", toString(card.headline.noise),
+      `speed-bump ${toString(speedBumps)} + false ${toString(falses)} + alarmist ${toString(alarms)}; lower is better`),
+    reviewerEvalNumberRow("findings", toString(judged.length), `the review is ${toString(words)} words`),
+    reviewerEvalRow("confirmed recall", card.headline.confirmedRecall),
+    vettedLine,
+  ]
+  if (!vettedDismiss.isEmpty) {
+    lines += [reviewerEvalRow("dismissed raised", card.headline.vettedDismissRaised) + "   lower is better"]
+  }
+  let missedConfirmed = card.missedConfirmed
+  lines += [
+    "",
+    `values: guardrail ${toString(card.values.guardrail)}, guidance ${toString(card.values.guidance)}, ` +
+      `quick-fix ${toString(card.values.quickFix)}, speed-bump ${toString(speedBumps)}, false ${toString(falses)}, ` +
+      `duplicate ${toString(card.values.duplicate)}, disputed ${toString(card.values.disputed)}, unjudged ${toString(card.values.unjudged)}` +
+      `; sound contradictions ${toString(card.soundContradictions)}`,
+    "matched: " + (if (hit.isEmpty) { "(none)" } else { card.matched.join(", ") }),
+    "missed confirmed: " + (if (missedConfirmed.isEmpty) { "(none)" } else { missedConfirmed.join(", ") }),
+    "",
+    "informational, over the unvetted known issues:",
+    reviewerEvalRow("  recall (all)", card.informational.recall),
+  ]
+  reviewerEvalKinds.each { k =>
+    let r = reviewerEvalKindRatio(c, matched, k)
+    if (r.total > 0) {
+      lines += [reviewerEvalRow("    " + k, r)]
+    }
+  }
+  lines += [
+    reviewerEvalRow("  severity (3/1)", card.informational.severityWeighted),
+    "",
+    "per finding (value · match <- votes as match/value, ! = alarmist):",
+  ]
+  judged.each { f =>
+    let flag = if (f.alarmism) { " ALARMIST" } else { "" }
+    let why = if (f.note == "") { "" } else { " (" + f.note + ")" }
+    let votes = f.matchVotes.map { m, k =>
+      m + "/" + (f.valueVotes[k] ?? "unjudged")
+    }
+    let short = f.text.split("").takeFirst(110).join("")
+    let more = if (short == f.text) { "" } else { "…" }
+    lines += [
+      `  #${toString(f.id)} ${f.value}${flag} · ${f.match}${why} <- ${votes.join(", ")}; alarmist ${toString(f.alarmVotes)}/${toString(f.matchVotes.length)}` +
+        "\n      " + short + more,
+    ]
+  }
+  {{text: lines.join("\n"), json: JSON.encode(card)}}
+}
+
+# ------------------------------------------------------------------ check
+
+# A small case whose numbers are easy to work out by hand: a is vetted
+# real, b dismissed, the rest unvetted.
+let reviewerEvalSyntheticCase: String! = """
+  {
+    "name": "synthetic",
+    "title": "Synthetic case",
+    "pr": "https://example.com/pr/1",
+    "repo": "https://example.com/repo",
+    "head": "1111111111111111111111111111111111111111",
+    "base": "2222222222222222222222222222222222222222",
+    "issues": [
+      {"key": "a", "kind": "bug", "severity": "important", "confidence": "confirmed", "vetted": "real", "locations": ["x.go:1"], "summary": "a breaks"},
+      {"key": "b", "kind": "bug", "severity": "minor", "confidence": "claimed", "vetted": "dismiss", "locations": [], "summary": "b breaks"},
+      {"key": "c", "kind": "concern", "severity": "important", "confidence": "claimed", "vetted": null, "locations": [], "summary": "c is risky"},
+      {"key": "d", "kind": "docs", "severity": "minor", "confidence": "confirmed", "locations": ["README.md"], "summary": "d is stale"},
+      {"key": "e", "kind": "cleanup", "severity": "minor", "confidence": "claimed", "locations": [], "summary": "e is dead code"}
+    ],
+    "sound": [{"key": "s", "summary": "s holds"}]
+  }
+"""
+
+let reviewerEvalVote(finding: Int!, match: String!, value: String!, alarmism: Boolean!): String! {
+  JSON.encode({{finding: finding, reason: "canned", match: match, value: value, alarmism: alarmism}})
+}
+
+let reviewerEvalNoMeta: [{{name: String!, value: String!}}!]! = []
+
+let checkReviewerEvalScoring(source: Workspace!): String! {
+  # Every case on disk loads and validates, with its vetting note.
+  let names = source.directory("agents-dev/evals").entries.map { e => e.trimSuffix("/") }
+  assert(message: names.join(", ")) { names.contains("dang-187") }
+  names.each { n => loadReviewerEvalCase(source, n) }
+
+  # Validation catches what it should.
+  let bad = decodeReviewerEvalCase(reviewerEvalSyntheticCase
+    .replace("\"head\": \"1111111111111111111111111111111111111111\"", "\"head\": \"1111111\"")
+    .replace("\"key\": \"b\", \"kind\": \"bug\", \"severity\": \"minor\"", "\"key\": \"a\", \"kind\": \"nit\", \"severity\": \"high\"")
+    .replace("\"vetted\": \"dismiss\"", "\"vetted\": \"maybe\"")
+    .replace("\"key\": \"s\"", "\"key\": \"duplicate\""))
+  let problems = reviewerEvalProblems(bad).join("\n")
+  assert(message: problems) { problems.contains("head \"1111111\" is not a full 40-character commit SHA") }
+  assert(message: problems) { problems.contains("key \"a\" is used more than once") }
+  assert(message: problems) { problems.contains("a: kind \"nit\" is not one of") }
+  assert(message: problems) { problems.contains("a: severity \"high\" is not important or minor") }
+  assert(message: problems) { problems.contains("a: vetted \"maybe\" is not null, real or dismiss") }
+  assert(message: problems) { problems.contains("key \"duplicate\" is reserved") }
+  assert(message: problems) { !problems.contains("base") }
+  let good = decodeReviewerEvalCase(reviewerEvalSyntheticCase)
+  let none = reviewerEvalProblems(good)
+  assert(message: none.join("\n")) { none.isEmpty }
+
+  # The vetting note: headings and "vetted:" lines; it fills nulls, must
+  # agree with labels already set, and must list every issue.
+  let note = reviewerEvalVettingNote([
+    "# Vetting", "", "Mark each one.", "",
+    "### a", "vetted: real", "bug · important", "",
+    "### b", "vetted:", "",
+    "### c", "Vetted: Dismiss", "",
+    "### d", "vetted:  real  ", "",
+    "### e", "some text", "vetted: real",
+  ].join("\n"))
+  assert(message: JSON.encode(note)) {
+    note == [
+      {{key: "a", vetted: "real"}}, {{key: "b", vetted: ""}}, {{key: "c", vetted: "dismiss"}},
+      {{key: "d", vetted: "real"}}, {{key: "e", vetted: "real"}},
+    ]
+  }
+  let notProblems = reviewerEvalVettingProblems(good, note)
+  assert(message: notProblems.join("\n")) { notProblems.isEmpty }
+  let vetted = reviewerEvalWithVetting(good, note).issues.map { i => i.vetted ?? "" }
+  assert(message: vetted.join(", ")) { vetted == ["real", "dismiss", "dismiss", "real", "real"] }
+  let clash = reviewerEvalVettingProblems(good, [{{key: "a", vetted: "dismiss"}}, {{key: "zz", vetted: "nope"}}]).join("\n")
+  assert(message: clash) { clash.contains("a: vetted \"real\" in case.json but \"dismiss\" in the vetting note") }
+  assert(message: clash) { clash.contains("\"zz\" is not an issue key") and clash.contains("zz: \"nope\" is not blank, real or dismiss") }
+  assert(message: clash) { clash.contains("does not list b") and clash.contains("does not list e") }
+  assert { reviewerEvalVettingProblems(good, [] :: [{{key: String!, vetted: String!}}!]!).isEmpty }
+
+  # Rounding and weights.
+  assert { reviewerEvalPercent(4, 9) == 44 and reviewerEvalPercent(2, 3) == 67 and reviewerEvalPercent(1, 2) == 50 and reviewerEvalPercent(0, 0) == 0 }
+  assert(message: reviewerEvalWeightsText) {
+    reviewerEvalWeightsText == "guardrail +3, guidance +1, quick-fix +1, speed-bump -1, false -2, duplicate -1, alarmism -1"
+  }
+
+  # Seven findings, three samples (match/value, ! = alarmist):
+  #   1: a/speed-bump a/speed-bump a/guardrail   -> a, speed-bump; a is vetted real: guidance
+  #   2: a/guardrail! a/guardrail! b/guardrail   -> a again: duplicate, alarmist
+  #   3: d/quick-fix none/quick-fix d/quick-fix  -> d, quick-fix
+  #   4: none/guidance none/speed-bump none/false -> none, disputed
+  #   5: b/guidance! b/guidance! zzz/guidance!   -> b, vetted dismiss: speed-bump, alarmist
+  #   6: s/false x3                              -> sound contradiction, false (unanimous)
+  #   7: none/speed-bump x2, missing             -> none, speed-bump
+  # Sample 2 is fenced and wrapped in prose, with keys and values in
+  # capitals; sample 3 skips finding 7 and judges a finding 99.
+  let findings = ["one", "two", "three", "four", "five", "six", "seven"]
+  let replies = [
+    "{\"judgements\": [" + [
+      reviewerEvalVote(1, "a", "speed-bump", false), reviewerEvalVote(2, "a", "guardrail", true),
+      reviewerEvalVote(3, "d", "quick-fix", false), reviewerEvalVote(4, "none", "guidance", false),
+      reviewerEvalVote(5, "b", "guidance", true), reviewerEvalVote(6, "s", "false", false),
+      reviewerEvalVote(7, "none", "speed-bump", false),
+    ].join(", ") + "]}",
+    "Here you go:\n```json\n{\"judgements\": [" + [
+      reviewerEvalVote(1, "A", "Speed-Bump", false), reviewerEvalVote(2, "a", "guardrail", true),
+      reviewerEvalVote(3, "none", "quick-fix", false), reviewerEvalVote(4, "none", "speed-bump", false),
+      reviewerEvalVote(5, "b", "guidance", true), reviewerEvalVote(6, "s", "false", false),
+      reviewerEvalVote(7, "none", "speed-bump", false),
+    ].join(", ") + "]}\n```\nDone.",
+    "{\"judgements\": [" + [
+      reviewerEvalVote(1, "a", "guardrail", false), reviewerEvalVote(2, "b", "guardrail", false),
+      reviewerEvalVote(3, "d", "quick-fix", false), reviewerEvalVote(4, "none", "false", false),
+      reviewerEvalVote(5, "zzz", "guidance", true), reviewerEvalVote(6, "s", "false", false),
+      reviewerEvalVote(99, "c", "guardrail", false),
+    ].join(", ") + "]}",
+  ]
+  let card = reviewerEvalScorecard(good, "canned", "one two  three\nfour", findings, replies, [{{name: "judge", value: "canned"}}])
+  let r: {{
+    caseName: String!,
+    samples: Int!,
+    unanimous: Int!,
+    headline: {{
+      valueScore: Int!, noise: Int!, speedBumps: Int!, falseFindings: Int!, alarmist: Int!,
+      findings: Int!, words: Int!,
+      confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!,
+      vettedRealRecall: {{hit: Int!, total: Int!, percent: Int!}}!,
+      vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!,
+    }}!,
+    values: {{guardrail: Int!, guidance: Int!, quickFix: Int!, speedBump: Int!, falseFinding: Int!, duplicate: Int!, disputed: Int!, unjudged: Int!}}!,
+    soundContradictions: Int!,
+    matched: [String!]!,
+    missedConfirmed: [String!]!,
+    informational: {{
+      recall: {{hit: Int!, total: Int!, percent: Int!}}!,
+      byKind: {{
+        bug: {{hit: Int!, total: Int!, percent: Int!}}!,
+        concern: {{hit: Int!, total: Int!, percent: Int!}}!,
+        cleanup: {{hit: Int!, total: Int!, percent: Int!}}!,
+        docs: {{hit: Int!, total: Int!, percent: Int!}}!,
+      }}!,
+      severityWeighted: {{hit: Int!, total: Int!, percent: Int!}}!,
+      missed: [String!]!,
+    }}!,
+    judged: [{{id: Int!, value: String!, alarmism: Boolean!, match: String!, matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!}}!]!,
+  }}! = JSON.decode(card.json)
+  let msg = card.text + "\n" + card.json
+  assert(message: msg) { r.caseName == "synthetic" and r.samples == 3 and r.unanimous == 1 }
+  assert(message: msg) { r.judged.map { f => f.value } == ["guidance", "duplicate", "quick-fix", "disputed", "speed-bump", "false", "speed-bump"] }
+  assert(message: msg) { r.judged.map { f => f.match } == ["a", "a", "d", "none", "b", "s", "none"] }
+  assert(message: msg) { r.judged.map { f => f.alarmism } == [false, true, false, false, true, false, false] }
+  assert(message: msg) { r.judged.map { f => f.alarmVotes } == [0, 2, 0, 0, 3, 0, 0] }
+  assert(message: msg) {
+    r.judged.map { f => f.matchVotes } == [
+      ["a", "a", "a"], ["a", "a", "b"], ["d", "none", "d"], ["none", "none", "none"],
+      ["b", "b", "unjudged"], ["s", "s", "s"], ["none", "none", "unjudged"],
+    ]
+  }
+  assert(message: msg) {
+    r.judged.map { f => f.valueVotes } == [
+      ["speed-bump", "speed-bump", "guardrail"], ["guardrail", "guardrail", "guardrail"],
+      ["quick-fix", "quick-fix", "quick-fix"], ["guidance", "speed-bump", "false"],
+      ["guidance", "guidance", "guidance"], ["false", "false", "false"],
+      ["speed-bump", "speed-bump", "unjudged"],
+    ]
+  }
+  # guidance +1, duplicate -1, quick-fix +1, disputed 0, speed-bump -1,
+  # false -2, speed-bump -1, and two alarmist findings -1 each: -5.
+  assert(message: msg) { r.headline.valueScore == -5 }
+  assert(message: msg) { r.headline.noise == 5 and r.headline.speedBumps == 2 and r.headline.falseFindings == 1 and r.headline.alarmist == 2 }
+  assert(message: msg) { r.headline.findings == 7 and r.headline.words == 4 }
+  assert(message: msg) { r.headline.confirmedRecall == {{hit: 2, total: 2, percent: 100}} }
+  assert(message: msg) { r.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
+  assert(message: msg) { r.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} }
+  assert(message: msg) { r.values == {{guardrail: 0, guidance: 1, quickFix: 1, speedBump: 2, falseFinding: 1, duplicate: 1, disputed: 1, unjudged: 0}} }
+  assert(message: msg) { r.soundContradictions == 1 and r.matched == ["a", "b", "d"] and r.missedConfirmed == [] }
+  assert(message: msg) { r.informational.recall == {{hit: 3, total: 5, percent: 60}} and r.informational.missed == ["c", "e"] }
+  assert(message: msg) { r.informational.byKind.bug == {{hit: 2, total: 2, percent: 100}} and r.informational.byKind.concern == {{hit: 0, total: 1, percent: 0}} }
+  assert(message: msg) { r.informational.byKind.cleanup == {{hit: 0, total: 1, percent: 0}} and r.informational.byKind.docs == {{hit: 1, total: 1, percent: 100}} }
+  # a (3), b (1), d (1) of a and c (3 each) and b, d and e (1 each).
+  assert(message: msg) { r.informational.severityWeighted == {{hit: 5, total: 9, percent: 56}} }
+  # The table says the same.
+  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("value score", "-5", "(" + reviewerEvalWeightsText + ")")) }
+  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("noise", "5", "speed-bump 2 + false 1 + alarmist 2; lower is better")) }
+  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("findings", "7", "the review is 4 words")) }
+  assert(message: card.text) { card.text.contains(reviewerEvalRow("confirmed recall", {{hit: 2, total: 2, percent: 100}})) }
+  assert(message: card.text) { card.text.contains(reviewerEvalRow("vetted-real recall", {{hit: 1, total: 1, percent: 100}})) }
+  assert(message: card.text) { card.text.contains(reviewerEvalRow("  recall (all)", {{hit: 3, total: 5, percent: 60}})) }
+  assert(message: card.text) { card.text.contains("#1 guidance · a (its issue is vetted real) <- a/speed-bump, a/speed-bump, a/guardrail; alarmist 0/3") }
+  assert(message: card.text) { card.text.contains("#2 duplicate ALARMIST · a (an earlier finding matched this issue)") }
+  assert(message: card.text) { card.text.contains("#5 speed-bump ALARMIST · b (its issue is vetted dismiss)") }
+  assert(message: card.text) { card.text.contains("#6 false · s (contradicts a sound item)") }
+  assert(message: card.text) { card.text.contains("1/7 findings unanimous") and card.text.contains("judge: canned") }
+
+  # Nothing vetted yet: the vetted line says so.
+  let unvetted = decodeReviewerEvalCase(reviewerEvalSyntheticCase.replace("\"vetted\": \"real\"", "\"vetted\": null"))
+  let quiet = reviewerEvalScorecard(unvetted, "canned", "x", ["one"], [reviewerEvalVote(1, "a", "guardrail", false)], reviewerEvalNoMeta)
+  assert(message: quiet.text) { quiet.text.contains("vetted-real recall  (no issue vetted real yet)") }
+  # A judge that answers in prose leaves every finding unjudged.
+  let prose: {{headline: {{valueScore: Int!, noise: Int!}}!, values: {{unjudged: Int!}}!}}! = JSON.decode(
+    reviewerEvalScorecard(good, "canned", "x", ["one", "two"], ["I could not decide."], reviewerEvalNoMeta).json
+  )
+  assert { prose.headline.valueScore == 0 and prose.headline.noise == 0 and prose.values.unjudged == 2 }
+  # No findings at all: nothing found, nothing wasted.
+  let empty = reviewerEvalScorecard(good, "canned", "Nothing to fix.", [] :: [String!]!, ["{\"judgements\": []}"], reviewerEvalNoMeta)
+  assert(message: empty.text) { empty.text.contains(reviewerEvalRow("confirmed recall", {{hit: 0, total: 2, percent: 0}})) and empty.text.contains(reviewerEvalNumberRow("findings", "0", "the review is 3 words")) }
+  "Reviewer eval scoring checks passed."
+}

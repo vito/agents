@@ -1,0 +1,11 @@
+name = "reviewer-eval"
+engineVersion = "v1.0.0-0"
+
+[runtime]
+  source = "dang"
+
+# Resolved in the fixture workspace agents-dev builds (reviewerEval,
+# reviewerEvalScore), where this module sits beside a copy of ../../reviewer.
+[[dependencies]]
+  name = "reviewer"
+  source = "../reviewer"
