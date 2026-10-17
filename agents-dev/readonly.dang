@@ -116,6 +116,13 @@ let testContributorReadonly(source: Workspace!): String! {
     ["-R", "o/r", "pr", "merge", "1"],
     ["pr", "--repo", "o/r", "merge", "1"],
     ["pr", "--", "view"],
+    # An unknown flag before the subcommand: gh reads it as taking the next
+    # token, so these run close/merge, not list/view.
+    ["pr", "--comment", "list", "close", "1"],
+    ["pr", "-b", "view", "merge", "1"],
+    ["issue", "-c", "view", "close", "1"],
+    ["--verbose", "pr", "view", "1"],
+    ["--verbose", "api", "repos/o/r"],
     ["api", "-X", "POST", "repos/o/r/issues"],
     ["api", "--method=PATCH", "repos/o/r/issues/1"],
     ["api", "-XPUT", "repos/o/r/pulls/1/merge"],
@@ -138,6 +145,8 @@ let testContributorReadonly(source: Workspace!): String! {
   assert(message: getFields) { !readOnlyRefused(getFields) and getFields.contains("always-missing") }
   [
     ["pr", "view", "1", "--repo", "cli/cli"],
+    ["-R", "cli/cli", "pr", "view", "1"],
+    ["pr", "--repo=cli/cli", "diff", "1"],
     ["pr", "diff", "1", "--repo", "cli/cli"],
     ["issue", "list", "--repo", "cli/cli"],
     ["search", "issues", "readonly"],

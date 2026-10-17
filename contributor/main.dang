@@ -267,6 +267,13 @@ type Contributor {
     let skipNext = false
     let hasRepoFlag = false
     let done = false
+    # Flags gh does not know take a value are ambiguous to this parser but
+    # not to gh: cobra assumes an unknown flag takes one, so in
+    # `pr --comment list close 1` gh runs `close`, while this loop reads
+    # `list`. Read-only mode refuses any such flag before the command or
+    # subcommand it gates on (see ghReadOnlyAllowed).
+    let flagBeforeCmd = false
+    let flagBeforeSub = false
     args.each { a =>
       if (done) {
         # Everything after "--" is positional to gh, but never the command.
@@ -283,6 +290,11 @@ type Contributor {
           hasRepoFlag = true
         } else if (a == "--hostname") {
           skipNext = true
+        } else if (positional.length == 0) {
+          flagBeforeCmd = true
+          flagBeforeSub = true
+        } else if (positional.length == 1) {
+          flagBeforeSub = true
         }
       } else if (positional.length < 2) {
         positional = positional + [a]
@@ -293,7 +305,7 @@ type Contributor {
 
     # Read-only mode is an ALLOWLIST, not a longer denylist: a verb gh adds
     # later stays refused until someone decides it only reads.
-    if (readOnlyMode and !ghReadOnlyAllowed(cmd, sub, args)) {
+    if (readOnlyMode and !ghReadOnlyAllowed(cmd, sub, args, flagBeforeCmd, flagBeforeSub)) {
       raise `gh ${args.join(" ")} is not available in read-only mode: ` + "only read verbs run here (view/list/diff/checks/status, search, and `api` GET requests without graphql). Nothing in this role may change GitHub."
     }
 
@@ -1191,11 +1203,23 @@ type Contributor {
   # The gh invocations read-only mode runs: read verbs of each command, every
   # search, and `api` requests that are GET by construction. Everything else
   # — create/edit/merge/close/reopen/ready/delete/rerun/cancel/run/fork/...,
-  # and any command gh adds later — is refused.
-  let ghReadOnlyAllowed(cmd: String!, sub: String!, args: [String!]!): Boolean! {
+  # and any command gh adds later — is refused. So is any flag before the
+  # token a decision rests on (the command for search/status/api, else the
+  # subcommand), other than -R/--repo/--hostname: gh may read that flag as
+  # taking the next token, and run a different subcommand than this saw.
+  let ghReadOnlyAllowed(cmd: String!, sub: String!, args: [String!]!, flagBeforeCmd: Boolean!, flagBeforeSub: Boolean!): Boolean! {
+    if (flagBeforeCmd) {
+      return false
+    }
     let reads = ["view", "list", "ls"]
     if (cmd == "search" or (cmd == "status" and sub == "")) {
       return true
+    }
+    if (cmd == "api") {
+      return apiReadOnly(args)
+    }
+    if (flagBeforeSub) {
+      return false
     }
     if (cmd == "pr") {
       return (reads + ["diff", "checks", "status"]).contains(sub)
@@ -1211,9 +1235,6 @@ type Contributor {
     }
     if (cmd == "ruleset") {
       return (reads + ["check"]).contains(sub)
-    }
-    if (cmd == "api") {
-      return apiReadOnly(args)
     }
     false
   }
