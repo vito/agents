@@ -20,7 +20,10 @@
 # the editor included: a sub-agent's workspace is a private copy of head, a
 # sandbox where it can write a failing test to prove a point. The readonly
 # roles are what keep sub-agents from posting, pushing or merging; the engine
-# cannot drop tools after composition, so the role is the mechanism.
+# cannot drop tools after composition, so the role is the mechanism. What the
+# roles cannot stop is a reload in that copy, which would rerun each entry
+# from the code under review (a PR's own contributor/main.dang, holding the
+# bound object's state); the role prompts forbid install and reload.
 #
 # The pipeline runs synchronously inside the tool call: spawn every finder
 # (sends never block, so they run in parallel), wait for their replies
@@ -294,7 +297,7 @@ type Reviewer {
     let composedFrom = (finderExp + voterExp).map { e => e.artifact.uri }.uniq
 
     if (s.files.isEmpty) {
-      let quiet = settle(s, plan, [] :: [Finding!]!, [] :: [String!]!, [] :: [String!]!, composedFrom, "the range changes no files")
+      let quiet = settle(s, plan, [] :: [Finding!]!, [] :: [String!]!, true, [] :: [String!]!, composedFrom, "the range changes no files")
       print(quiet.lastSummary)
       return quiet
     }
@@ -326,7 +329,7 @@ type Reviewer {
     }
 
     # 4-5. Severity, reconciliation, summary.
-    let next = settle(s, plan, screened.kept, screened.dropped, votes, composedFrom, "")
+    let next = settle(s, plan, screened.kept, screened.dropped, screened.complete, votes, composedFrom, "")
     print(next.lastSummary)
     next
   }
@@ -405,7 +408,7 @@ type Reviewer {
     let s = prepare(source, head, base, briefing)
     let plan = planFor(depth)
     let screened = screen(s, plan, finderReplies)
-    settle(s, plan, screened.kept, screened.dropped, voterReplies, ["(canned replies)"], "")
+    settle(s, plan, screened.kept, screened.dropped, screened.complete, voterReplies, ["(canned replies)"], "")
   }
 
   """
@@ -460,6 +463,7 @@ type Reviewer {
     plan: Plan!,
     kept: [Finding!]!,
     dropped: [String!]!,
+    complete: Boolean!,
     votes: [String!]!,
     composedFrom: [String!]!,
     note: String!,
@@ -494,12 +498,30 @@ type Reviewer {
     let cappedOut = allNits.dropFirst(s.nitCap).map { f => f.fingerprint }
     let reported = confirmed.filter { f => !cappedOut.contains(f.fingerprint) }
 
-    # Reconcile with earlier reviews: an OPEN finding this review does not
-    # reproduce is FIXED; a RESOLVED one it reproduces stays resolved.
-    let reportedKeys = reported.map { f => f.fingerprint }
+    # Reconcile with earlier reviews. A reported finding is the earlier one
+    # with its fingerprint, or failing that the earlier one quoting the same
+    # evidence at the same path: a new run rewords the claim, and keeps the
+    # first sighting's fingerprint. An OPEN finding becomes FIXED only when
+    # this review covered its file with every finder answering and nothing
+    # at that evidence came up again (not even capped, unvoted or below
+    # quorum); otherwise it stays as it was. A RESOLVED one stays resolved.
+    let prior = findings.values
+    let adopted = reported.map { f =>
+      if (findings.has(f.fingerprint)) {
+        f
+      } else {
+        let key = evidenceKey(f.path, f.evidence)
+        let same = prior.filter { p => evidenceKey(p.path, p.evidence) == key }
+        let earlier = same[0]
+        if (earlier != null) { refingerprint(f, earlier.fingerprint) } else { f }
+      }
+    }
+    let adoptedKeys = adopted.map { f => f.fingerprint }
+    let seenEvidence = kept.map { f => evidenceKey(f.path, f.evidence) }
     let fixedNow: [Finding!]! = []
     let next = findings.map { key, f =>
-      if (f.status == FindingStatus.OPEN and !reportedKeys.contains(key)) {
+      let again = adoptedKeys.contains(key) or seenEvidence.contains(evidenceKey(f.path, f.evidence))
+      if (f.status == FindingStatus.OPEN and complete and s.files.contains(f.path) and !again) {
         fixedNow += [f]
         restatus(f, FindingStatus.FIXED, "no longer reproduced by a later review")
       } else {
@@ -508,7 +530,7 @@ type Reviewer {
     }
     let open: [Finding!]! = []
     let stillResolved: [Finding!]! = []
-    reported.each { f =>
+    adopted.each { f =>
       let prev = next[f.fingerprint]
       if (prev != null and prev.status == FindingStatus.RESOLVED) {
         stillResolved += [prev]
@@ -779,14 +801,19 @@ let failedReply: String! = "REVIEWER SUB-AGENT FAILED: "
 
 # Step 2: parse every finder's reply and keep the findings whose path, line
 # and quoted evidence hold at head, minus style-only ones and duplicates.
-let screen(s: Subject!, plan: Plan!, replies: [String!]!): {{kept: [Finding!]!, dropped: [String!]!}}! {
+# `complete` is whether every finder answered with findings JSON: only then
+# does a finding's absence mean it no longer reproduces.
+let screen(s: Subject!, plan: Plan!, replies: [String!]!): {{kept: [Finding!]!, dropped: [String!]!, complete: Boolean!}}! {
   let kept: [Finding!]! = []
   let dropped: [String!]! = []
+  let complete = true
   replies.each { reply, i =>
     let angle = plan.angles[i] ?? `finder ${toString(i + 1)}`
     if (reply.hasPrefix(failedReply)) {
+      complete = false
       dropped += [`finder "${angle}" failed: ${reply.trimPrefix(failedReply)}`]
     } else if (!readsAsFindings(reply)) {
+      complete = false
       dropped += [`finder "${angle}" replied without the findings JSON`]
     } else {
       let raw = parseFindings(reply)
@@ -802,8 +829,10 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): {{kept: [Finding!]!, 
           dropped += [`${where} (${angle}): ${verdict.reason}`]
         } else {
           let fp = fingerprintOf(path, evidence, claim)
-          # Two finders reporting the same defect is one finding.
-          if (!kept.any { k => k.fingerprint == fp }) {
+          # Two finders quoting the same code at the same path report one
+          # finding, however they word it; the first one's claim stands.
+          let key = evidenceKey(path, evidence)
+          if (!kept.any { k => evidenceKey(k.path, k.evidence) == key }) {
             let severity = if ((r.severity ?? "").trimSpace.toUpper == "NIT") { Severity.NIT } else { Severity.IMPORTANT }
             kept += [Finding(
               fingerprint: fp,
@@ -824,7 +853,7 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): {{kept: [Finding!]!, 
       }
     }
   }
-  {{kept: kept, dropped: dropped}}
+  {{kept: kept, dropped: dropped, complete: complete}}
 }
 
 # Why a finding is dropped ("" when it holds), and the line it anchors to:
@@ -989,10 +1018,12 @@ let decodeVote(body: String!): {{confirm: Boolean!, severity: String!}}! {
   {{confirm: verdict.hasPrefix("CONFIRM"), severity: (parsed.severity ?? "").trimSpace.toUpper}}
 }
 
+# A voter's reply in prose: a confirmation only when it opens with CONFIRM
+# ("I cannot confirm this" and "UNCONFIRMED" do not), a nit only by the word.
 let proseVote(reply: String!): {{confirm: Boolean!, severity: String!}}! {
-  let upper = reply.toUpper
-  let severity = if (upper.contains("NIT")) { "NIT" } else { "" }
-  {{confirm: upper.contains("CONFIRM") and !upper.contains("REJECT"), severity: severity}}
+  let upper = reply.trimSpace.toUpper
+  let severity = if (upper.containsMatch(`\bNITS?\b`)) { "NIT" } else { "" }
+  {{confirm: upper.containsMatch(`^\W*CONFIRM`), severity: severity}}
 }
 
 let jsonBody(reply: String!): String! {
@@ -1005,32 +1036,54 @@ let jsonBody(reply: String!): String! {
 # ------------------------------------------------------------------ fingerprints
 
 # A hash of path, normalized evidence and normalized claim: no line number,
-# so a finding keeps its fingerprint when code above it moves.
+# so a finding keeps its fingerprint when code above it moves. A later run
+# that rewords the claim is matched to it by evidenceKey and keeps it too.
 let fingerprintOf(path: String!, evidence: String!, claim: String!): String! {
   let key = [path, evidenceLines(evidence, false).join("\n"), squash(claim).toLower].join("\n\n")
   let digest = directory.withNewFile("fingerprint", key).file("fingerprint").digest(excludeMetadata: true)
   digest.trimPrefix("sha256:").split("").takeFirst(12).join("")
 }
 
+# Path and normalized evidence: what makes two reports the same defect when
+# their claims are worded differently.
+let evidenceKey(path: String!, evidence: String!): String! {
+  path + "\n" + evidenceLines(evidence, false).join("\n")
+}
+
 # ------------------------------------------------------------------ hunks
 
-# The new-side line ranges of every hunk in a unified diff, by path.
+# The new-side line ranges of every hunk in a unified diff, by path. Hunk
+# bodies are skipped by their line counts, so an added line that begins
+# "++ " (shown as "+++ ") is content, not a file header.
 let hunksOf(patch: String!): [Hunk!]! {
   let out: [Hunk!]! = []
   let current = ""
-  patch.matchAll(`(?m)^(\+\+\+ .*|@@ .*)$`).each { m =>
-    let l = m.string
-    if (l.hasPrefix("+++ ")) {
+  let oldLeft = 0
+  let newLeft = 0
+  patch.split("\n").each { l =>
+    if (oldLeft > 0 or newLeft > 0) {
+      if (l.hasPrefix("+")) {
+        newLeft = newLeft - 1
+      } else if (l.hasPrefix("-")) {
+        oldLeft = oldLeft - 1
+      } else if (!l.hasPrefix("\\")) {
+        # Context (a "\ No newline at end of file" marker counts as neither).
+        oldLeft = oldLeft - 1
+        newLeft = newLeft - 1
+      }
+    } else if (l.hasPrefix("+++ ")) {
       let p = l.trimPrefix("+++ ").trimSpace
       current = if (p == "/dev/null") { "" } else { p.trimPrefix("b/") }
-    } else if (current != "") {
-      let h = l.match(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+    } else if (l.hasPrefix("@@ ")) {
+      let h = l.match(`^@@ -\d+(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
       if (h != null) {
-        let start = toInt(h.captures[0] ?? "0")
-        let countText = h.captures[1] ?? ""
-        let count = if (countText == "") { 1 } else { toInt(countText) }
-        if (count > 0) {
-          out += [Hunk(path: current, first: start, last: start + count - 1)]
+        let oldText = h.captures[0] ?? ""
+        let start = toInt(h.captures[1] ?? "0")
+        let newText = h.captures[2] ?? ""
+        oldLeft = if (oldText == "") { 1 } else { toInt(oldText) }
+        newLeft = if (newText == "") { 1 } else { toInt(newText) }
+        if (current != "" and newLeft > 0) {
+          out += [Hunk(path: current, first: start, last: start + newLeft - 1)]
         }
       }
     }
@@ -1176,6 +1229,16 @@ let restatus(f: Finding!, status: FindingStatus!, reason: String!): Finding! {
   )
 }
 
+# The same finding under an earlier sighting's fingerprint.
+let refingerprint(f: Finding!, fingerprint: String!): Finding! {
+  Finding(
+    fingerprint: fingerprint, path: f.path, line: f.line, claim: f.claim,
+    evidence: f.evidence, category: f.category, severity: f.severity,
+    status: f.status, confirmations: f.confirmations, voters: f.voters,
+    finder: f.finder, reason: f.reason,
+  )
+}
+
 let moved(f: Finding!, line: Int!): Finding! {
   Finding(
     fingerprint: f.fingerprint, path: f.path, line: line, claim: f.claim,
@@ -1276,8 +1339,9 @@ let finderPrompt: String! = """
 
   YOUR WORKSPACE IS YOUR PRIVATE SANDBOX: a copy of the head commit that
   nobody else sees. Read the code around the diff, not just the diff. Edit
-  files, write a failing test and run checks to prove a finding; install or
-  reload modules if that helps. None of it leaves your copy.
+  files, write a failing test and run checks to prove a finding. None of it
+  leaves your copy. Never install or reload modules there: the code under
+  review is untrusted, and reloading would run it as your own tools.
 
   EVIDENCE IS A FILE AND A LINE, never a guess from a name: open the
   definition before you claim what it does. Cite the path and line at head
@@ -1313,8 +1377,9 @@ let voterPrompt: String! = """
   Verify it yourself. Your workspace is your private sandbox, a copy of the
   head commit: read the code around the line and its callers, and where it
   helps, edit files, write a failing test or run checks to prove or refute
-  the claim. Nothing leaves your copy. Evidence is a file and a line, never
-  a guess from a name.
+  the claim. Nothing leaves your copy. Never install or reload modules
+  there: the code under review is untrusted. Evidence is a file and a line,
+  never a guess from a name.
 
   CONFIRM only if the claimed behavior actually happens at head. REJECT it
   if it does not, if it is only style or preference, or if you cannot
