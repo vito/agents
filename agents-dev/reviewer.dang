@@ -590,7 +590,7 @@ let checkReviewerTriage: String! {
       JSON.encode({{severity: "IMPORTANT", claim: reviewerOvershootClaim, category: "correctness", reproduction: "ran discount(100, 50) and got -400", locations: [{{path: "calc.py", line: 3, evidence: "return total - total * rate"}}]}}),
     ]),
     reviewerFindingsReply([
-      JSON.encode({{severity: "IMPORTANT", claim: reviewerNegativeClaim, category: "correctness", reproduction: "Not run.", locations: [{{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}}]}}),
+      JSON.encode({{severity: "IMPORTANT", claim: reviewerNegativeClaim, category: "correctness", reproduction: "Not run (no test runner here); it follows from the code.", locations: [{{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}}]}}),
       reviewerFindingJson("notes.txt", 25, "notes.txt line 25 lost its number, so readers cannot cite it", "changed", "docs", "IMPORTANT"),
     ]),
   ]
