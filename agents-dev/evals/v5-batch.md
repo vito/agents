@@ -18,6 +18,7 @@ check span, the judge's included (reviewer + judge).
 | dang-55-shadowing | v5-3 | +10 | 0 | 4 | 2/3 | constant-annotation-before-hoist, indistinguishable-type-errors | 4/4 | 724 | 6.8 | 180 (176 + 4) |
 | dang-160-clean | v5-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 439 | 4.9 | 122 (118 + 4) |
 | dang-160-clean | v5-2 | +7 | 0 | 3 | - | (none vetted real) | 3/3 | 544 | 4.9 | 103 (99 + 4) |
+| dang-160-clean | v5-3 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 470 | 4.9 | 138 (134 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -122,6 +123,12 @@ No run failed for infrastructure reasons; none was retried.
   does not contradict the sound item; a reader may find it a borderline
   speed bump. Run 1's version of it failed its vote 0/2; here as a nit it
   needed 1/1.
+- dang-160-clean v5-3: the same two IMPORTANT findings as run 1, both
+  guardrail 3/3 and unanimous: the `%f` six decimals (3.14159265 sent as
+  3.141593; NaN/Inf to reject) and the inline-fragment leaves (`rating /
+  2` gives 1). Both are labelled "confirmed bug", and the verdict says
+  "two confirmed bugs need fixing before merge". The MapValue finding
+  came back as unescaped map keys, a concern, and failed its vote 0/2.
 
 ## Summary
 
