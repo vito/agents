@@ -10,6 +10,7 @@ check span, the judge's included (reviewer + judge).
 | dang-187 | v5-1 | -4 | 4 | 6 | 2/12 | redundant-round-trips, docs-skill-graphql-laziness | 4/6 | 737 | 9.1 | 176 (172 + 4) |
 | dang-187 | v5-2 | +9 | 0 | 6 | 2/12 | fragment-nesting, docs-skill-graphql-laziness | 6/6 | 896 | 12.8 | 232 (228 + 4) |
 | dang-187 | v5-3 | +12 | 1 | 9 | 4/12 | fragment-nesting, redundant-round-trips, docs-skill-graphql-laziness, qualified-root-rescue | 9/9 | 1194 | 12.8 | 226 (222 + 4) |
+| dang-59 | v5-1 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1166 | 9.0 | 293 (289 + 4) |
 
 ## Run notes
 
@@ -37,3 +38,14 @@ check span, the judge's included (reviewer + judge).
   mutation-sent-once (judged on its value, quick-fix); it is run 1's
   second "also raised" one-liner, false there. 14 voters; one nit over
   the cap of 5 not reported. 3/7 confirmed.
+- dang-59 v5-1 (dang-59-file-local-imports): 4 guardrails (per-file
+  variable ordering, the LSP's sibling variables, imports shared at
+  runtime, one schema module per file breaking type identity across
+  files) and 3 guidance concerns asked as questions (shared mutable
+  cached blocks in the LSP, the schema env rebuilt per file, RunFile and
+  RunDir disagreeing on alias conflicts). The per-file variable ordering
+  contradicts the unvetted sound item lockstep-phases, judged on its
+  value (guardrail 3/3); v4 reported it twice, here the triage merged
+  the two copies and the LSP one stays apart. 7/7 unanimous; 2/2
+  confirmed. phase-groups-by-index missed; one concern cites a path in
+  the finder's mount (mnt/jrpc2), noted "not found at head".
