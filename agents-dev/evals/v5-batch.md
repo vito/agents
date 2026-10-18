@@ -157,9 +157,17 @@ No run failed for infrastructure reasons; none was retried.
 | dang-187 | v4 ×2 | +6.0 (+4, +8) | 1.5 (1, 2) | 3.5/11 (3, 4) | 7.5 (7, 8) | 1128 (1062, 1194) | 10.3 (10.0, 10.5) | 226 (220, 231) |
 | dang-59 | v5 ×3 | +14.3 (+13 to +15) | 0.3 (0 to 1) | 2/3, 67% (2 to 2) | 6.7 (6 to 7) | 1111 (986 to 1180) | 9.2 (8.5 to 10.1) | 306 (280 to 344) |
 | dang-59 | v4 ×1 | +12 | 0 | 2/3 | 6 | 991 | 9.4 | 354 |
+| dang-55-shadowing | v5 ×3 | +8.3 (+6 to +10) | 0.3 (0 to 1) | 2.7/3, 89% (2 to 3) | 4.7 (4 to 5) | 839 (724 to 935) | 8.6 (6.8 to 10.4) | 232 (180 to 276) |
+| dang-55-shadowing | v4 ×2 | +10 (+10, +10) | 0 (0, 0) | 2/3 (2, 2) | 4 (4, 4) | 824 (820, 828) | 8.2 (7.8, 8.5) | 247 (227, 267) |
+| dang-160-clean | v5 ×3 | +6.3 (+6 to +7) | 0 (0 to 0) | - (none vetted real) | 2.3 (2 to 3) | 484 (439 to 544) | 4.9 (4.9 to 4.9) | 121 (103 to 138) |
+| dang-160-clean | v3 ×1 | +6 | 0 | - | 2 | 368 | 3.8 | 116 |
+| dang-160-clean | v2 ×1 | +6 | 0 | - | 2 | 876 | 12.0 | - |
+| agents-tools-version | v5 ×3 | +2.7 (+2 to +3) | 0 (0 to 0) | 1/1, 100% (1 to 1) | 1.3 (1 to 2) | 320 (285 to 380) | 4.3 (4.1 to 4.7) | 110 (106 to 118) |
+| agents-tools-version | v2 ×1 | +2 | 0 | 1/1 | 2 | 607 | 7.3 | - |
 
 Fix given: dang-187 19/21 (the two misses are run 1's fixless one-liners),
-dang-59 20/20.
+dang-59 20/20, dang-55-shadowing 13/14 (run 2's fixless one-liner),
+dang-160-clean 7/7, agents-tools-version 4/4.
 
 The v4 numbers are from the commit messages (526a269, 9cd18a5, 0063344),
 scored under the labels of the time and not rescored: dang-187 had 11
@@ -170,6 +178,13 @@ rescue-classification). By arithmetic, v4-1 would be +9 with noise 0 now;
 v4-2 would be 4/12, about +7 with noise 1 (that finding false -2 to at
 least guidance +1, the judge's rating then). Model calls for v5 include
 the judge's 4; how v4's were counted is not recorded.
+
+The earlier rows for dang-55-shadowing, dang-160-clean and
+agents-tools-version are from commit messages too: dang-55 v4 from 9fa177c
+and 95c0aa9 (calls "in the eval"), dang-160 v3 from 9045d49 (the triage
+run; 116 calls in the eval), dang-160 v2 and agents-tools-version v2 from
+3dd5bac (calls not recorded). dang-55 v5-1's 239 calls are from b3930ee,
+which does not say whether the judge's 4 are in it.
 
 ### dang-187: which vetted-real issues are found
 
@@ -240,3 +255,86 @@ Speed bumps and false findings: none from the reviews. The only noise
 its own finding, scored a duplicate and alarmist. v4's duplicate (the
 variable ordering twice) did not recur: the triage merged the copies in
 all three runs.
+
+### dang-55-shadowing: which vetted-real issues are found
+
+- 3/3: constant-annotation-before-hoist (IMPORTANT in runs 1 and 2, a
+  concern asked as a question in run 3; guardrail 3/3 each time), which
+  v4 never got through (found by no finder in v4-1, voted down in v4-2);
+  indistinguishable-type-errors (a concern every run; guidance in runs 2
+  and 3).
+- 2/3: fragment-resolves-local-type (IMPORTANT in run 1, a concern in run
+  2, guardrail 3/3 there). Run 3 missed it: no finding about it reached
+  the review, the merges or the evidence drops.
+
+Findings outside the case, recurring (worth vetting):
+- the REPL's BuildEnvFromImports never records unqualified imports, so a
+  local `type Container` in the REPL still reuses and mutates the
+  imported one: 3/3 (a concern in runs 1 and 2, guidance in run 2;
+  IMPORTANT and guardrail 3/3 in run 3);
+- interface and union pass 0 now reuse an existing local module, so a REPL
+  redeclaration merges with the stale one (union members A, B, A, C): 3/3
+  (a concern in run 1; run 2's fixless one-liner, false; a concern and
+  guardrail 3/3 in run 3, where the IMPORTANT REPL item also names it).
+
+Speed bumps and false findings: only run 2's "Also raised, past the 3
+strongest concerns" one-liner (the interface/union reuse, -2), the same
+overflow line that cost dang-187 v5-1; that run had four concerns, so
+the fourth lost its evidence and fix. The other two runs have no noise.
+v5 is 1.7 lower than v4's +10 on average but finds more: 2.7/3 against 2/3,
+since the constant bug now survives the vote. Run 3 was the cheapest (6.8
+min, 180 calls; 8 voters against 10 and 11).
+
+### dang-160-clean: what each run raised
+
+A case where nothing was fixed in history; the one listed issue,
+float-arg-six-decimals, is claimed and unvetted, so vetted-real recall
+does not apply.
+
+- float-arg-six-decimals: 3/3, IMPORTANT, guardrail 3/3 every run (`%f`
+  in querybuilder's marshaller; examples 1.23456789, 3.14159265, 1e-7).
+  Runs 2 and 3 add that NaN/Inf render as invalid GraphQL.
+- inline-fragment nested leaves turning whole Floats into Ints (unmatched,
+  not in the case): 3/3, IMPORTANT in runs 1 and 3, a concern in run 2;
+  guardrail 3/3, 2/3 and 3/3. convertNestedSelectionResult
+  (ast_expressions.go:2026) converts leaf fields with the untyped ToValue,
+  whose new json.Number case makes `4` an IntValue under a Float field.
+  At the base, querybuilder did not decode with UseNumber and ToValue had
+  no json.Number case, so the same leaf was a float64 and a FloatValue.
+  It holds by inspection at both ends, and ToValue's new comment ("typed
+  GraphQL/codec leaves never reach here") says otherwise. v2 raised it
+  twice (an IMPORTANT and a concern, 3/3 votes each) and v3 once,
+  IMPORTANT: every recorded run since v2 has, 5/5. It is worth adding to
+  the case as a claimed issue, like float-arg-six-decimals.
+- the new MapValue case in dangValueToGo: a finder raised it in all three
+  runs (unreachable, since no GraphQL argument type unifies with a Map;
+  or its keys written unquoted). Voted down as a concern in runs 1 and 3
+  (0/2); in run 2 it passed as a NIT (1/1) and scored a quick-fix (one of
+  three samples: speed bump). v2 and v3 voted it down too (0/3 twice,
+  0/2).
+
+Would a reader call any of it noise? Neither IMPORTANT item: both are
+silent wrong values introduced by the change, with a concrete fix and
+test. Run 2's MapValue nit is the only borderline item (it argues against
+the commit message's claim rather than showing a failure), but it is
+short and actionable. What a reader might push back on is tone: every
+verdict says to fix before merging, and run 3 calls both "confirmed
+bugs", for a change that has gone 3.5 months without a follow-up fix.
+Nothing contradicted a sound item in any run. The scores match the
+earlier runs (+6 in v2 and v3); the length sits between them (484 words
+against 876 and 368), at about 5 min and 121 calls.
+
+### agents-tools-version
+
+- 3/3: continuations-bind-version-zero, IMPORTANT, guardrail 3/3, naming
+  all four call sites (388, 818, 1453, 1477) each time. All four finders
+  reported it in every run; the triage merged the copies.
+- run 2's NIT (the new comment says to bump the version in `agent()`
+  only) is matched to the same issue 3/3 and scores a duplicate (-1); v2
+  raised the same nit and scored +2 with 2 findings too.
+- a finding on staff/main.dang:67 (Staff's own versioned binding) was
+  voted down 0/2 in run 3, as in v2 (0/3).
+
+No speed bumps or false findings. With one issue the ceiling is +3,
+reached in runs 1 and 3; the review is about half v2's length (320 words
+against 607) and faster (4.3 min against 7.3).
