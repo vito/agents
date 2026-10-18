@@ -16,6 +16,7 @@ check span, the judge's included (reviewer + judge).
 | dang-55-shadowing | v5-1 | +9 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 5/5 | 935 | 8.5 | 239 |
 | dang-55-shadowing | v5-2 | +6 | 1 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 4/5 | 857 | 10.4 | 276 (272 + 4) |
 | dang-55-shadowing | v5-3 | +10 | 0 | 4 | 2/3 | constant-annotation-before-hoist, indistinguishable-type-errors | 4/4 | 724 | 6.8 | 180 (176 + 4) |
+| dang-160-clean | v5-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 439 | 4.9 | 122 (118 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -94,6 +95,18 @@ No run failed for infrastructure reasons; none was retried.
   asked as a question (guardrail). fragment-resolves-local-type is missed:
   it is not in the review, the merges or the evidence drops. 8 voters, no
   split; the fastest run (6.8 min, 180 calls).
+- dang-160-clean v5-1: two IMPORTANT findings, both guardrail 3/3. (1)
+  float-arg-six-decimals (claimed, unvetted): Float arguments reach
+  querybuilder's `%f`, so 1.23456789 is sent as 1.234568. (2) Unmatched:
+  leaves of a nested selection inside an inline fragment still go through
+  the untyped ToValue, whose new json.Number case makes a Float field's
+  integral value (gqlgen writes 4.0 as `4`) an Int, so `score / 8` divides
+  as integers. It holds by inspection at head: convertNestedSelectionResult
+  (ast_expressions.go:2026) calls ToValue on leaves, where
+  convertInlineFragmentResult looks up the schema field. A third finding
+  (the untested MapValue branch) failed its vote 0/2. Nothing contradicts
+  a sound item; a reader would call none of it noise, though the verdict's
+  "before merging" is stronger than a known-clean case wants.
 
 ## Summary
 
