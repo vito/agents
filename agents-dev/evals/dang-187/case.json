@@ -141,6 +141,15 @@
       "vetted": null,
       "locations": [".agents/skills/dang-language/reference/control-flow.md:135"],
       "summary": "The agent skill reference lists only leaf fields and .{{ }} selections as GraphQL execution points; the PR adds a third (a possibly-null handle escaping the chain is probed), and rescue classification now treats it as a leaf. errors.md was updated; this twin wasn't."
+    },
+    {
+      "key": "qualified-root-rescue",
+      "kind": "bug",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/rescue_analysis.go:564", "pkg/dang/rescue_analysis.go:303"],
+      "summary": "The rescue analysis update misses nullable root fields reached through the schema's module name: `Test.maybeUser(id: \"User:1\") rescue null` still warns that a lazy value leaves the rescue without executing, though at runtime it is probed inside the rescue; the unqualified form doesn't warn. classifyGQLSelect and selectMayBeNull don't treat the import-module receiver as a root. Found by reviewer v4 run 2."
     }
   ],
   "sound": [
@@ -152,7 +161,7 @@
     {
       "key": "rescue-classification",
       "vetted": null,
-      "summary": "Static rescue classification matches runtime behaviour, including (x ?? y).f and x!.f."
+      "summary": "Static rescue classification matches runtime behaviour, including (x ?? y).f and x!.f. The qualified Module.field form is excluded: that gap is the issue qualified-root-rescue."
     },
     {
       "key": "union-id-fragments",

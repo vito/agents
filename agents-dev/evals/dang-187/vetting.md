@@ -112,6 +112,14 @@ docs · minor · confirmed. The skill's control-flow.md:135 lists only leaf
 fields and .{{ }} as execution points; escaping possibly-null handles are now a
 third.
 
+### qualified-root-rescue
+vetted: real
+bug · minor · claimed. The rescue analysis misses nullable root fields reached
+through the schema's module name: `Test.maybeUser(...) rescue null` still warns
+that the rescue guards nothing, though it is probed inside it; the unqualified
+form doesn't warn. rescue_analysis.go:564, :303. Author: real, a consistency
+gap the PR left in the rescue analysis update.
+
 ## Sound items
 
 Things the same two reviews checked and found correct. Mark each one after its
@@ -133,7 +141,8 @@ probing only when a value leaves the chain holds up.
 ### rescue-classification
 vetted: sound
 Static rescue classification matches runtime behaviour, including (x ?? y).f
-and x!.f.
+and x!.f. (The qualified `Module.field` form is a separate, real gap:
+qualified-root-rescue.)
 
 ### union-id-fragments
 vetted: sound
