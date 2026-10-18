@@ -15,6 +15,7 @@ check span, the judge's included (reviewer + judge).
 | dang-59 | v5-3 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1180 | 8.5 | 344 (340 + 4) |
 | dang-55-shadowing | v5-1 | +9 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 5/5 | 935 | 8.5 | 239 |
 | dang-55-shadowing | v5-2 | +6 | 1 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 4/5 | 857 | 10.4 | 276 (272 + 4) |
+| dang-55-shadowing | v5-3 | +10 | 0 | 4 | 2/3 | constant-annotation-before-hoist, indistinguishable-type-errors | 4/4 | 724 | 6.8 | 180 (176 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -84,6 +85,15 @@ No run failed for infrastructure reasons; none was retried.
   reusing a local type, demoted to a fixless "Also raised, past the 3
   strongest concerns" one-liner and judged false 3/3, as on dang-187 v5-1.
   11 voters; 3/3 confirmed.
+- dang-55-shadowing v5-3: 3 guardrails and 1 guidance, all unanimous.
+  The REPL's untracked imports lead as IMPORTANT (unmatched, guardrail
+  3/3; it now also carries the interface/union regression, three finders'
+  copies merged into it), then interface/union pass 0 reusing stale REPL
+  definitions (unmatched, guardrail, in full this time), the bare-name
+  type errors (guidance) and constant-annotation-before-hoist, a concern
+  asked as a question (guardrail). fragment-resolves-local-type is missed:
+  it is not in the review, the merges or the evidence drops. 8 voters, no
+  split; the fastest run (6.8 min, 180 calls).
 
 ## Summary
 
