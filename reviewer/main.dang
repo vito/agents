@@ -30,13 +30,16 @@
 # from the code under review (a PR's own contributor/main.dang, holding the
 # bound object's state); the role prompts forbid install and reload.
 #
-# The pipeline runs synchronously inside the tool call: spawn every finder
-# (sends never block, so they run in parallel), wait for their replies
-# (AgentMessage.response: a parent may wait on agents it spawned; sub-agents
-# never wait on the caller), check the evidence, ask the triage sub-agent
-# which findings are the same problem and merge those, then do the same for
-# voters, then tag severity, ask the synthesizer for the verdict, and
-# reconcile with module state. Whether a finding stands is one uniform vote
+# The pipeline runs synchronously inside the tool call: run every finder at
+# once (each a ReviewRun: spawn, send, wait for the reply, stop; selecting
+# `reply` across the list runs them in parallel, while `.map`/`.each` alone
+# are sequential), check the evidence, ask the triage sub-agent which
+# findings are the same problem and merge those, then vote, each finding
+# on its own ReviewBallot, all at once, a tie-break starting as soon as
+# that finding's own voters split; then tag severity, ask the synthesizer
+# for the verdict, and reconcile with module state. A parent may wait on
+# agents it spawned; sub-agents never wait on the caller. Whether a
+# finding stands is one uniform vote
 # (real, caused by the change, worth the time: at STANDARD two voters and a
 # tie-break on a split, one for a NIT); its tier is decided after, from
 # the evidence (a reproduction) and what the confirming voters call it.
@@ -340,6 +343,81 @@ type Plan {
 }
 
 """
+One sub-agent run: spawn it from `exp` in a copy of head (`tip`; a
+Workspace cannot be stored on an object), send it `task`, wait for its
+reply and stop it. A failed agent's reply is the failure, which the screen
+and the tally report. Internal to `review`, which runs a list of these at
+once: selecting `reply` across a list evaluates the elements in parallel,
+so spawns overlap too.
+"""
+type ReviewRun {
+  tip: GitRef!
+  exp: [Expertise!]!
+  name: String!
+  task: String!
+  """
+  A `recording/` model for the recorded-turn pipeline check; "" for the
+  default model.
+  """
+  model: String!
+
+  reply: String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): every call is a fresh agent.
+    let base = llm.withWorkspace(tip.asWorkspace)
+    let conversation = if (model == "") { base } else { base.withModel(model) }
+    let child = conversation.spawn(name: name, expertise: exp)
+    let answer = child.send(task).response rescue { e: Error => failedReply + e.message }
+    child.stop
+    answer
+  }
+}
+
+"""
+One finding's vote: its first voters at once, then, only when they split
+short of the quorum and its tie-break voters could still reach it, those
+too, without waiting on any other finding's vote. `models` holds one
+entry per first voter and `tieModels` one per tie-break voter: a
+`recording/` model in the pipeline check, else "". Internal to `review`.
+"""
+type ReviewBallot {
+  tip: GitRef!
+  exp: [Expertise!]!
+  """
+  The finding's place among the voted ones, from 1, for the voters' names.
+  """
+  number: Int!
+  task: String!
+  quorum: Int!
+  models: [String!]!
+  tieModels: [String!]!
+
+  """
+  The first voters' replies, then the tie-break voters' if they ran.
+  """
+  cast: [String!]! @cache(policy: FunctionCachePolicy.Never) {
+    let first = runReviewRuns(models.map { m, j => voterRun(tip, exp, number, j, task, m) })
+    let yes = first.filter { r => parseVote(r).confirm }.length
+    if (!tieBreakWanted(yes, quorum, tieModels.length)) {
+      return first
+    }
+    first + runReviewRuns(tieModels.map { m, j => voterRun(tip, exp, number, models.length + j, task, m) })
+  }
+}
+
+let voterRun(tip: GitRef!, exp: [Expertise!]!, number: Int!, slot: Int!, task: String!, model: String!): ReviewRun! {
+  ReviewRun(tip: tip, exp: exp, name: `voter-${toString(number)}-${toString(slot + 1)}`, task: task, model: model)
+}
+
+# Every run's reply, in order, all running at once (a selection across a
+# list evaluates its elements in parallel; `.map` alone would not).
+let runReviewRuns(runs: [ReviewRun!]!): [String!]! {
+  if (runs.isEmpty) {
+    return [] :: [String!]!
+  }
+  runs.{{ reply }}.map { r => r.reply }
+}
+
+"""
 Review a commit range with independent sub-agents that try to break it,
 check their evidence, vote on what they find, and sum the review up; track
 the findings until each is fixed or resolved.
@@ -473,12 +551,20 @@ type Reviewer {
   ): Reviewer! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): spawns and runs real agents, and reads module state that
     # a re-review reconciles against.
-    let s = prepare(source, head, base, briefing)
+    # Independent reads, at once: a record's fields evaluate concurrently.
+    let setup = {{
+      s: prepare(source, head, base, briefing),
+      finderExp: composition(caller, "finder"),
+      triageExp: composition(caller, "triage"),
+      voterExp: composition(caller, "voter"),
+      synthExp: composition(caller, "synthesizer"),
+    }}
+    let s = setup.s
     let plan = planFor(depth)
-    let finderExp = composition(caller, "finder")
-    let triageExp = composition(caller, "triage")
-    let voterExp = composition(caller, "voter")
-    let synthExp = composition(caller, "synthesizer")
+    let finderExp = setup.finderExp
+    let triageExp = setup.triageExp
+    let voterExp = setup.voterExp
+    let synthExp = setup.synthExp
     let composedFrom = (finderExp + triageExp + voterExp + synthExp).map { e => e.artifact.uri }.uniq
 
     if (s.files.isEmpty) {
@@ -488,10 +574,9 @@ type Reviewer {
     }
 
     # 1. Find, in parallel, each finder in its own copy of head.
-    let headWs = s.tip.asWorkspace
     let tasks = plan.angles.map { a => finderTask(a, s) }
     let names = finderLabels(plan.angles).map { a => "finder-" + a }
-    let replies = runAgents(headWs, finderExp, names, tasks, replayFinders)
+    let replies = runAgents(s.tip, finderExp, names, tasks, replayFinders)
 
     # 2. Check evidence, then merge what describes the same problem: one
     # sub-agent, only when there is something to merge.
@@ -499,50 +584,27 @@ type Reviewer {
     let triageReply: String = if (evidenced.kept.length < 2) {
       null
     } else {
-      runAgents(headWs, triageExp, ["triage"], [triageTask(s, evidenced.kept)], [replayTriage])[0] ?? ""
+      runAgents(s.tip, triageExp, ["triage"], [triageTask(s, evidenced.kept)], [replayTriage])[0] ?? ""
     }
     let screened = applyTriage(s, evidenced, triageReply)
     let voted = screened.kept.takeFirst(plan.maxVoted)
 
-    # 3. Vote, all findings at once: the same number of voters for each
-    # (fewer for a NIT), whatever tier it ends up in.
-    let voterNames: [String!]! = []
-    let voterTasks: [String!]! = []
+    # 3. Vote, every finding at once, each on its own ballot: the same
+    # number of voters for each (fewer for a NIT), whatever tier it ends
+    # up in, and a tie-break as soon as its own voters split.
+    let cast = castBallots(s, plan, voterExp, voted)
+    let votes: [String!]! = []
+    let breaks: [String!]! = []
     voted.each { f, i =>
-      let task = voterTask(f, s)
-      voterSlots(votersFor(plan, f.severity)).each { j =>
-        voterNames += [`voter-${toString(i + 1)}-${toString(j + 1)}`]
-        voterTasks += [task]
-      }
-    }
-    let votes = if (voted.isEmpty) {
-      [] :: [String!]!
-    } else {
-      runAgents(headWs, voterExp, voterNames, voterTasks, replayVoters)
-    }
-    # A split the tie-break can still settle gets its voters, all at once.
-    let splits = tieBreaks(plan, screened.kept, votes)
-    let breakNames: [String!]! = []
-    let breakTasks: [String!]! = []
-    splits.each { b =>
-      let f = voted[b.index]
-      if (f != null) {
-        let task = voterTask(f, s)
-        voterSlots(b.extra).each { j =>
-          breakNames += [`voter-${toString(b.index + 1)}-${toString(votersFor(plan, f.severity) + j + 1)}`]
-          breakTasks += [task]
-        }
-      }
-    }
-    let breaks = if (breakNames.isEmpty) {
-      [] :: [String!]!
-    } else {
-      runAgents(headWs, voterExp, breakNames, breakTasks, replayTieBreaks)
+      let mine = cast[i] ?? ([] :: [String!]!)
+      let n = votersFor(plan, f.severity)
+      votes += mine.takeFirst(n)
+      breaks += mine.dropFirst(n)
     }
     let judged = judge(plan, screened.kept, votes, breaks)
 
     # 4. Sum up: one sub-agent, no vote.
-    let synthesis = runAgents(headWs, synthExp, ["synthesizer"], [synthesisTask(s, reportable(s, judged.confirmed), screened.checked)], [replaySynthesis])[0] ?? ""
+    let synthesis = runAgents(s.tip, synthExp, ["synthesizer"], [synthesisTask(s, reportable(s, judged.confirmed), screened.checked)], [replaySynthesis])[0] ?? ""
 
     # 5. Reconciliation and the summary.
     let ran = agentCounts(plan.angles.length, screened.triaged, votes.length + breaks.length, true)
@@ -678,35 +740,60 @@ type Reviewer {
     self
   }
 
-  # Spawn one agent per task, composed from `exp`, in a copy of `ws`; send
-  # every task before waiting on any reply, so they run in parallel. A
-  # failed agent's reply is the failure, which the screen reports.
+  # Spawn one agent per task, composed from `exp`, in a copy of head
+  # (`tip`), all at once (runReviewRuns), and return their replies in
+  # order. A failed agent's reply is the failure, which the screen reports.
   let runAgents(
-    ws: Workspace!,
+    tip: GitRef!,
     exp: [Expertise!]!,
     names: [String!]!,
     tasks: [String!]!,
     canned: [String!]!,
   ): [String!]! {
-    let baseline = if (replaying) { recordingBaseline(ws, exp) } else { [] :: [String!]! }
-    let agents: [Agent!]! = []
-    let sent: [AgentMessage!]! = []
-    names.each { name, i =>
+    let baseline = if (replaying) { recordingBaseline(tip.asWorkspace, exp) } else { [] :: [String!]! }
+    runReviewRuns(names.map { name, i =>
       let task = tasks[i] ?? ""
-      let conversation = if (replaying) {
-        llm.withWorkspace(ws).withModel(recordingModel(baseline, replayOrigin, task, canned[i] ?? ""))
-      } else {
-        llm.withWorkspace(ws)
+      let model = if (replaying) { recordingModel(baseline, replayOrigin, task, canned[i] ?? "") } else { "" }
+      ReviewRun(tip: tip, exp: exp, name: name, task: task, model: model)
+    })
+  }
+
+  # Each voted finding's votes, every ballot at once (see ReviewBallot):
+  # its first voters' replies, then its tie-break voters' if they ran. In
+  # the pipeline check, each voter replays its canned reply: the first
+  # voters', per finding in order, and the tie-break voters', per finding
+  # whose canned first votes split, in order.
+  let castBallots(s: Subject!, plan: Plan!, exp: [Expertise!]!, voted: [Finding!]!): [[String!]!]! {
+    if (voted.isEmpty) {
+      return [] :: [[String!]!]!
+    }
+    let baseline = if (replaying) { recordingBaseline(s.tip.asWorkspace, exp) } else { [] :: [String!]! }
+    let splits = if (replaying) { tieBreaks(plan, voted, replayVoters) } else { [] :: [{{index: Int!, extra: Int!}}!]! }
+    let offset = 0
+    let breakOffset = 0
+    let ballots: [ReviewBallot!]! = []
+    voted.each { f, i =>
+      let task = voterTask(f, s)
+      let first = votersFor(plan, f.severity)
+      let extra = tieBreakFor(plan, f.severity)
+      let firstCanned = replayVoters.dropFirst(offset).takeFirst(first)
+      offset += first
+      let split = splits.any { b => b.index == i }
+      let tieCanned = if (split) { replayTieBreaks.dropFirst(breakOffset).takeFirst(extra) } else { [] :: [String!]! }
+      if (split) {
+        breakOffset += extra
       }
-      let child = conversation.spawn(name: name, expertise: exp)
-      agents += [child]
-      sent += [child.send(task)]
+      ballots += [ReviewBallot(
+        tip: s.tip, exp: exp, number: i + 1, task: task, quorum: quorumFor(plan, f.severity),
+        models: voterSlots(first).map { j =>
+          if (replaying) { recordingModel(baseline, replayOrigin, task, firstCanned[j] ?? "") } else { "" }
+        },
+        tieModels: voterSlots(extra).map { j =>
+          if (replaying) { recordingModel(baseline, replayOrigin, task, tieCanned[j] ?? "") } else { "" }
+        },
+      )]
     }
-    let replies = sent.map { m =>
-      m.response rescue { e: Error => failedReply + e.message }
-    }
-    agents.each { a => a.stop }
-    replies
+    ballots.{{ cast }}.map { b => b.cast }
   }
 
   # What of the confirmed findings the summary will report as open: within
@@ -1092,11 +1179,19 @@ let tieBreaks(plan: Plan!, kept: [Finding!]!, votes: [String!]!): [{{index: Int!
     let extra = tieBreakFor(plan, f.severity)
     let yes = votes.dropFirst(offset).takeFirst(asked).filter { r => parseVote(r).confirm }.length
     offset += asked
-    if (extra > 0 and yes > 0 and yes < quorum and yes + extra >= quorum) {
+    if (tieBreakWanted(yes, quorum, extra)) {
       out += [{{index: i, extra: extra}}]
     }
   }
   out
+}
+
+# Whether `extra` tie-break voters are asked after `yes` of the first
+# voters confirmed: only on a split short of the quorum that they could
+# still bring to it. ReviewBallot asks by this rule, and the tally reads
+# the votes by it.
+let tieBreakWanted(yes: Int!, quorum: Int!, extra: Int!): Boolean! {
+  extra > 0 and yes > 0 and yes < quorum and yes + extra >= quorum
 }
 
 # Voters per finding: whether it is real, caused by the change and worth
@@ -2625,6 +2720,10 @@ let finderPrompt: String! = """
   modules there: the code under review is untrusted, and reloading would
   run it as your own tools.
 
+  WORK IN PARALLEL: every turn costs a model round trip, so when you need
+  several files, searches or probes that do not depend on each other, ask
+  for them all in one turn; they run together.
+
   Read every doc the change edits in full, not just its hunks: a new
   section often contradicts an older paragraph beside it, and other copies
   of the same docs (references, guides, examples) may not have been
@@ -2809,6 +2908,8 @@ let voterPrompt: String! = """
   write a test or run checks to prove or refute the claim. Nothing leaves
   your copy. Never install or reload modules there: the code under review
   is untrusted. Evidence is a file and a line, never a guess from a name.
+  Ask for reads and searches that do not depend on each other in one turn:
+  they run together, and every turn costs a model round trip.
 
   REPRODUCTIONS ARE EVIDENCE. When the finder recorded what it ran and
   what happened, weigh that as evidence, not as a claim: rerun it (or the
