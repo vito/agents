@@ -11,6 +11,7 @@ check span, the judge's included (reviewer + judge).
 | dang-187 | v5-2 | +9 | 0 | 6 | 2/12 | fragment-nesting, docs-skill-graphql-laziness | 6/6 | 896 | 12.8 | 232 (228 + 4) |
 | dang-187 | v5-3 | +12 | 1 | 9 | 4/12 | fragment-nesting, redundant-round-trips, docs-skill-graphql-laziness, qualified-root-rescue | 9/9 | 1194 | 12.8 | 226 (222 + 4) |
 | dang-59 | v5-1 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1166 | 9.0 | 293 (289 + 4) |
+| dang-59 | v5-2 | +13 | 1 | 6 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 6/6 | 986 | 10.1 | 280 (276 + 4) |
 
 ## Run notes
 
@@ -49,3 +50,12 @@ check span, the judge's included (reviewer + judge).
   the two copies and the LSP one stays apart. 7/7 unanimous; 2/2
   confirmed. phase-groups-by-index missed; one concern cites a path in
   the finder's mount (mnt/jrpc2), noted "not found at head".
+- dang-59 v5-2: the review has 5 items, all IMPORTANT, and the judge
+  rates all 5 guardrails: the same four as run 1 (variable ordering again
+  against lockstep-phases, LSP siblings, runtime imports, per-file
+  schema modules) plus the shared mutable parse cache, a concern asked
+  as a question in run 1 and IMPORTANT here. The judge's extraction made
+  a 6th finding of one sentence inside the runtime-imports item (the
+  stale RunDir comment), scored a duplicate and alarmist 3/3: -2 value
+  and the 1 noise come from that split, not from the review. 10 voters;
+  2/2 confirmed; phase-groups-by-index missed.
