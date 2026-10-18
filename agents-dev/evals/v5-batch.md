@@ -12,6 +12,9 @@ check span, the judge's included (reviewer + judge).
 | dang-187 | v5-3 | +12 | 1 | 9 | 4/12 | fragment-nesting, redundant-round-trips, docs-skill-graphql-laziness, qualified-root-rescue | 9/9 | 1194 | 12.8 | 226 (222 + 4) |
 | dang-59 | v5-1 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1166 | 9.0 | 293 (289 + 4) |
 | dang-59 | v5-2 | +13 | 1 | 6 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 6/6 | 986 | 10.1 | 280 (276 + 4) |
+| dang-59 | v5-3 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1180 | 8.5 | 344 (340 + 4) |
+
+No run failed for infrastructure reasons; none was retried.
 
 ## Run notes
 
@@ -59,3 +62,9 @@ check span, the judge's included (reviewer + judge).
   stale RunDir comment), scored a duplicate and alarmist 3/3: -2 value
   and the 1 noise come from that split, not from the review. 10 voters;
   2/2 confirmed; phase-groups-by-index missed.
+- dang-59 v5-3: 4 guardrails (the same four as run 1), 2 guidance (the
+  shared parse cache, as a concern again; the RunFile/RunDir alias rule,
+  filed as a decision this time), and a quick fix: TestRunDirImportsAreFileLocal
+  cannot tell file-local imports from leaking ones. Variable ordering
+  matched lockstep-phases again. 7/7 unanimous, 14 voters, 2/2
+  confirmed; phase-groups-by-index missed.
