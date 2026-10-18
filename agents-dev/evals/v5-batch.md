@@ -20,6 +20,7 @@ check span, the judge's included (reviewer + judge).
 | dang-160-clean | v5-2 | +7 | 0 | 3 | - | (none vetted real) | 3/3 | 544 | 4.9 | 103 (99 + 4) |
 | dang-160-clean | v5-3 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 470 | 4.9 | 138 (134 + 4) |
 | agents-tools-version | v5-1 | +3 | 0 | 1 | 1/1 | continuations-bind-version-zero | 1/1 | 285 | 4.1 | 106 (102 + 4) |
+| agents-tools-version | v5-2 | +2 | 0 | 2 | 1/1 | continuations-bind-version-zero | 2/2 | 380 | 4.7 | 118 (114 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -134,6 +135,14 @@ No run failed for infrastructure reasons; none was retried.
   IMPORTANT 2/2, guardrail 3/3, naming all four call sites (388, 818,
   1453, 1477). All four finders reported it; the triage merged them.
   Nothing else raised; 2 voters.
+- agents-tools-version v5-2: continuations-bind-version-zero again
+  (IMPORTANT 2/2, guardrail 3/3, the four call sites, naming five tools:
+  reset, rebase, rebaseContinue, rebaseSkip, rebaseAbort), plus a NIT:
+  the new comment at committer/main.dang:83
+  says to bump the version in `agent()` only. The judge matched the nit to
+  the same issue 3/3 (quick-fix each time), so it scores a duplicate (-1,
+  not noise); its fix is the same shared `stateVersion` the IMPORTANT
+  item already asks for. 3 voters.
 
 ## Summary
 
