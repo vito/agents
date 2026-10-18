@@ -496,6 +496,7 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | dang-55-shadowing | v6-1 | +13 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 2/2 | 5/5 | 926 | 6.9 | 224 (220 + 4) |
 | dang-59 | v6-1 | +13 | 0 | 5 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 3/3 | 5/5 | 923 | 10.5 | 287 (283 + 4) |
+| dang-160-clean | v6-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 2/2 | 437 | 6.5 | 120 (116 + 4) |
 
 - dang-55-shadowing v6-1: 4 guardrails and 1 guidance, every finding
   unanimous 3/3. fragment-resolves-local-type leads as IMPORTANT (run 3
@@ -517,3 +518,11 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
   problems as v5, without the schema-env-rebuilt concern that cost v5-1
   its duplicate or the RunFile/RunDir alias item. phase-groups-by-index
   missed again. Two concerns, no overflow. 10 voters, all 2/2.
+- dang-160-clean v6-1: the same two IMPORTANT findings as v5-1 and v5-3,
+  both guardrail 3/3, unanimous: float-arg-six-decimals (0.1234567 sent
+  as 0.123457, 1e-7 as 0.000000; NaN/Inf invalid) and
+  fragment-leaf-float-as-int (4.0 under a nested inline-fragment
+  selection becomes an Int, so `/ 3` gives 1). The MapValue finding at
+  eval.go:869 was voted down 1/3. The verdict is milder than v5's ("don't
+  round-trip cleanly yet. Fix eval.go:863 first"), with no "before
+  merging" or "confirmed bugs". No concerns, no overflow. 7 voters.
