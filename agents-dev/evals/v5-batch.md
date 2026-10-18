@@ -17,6 +17,7 @@ check span, the judge's included (reviewer + judge).
 | dang-55-shadowing | v5-2 | +6 | 1 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 4/5 | 857 | 10.4 | 276 (272 + 4) |
 | dang-55-shadowing | v5-3 | +10 | 0 | 4 | 2/3 | constant-annotation-before-hoist, indistinguishable-type-errors | 4/4 | 724 | 6.8 | 180 (176 + 4) |
 | dang-160-clean | v5-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 439 | 4.9 | 122 (118 + 4) |
+| dang-160-clean | v5-2 | +7 | 0 | 3 | - | (none vetted real) | 3/3 | 544 | 4.9 | 103 (99 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -107,6 +108,20 @@ No run failed for infrastructure reasons; none was retried.
   (the untested MapValue branch) failed its vote 0/2. Nothing contradicts
   a sound item; a reader would call none of it noise, though the verdict's
   "before merging" is stronger than a known-clean case wants.
+- dang-160-clean v5-2: the same two problems, plus a nit. (1)
+  float-arg-six-decimals, IMPORTANT, guardrail 3/3; it adds that NaN and
+  Inf render as invalid GraphQL literals. (2) The inline-fragment
+  Float-to-Int leaves, a concern this time (guardrail 2/3, guidance 1/3),
+  which also points out that the ToValue comment ("typed leaves never
+  reach here") is wrong. (3) NIT: the new MapValue case in dangValueToGo
+  looks unreachable (no GraphQL argument type unifies with a Map), and
+  marshalValue would write its keys unquoted; judged quick-fix (samples:
+  quick-fix twice, one of them matched to the sound item
+  float-and-map-arguments, and a speed bump once). It disputes the commit
+  message's claim rather than calling the serialization broken, so it
+  does not contradict the sound item; a reader may find it a borderline
+  speed bump. Run 1's version of it failed its vote 0/2; here as a nit it
+  needed 1/1.
 
 ## Summary
 
