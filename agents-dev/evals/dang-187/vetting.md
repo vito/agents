@@ -13,7 +13,7 @@ counts as a speed bump. A non-blank value here overrides a null `vetted` in
 case.json (and must agree with a non-null one).
 
 ### fragment-nesting
-vetted:
+vetted: real
 bug · important · confirmed (reproduced). A probed nullable interface/union
 handle ends in an inline fragment on the concrete type but keeps the interface
 static type, so multi-type inline fragments on it nest and fail GraphQL
@@ -21,83 +21,93 @@ validation; a single non-matching fragment now errors instead of returning
 null. eval.go:962, :1287.
 
 ### error-path-node
-vetted:
+vetted: dismiss
 bug · important · confirmed. After a probe and reload through node(id:),
 GraphQLError.path is ["node", ...] instead of the field path: binding the value
-with `let` first changes what e.path says.
+with `let` first changes what e.path says. Author: users aren't expected to
+inspect error paths programmatically; not worth bending over backwards for. A
+product decision a reviewer couldn't deduce unless it were recorded.
 
 ### case-binding-equality
-vetted:
+vetted: dismiss
 bug · minor · confirmed. The handle a `case` type arm binds no longer equals the
 value it matched (`case (f) { p: Post => p == f }` is false): resolveObject
-builds a new node(id:) chain.
+builds a new node(id:) chain. Author: equality isn't really defined for GraphQL
+objects.
 
 ### node-load-assumption
-vetted:
+vetted: dismiss
 concern · important · claimed. Loading through node(id:) assumes the server can
 load every type implementing node's return type; Relay servers that load a
 subset or apply other permissions return null, and later non-null leaves fail
-far from the cause. Suggests a fallback or opt-in.
+far from the cause. Suggests a fallback or opt-in. Author: start simple and
+handle such servers when they come, unless it's provably a one-way door.
 
 ### fragment-null-soundness
-vetted:
+vetted: real
 concern · minor · claimed. "No error means the parent was null" has an exception
 (querybuilder.unpack steps over inline fragments). Safe today because every such
 fragment follows a __typename check; the soundness argument doesn't mention it.
+Author: real, maybe; it would need a suggested fix to judge whether it's a
+design issue or an easy gap to cover.
 
 ### nullable-list-inconsistency
-vetted:
+vetted: real
 concern · minor · claimed. A nullable [User] field on an ordinary chain never
 compares == null, but one reached through a nullable object can: whether a list
-can be null depends on the path.
+can be null depends on the path. Author: likely fix is recursing into a trivial
+(__typename and/or id) sub-selection so the probe can be queried; a suggested
+fix would have made this easier to judge.
 
 ### node-can-return-abstract
-vetted:
+vetted: real
 bug · minor · claimed. nodeCanReturn accepts any interface or union; when
 knowsType fails, resolveObject loads with the abstract type name, which can fail
-validation if the union doesn't overlap node's return type.
+validation if the union doesn't overlap node's return type. Author: real, I
+guess; is the fix to check it's a possible type during type checking?
 
 ### selected-through-ast-state
-vetted:
+vetted: dismiss
 concern · minor · claimed. selectedThrough is written onto AST nodes during
 Infer and never reset; harmless unless nodes are shared or inferred
-concurrently.
+concurrently. Author: dismiss, not entirely sure; there's likely precedent for
+inference state on AST nodes.
 
 ### sdk-parity-overstated
-vetted:
+vetted: real
 concern · minor · claimed. The PR goes further than the Dagger Go SDK (probes
 more, handles unions, narrows types), so "matches the Dagger SDKs" overstates
-it.
+it. Author: real but minor; just don't claim parity.
 
 ### redundant-round-trips
-vetted:
+vetted: real
 cleanup · minor · claimed. Unneeded queries: re-fetching an id already in
 KnownID (SelectField("id"), resolveObject), and selecting __typename on every
 list element just to learn whether the list is null.
 
 ### dead-branch-needs-concrete-type
-vetted:
+vetted: real
 cleanup · minor · claimed. In needsConcreteType, `g.MaybeNull ||` is never true
 (mutation chains return early); the comment is misleading.
 
 ### docs-interop-laziness
-vetted:
+vetted: real
 docs · minor · confirmed. interop.md's "Laziness" paragraph still says no
 request is sent until a value is forced, contradicting the new "Nullable object
 fields" section below it.
 
 ### docs-skill-graphql-laziness
-vetted:
+vetted: real
 docs · minor · confirmed. The skill's graphql.md:64 still says no request is
 sent until a GraphQL value is forced.
 
 ### docs-skill-mutation-laziness
-vetted:
+vetted: real
 docs · minor · confirmed. The skill's graphql.md:61 still says mutations follow
 the same laziness rules as queries.
 
 ### docs-skill-execution-points
-vetted:
+vetted: real
 docs · minor · confirmed. The skill's control-flow.md:135 lists only leaf
 fields and .{{ }} as execution points; escaping possibly-null handles are now a
 third.
@@ -116,17 +126,17 @@ contradiction and keeps the judge's value, unless the judge rated it false or a
 speed bump.
 
 ### null-result-fix
-vetted:
+vetted: sound
 convertGraphQLResultToModule returning null for a nil result is correct, and
 probing only when a value leaves the chain holds up.
 
 ### rescue-classification
-vetted:
+vetted: sound
 Static rescue classification matches runtime behaviour, including (x ?? y).f
 and x!.f.
 
 ### union-id-fragments
-vetted:
+vetted: sound
 Union probes use per-member `... on T { id }` fragments selecting ids of one
 shared type, avoiding field-merge conflicts.
 
@@ -137,6 +147,6 @@ runs recorded `touched.{{... on Post!}}.title` on a mutation result sending the
 mutation twice: first `{touchNode{__typename}}`, then the fragment.)
 
 ### args-in-selected-chain
-vetted:
+vetted: sound
 An argument evaluated inside a chain that is being selected through is still
 probed.
