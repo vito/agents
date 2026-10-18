@@ -533,3 +533,27 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
   nothing else; 2 voters. finder-design's probe, a check in its own copy
   (repro-committer-version), failed to load (`"name" not found`), a
   reviewer-side reproduction error that did not reach the review.
+
+## v6 status
+
+Value against the rescored v5 runs (mean and range), at STANDARD:
+
+| case | v6 value | v6 noise | v6 vetted-real | v5 rescored value mean (range) | v5 rescored noise mean | v5 vetted-real mean | regressed? |
+|---|---|---|---|---|---|---|---|
+| dang-187 | +9, +10 (2 runs) | 1, 0 | 4/12, 6/12 | +8.3 (+2 to +12) | 1.0 | 4.7/12 | no |
+| dang-59 | +13 | 0 | 2/3 | +14.3 (+13 to +15) | 0.3 | 2/3 | no: low end of the range |
+| dang-55-shadowing | +13 | 0 | 3/3 | +10.3 (+8 to +13) | 0.3 | 2.7/3 | no: top of the range |
+| dang-160-clean | +6 | 0 | - | +6.3 (+6 to +7) | 0 | - | no |
+| agents-tools-version | +3 | 0 | 1/1 | +3.3 (+3 to +4) | 0 | 1/1 | no |
+
+Every v6 run is inside its case's v5 range, with noise 0 everywhere but
+dang-187 v6-1 (error-path-node as a concern) and fix given on every
+finding (26/26 over the six runs). dang-59's +13 finds the same five
+problems as every v5 run; the 2 points under v5-2 and v5-3 are the
+parse-cache concern scoring guidance (a guardrail in v5-2) and none of
+v5-3's extra items (the RunFile/RunDir alias decision, the weak RunDir
+test), so it is fewer points on the same issues, not a lost issue.
+The overflow rendering ran live once, on dang-55-shadowing: the fourth
+concern kept its claim and fix and scored a guardrail, where v5-2's
+one-liner of the same finding scored false. One run per case is a spot
+check, not a new mean.
