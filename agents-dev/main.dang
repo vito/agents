@@ -157,7 +157,7 @@ type AgentsDev {
     null
   }
 
-  """Check the reviewer's triage merges findings that describe the same problem whatever they quote, keeps different problems on one line apart, and that voters per finding follow its severity, on canned replies."""
+  """Check the reviewer's triage merges findings that describe the same problem whatever they quote, keeps different problems on one line apart, reads them by file and line with their near neighbours named, and that voters per finding follow its severity, on canned replies."""
   reviewerTriage: Void @check {
     print(checkReviewerTriage)
     null

@@ -562,6 +562,41 @@ let checkReviewerTriage: String! {
   assert(message: three) { mergedLine.hasPrefix("Merged as duplicates: calc.py:2 (general: \"percent / 10 divides by ten") and mergedLine.hasSuffix("\") into calc.py:3: one rate bug") }
   assert(message: three) { mergedLine.split("calc.py:2 (").length == 2 and (three.split("\n")[0] ?? "") == "1 important, 1 concern" }
 
+  # The triage reads the findings by file and line, under their own
+  # numbers, each naming the findings that cite the same or a nearby line,
+  # so near duplicates sit side by side.
+  let shuffled = [
+    reviewerFindingsReply([
+      reviewerCitedJson("CONCERN", "notes.txt line 25 lost its number, so readers cannot cite it", "docs", true, [reviewerLocationJson("notes.txt", 25, "changed")]),
+      reviewerCitedJson("CONCERN", reviewerOvershootClaim, "behavior", true, [reviewerLocationJson("calc.py", 3, "return total - total * rate")]),
+    ]),
+    reviewerFindingsReply([
+      reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT"),
+      reviewerCitedJson("NIT", reviewerNegativeClaim, "correctness", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
+    ]),
+  ]
+  let task = reviewer.triageTaskFor(source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, finderReplies: shuffled)
+  let blocks = task.split("\n\n#")
+  let heads = blocks.dropFirst(1).map { b => (b.split("\n")[0] ?? "") }
+  assert(message: task) { heads == ["1 CONCERN (docs, finder: general)", "3 IMPORTANT (correctness, finder: behavior)", "4 NIT (correctness, finder: behavior)", "2 CONCERN (behavior, finder: general)"] }
+  let nearOf = blocks.dropFirst(1).map { b => (b.split("\n").filter { l => l.hasPrefix("near: ") }[0] ?? "") }
+  assert(message: task) { nearOf == ["", "near: #2, #4", "near: #2, #3", "near: #3, #4"] }
+  assert(message: task) { task.contains("listed by file and line; the numbers are the findings' own:") }
+  # A neighbour through another location counts; one past the window does
+  # not; and with one finding there is no triage at all. (Concern one
+  # anchors at notes.txt:25, its first location in a hunk, and also cites
+  # calc.py:3, next to concern two.)
+  let viaAlso = reviewer.triageTaskFor(source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, finderReplies: [reviewerFindingsReply([
+    reviewerCitedJson("CONCERN", "concern one", "design", true, [reviewerLocationJson("notes.txt", 25, "changed"), reviewerLocationJson("calc.py", 3, "return total - total * rate")]),
+    reviewerCitedJson("CONCERN", "concern two", "design", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
+    reviewerCitedJson("CONCERN", "concern three", "design", true, [reviewerLocationJson("notes.txt", 10, "line 10")]),
+  ])])
+  let alsoBlocks = viaAlso.split("\n\n#").dropFirst(1)
+  assert(message: viaAlso) { alsoBlocks.map { b => (b.split("\n")[0] ?? "").split(" ")[0] ?? "" } == ["3", "1", "2"] }
+  assert(message: viaAlso) { alsoBlocks.map { b => (b.split("\n").filter { l => l.hasPrefix("near: ") }[0] ?? "") } == ["", "near: #2", "near: #1"] }
+  let lone = reviewer.triageTaskFor(source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, finderReplies: [reviewerFindingsReply([reviewerFindingJson("calc.py", 2, reviewerDiscountClaim, "rate = percent / 10", "correctness", "IMPORTANT")])])
+  assert(message: lone) { lone == "" }
+
   # A triage that fails or answers without the JSON merges nothing, and
   # says so; every finding is voted on.
   let failed = reviewer.tallyReplies(
@@ -862,7 +897,7 @@ let checkReviewerComposition(source: Workspace!): String! {
 }
 
 let checkReviewerTools(source: Workspace!): String! {
-  let plumbing = ["finder", "triage", "voter", "synthesizer", "subagentExpertise", "tallyReplies", "withRecordedReplies", "lastSummary", "agent"]
+  let plumbing = ["finder", "triage", "voter", "synthesizer", "subagentExpertise", "tallyReplies", "triageTaskFor", "withRecordedReplies", "lastSummary", "agent"]
   # review takes the calling agent, which only an owning agent supplies.
   let unowned = composedToolNames(reviewer.agent(llm.withWorkspace(source)), llm.withWorkspace(source))
   assert(message: unowned.join(", ")) { unowned.contains("findingsList") and unowned.contains("resolve") and !unowned.contains("review") }
