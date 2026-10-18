@@ -64,10 +64,11 @@ type ReviewerEval {
   Judge the review in input/review.md against the case in input/case.json:
   one call splits the review into numbered findings (each with how the
   review frames it), then one call per slot in input/params.json gives
-  every finding a match (an issue or sound key, or none), a value class and
-  an alarmism flag. No tools. Returns result.json: the judge model, the raw
-  extraction, the findings, and each sample's raw reply; agents-dev takes
-  the majorities and does the arithmetic.
+  every finding a match (an issue or sound key, or none), any other issues
+  it explicitly covers too (each with the part that covers it), a value
+  class and an alarmism flag. No tools. Returns result.json: the judge
+  model, the raw extraction, the findings, and each sample's raw reply;
+  agents-dev takes the majorities and does the arithmetic.
   """
   judge(source: Workspace!): File! @cache(policy: FunctionCachePolicy.Never) {
     let caseText = source.file("input/case.json").contents
@@ -276,6 +277,16 @@ let judgePrompt: String! = """
     covering only part of it; sharing a file, function or topic is not
     enough; if several, the one it is mainly about), or the key of the sound
     item it claims is broken, or "none".
+  - "also": the OTHER known issues the finding covers explicitly too,
+    besides its match, as [{"key": "<issue key>", "cites": "<the part of
+    the finding that covers it, copied word for word>"}]. This is for a
+    finding that names several distinct known issues at once, e.g. one
+    docs item listing three stale passages, each a known issue of its own.
+    List an issue only when the finding names that issue's own location
+    (its file, line or function) or states its specific substance (the
+    same mechanism and consequence); a shared topic, a nearby file, a
+    general theme or a passing word is not enough. Usually []. Never the
+    match itself, never a sound item.
   - "value", judged on the finding's own merits, whether or not it matches:
     - "guardrail": a real bug or regression in this change, with a concrete
       trigger and consequence; worth blocking the merge on.
@@ -305,5 +316,5 @@ let judgePrompt: String! = """
 
   Reply with ONLY one JSON object, no prose around it, with one entry per
   finding, in order:
-  {"judgements": [{"finding": 1, "reason": "one or two sentences", "match": "<issue or sound key>|none", "value": "guardrail|guidance|quick-fix|speed-bump|false|duplicate", "alarmism": false, "fix": "actionable|reasoned|vague|missing"}]}
+  {"judgements": [{"finding": 1, "reason": "one or two sentences", "match": "<issue or sound key>|none", "also": [], "value": "guardrail|guidance|quick-fix|speed-bump|false|duplicate", "alarmism": false, "fix": "actionable|reasoned|vague|missing"}]}
 """
