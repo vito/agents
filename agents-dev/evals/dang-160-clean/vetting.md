@@ -8,10 +8,10 @@ and the later commits to pkg/dang/eval.go (scalar bodies, Regexp, visibility,
 says the change is fine and raises little; the sound items below are things
 such a review might wrongly call broken.
 
-One issue is listed all the same: a reviewer run found it, and it holds by
-code inspection, though no later commit fixes it. If a later fix ever
-attributes a bug to this change, add it as an issue here with `vetted: real`
-and cite the fix.
+Two issues are listed all the same: reviewer runs found them, and they hold
+by code inspection, though no later commit is known to fix them. If a later
+fix ever attributes a bug to this change, add it as an issue here with
+`vetted: real` and cite the fix.
 
 ## Known issues
 
@@ -22,6 +22,14 @@ vetted:
 bug · important · claimed. pkg/querybuilder/marshal.go:69 formats float64 with
 `%f` (six decimals), and Float arguments now reach it, so 0.1234567 is sent as
 0.123457. Found by run-v2-standard.md; not fixed in history.
+
+### fragment-leaf-float-as-int
+vetted:
+bug · important · claimed. Leaves of a nested selection inside an inline
+fragment still go through the untyped ToValue (ast_expressions.go:2026), whose
+new json.Number case makes a whole Float (`4`) an Int, so `score / 8` divides
+as integers. Found by every run since v2 (5/5); builtins.go is untouched
+since, ast_expressions.go not checked.
 
 ## Sound items
 

@@ -5,7 +5,7 @@
   "repo": "https://github.com/vito/dang",
   "head": "d7b82e009e594336af9a0ace05ac67cc105a1b68",
   "base": "8406a0c64f2fe197106acdc71d16ee2e8bba901e",
-  "notes": "The first commit of vito/dang#55 (fixes #52), reviewed alone: +396/-50 over 5 files. Ground truth from history: later commits in the same PR fixed each issue below, each adding a regression test or golden that fails at this head, so they are vetted real and, where a test reproduces them, confirmed. The fixing commits are cited in each summary; PR #55 merged with all of them (head dcc8f89).",
+  "notes": "The first commit of vito/dang#55 (fixes #52), reviewed alone: +396/-50 over 5 files. Ground truth from history: later commits in the same PR fixed each issue below, each adding a regression test or golden that fails at this head, so they are vetted real and, where a test reproduces them, confirmed. The fixing commits are cited in each summary; PR #55 merged with all of them (head dcc8f89). The issues marked claimed came from reviewer runs, not history (whether a later commit fixed them is not checked), and are unvetted.",
   "issues": [
     {
       "key": "fragment-resolves-local-type",
@@ -33,6 +33,24 @@
       "vetted": "real",
       "locations": ["tests/testdata/import_shadowing_local_distinct.golden"],
       "summary": "Now that a local type and an imported one can share a name, mismatch errors print both unqualified: the change's own golden shows `cannot use User! as User!`, `cannot use Status! as Status!`, `cannot use [SearchResult!]! as [SearchResult!]!`, which tell the user nothing. Fixed by 9dc903dfda (fix(dang): qualify imported type errors) and af13384818 (fix(dang): qualify type display paths), which render imported types as `Test.User!` and update the golden."
+    },
+    {
+      "key": "repl-imports-untracked",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/slots.go:350", "pkg/dang/slots.go:331", "pkg/dang/eval.go:382", "cmd/dang/repl_tuist.go:427"],
+      "summary": "The change decides that an existing type is an import to shadow by looking it up in unqualifiedTypeImports, which only ImportDecl fills. The REPL builds its environment with BuildEnvFromImports (eval.go:382), which adds the imported classes with AddClass but never records them, so in the REPL declareLocalType hands back the imported module: `type Container { pub value: String! }` with Dagger loaded still reuses and mutates Dagger.Container, the bug the change fixes for files and RunDir. Suggested fix: have BuildEnvFromImports call TrackUnqualifiedTypeImport (and the value variant) for what it installs, or reuse ImportDecl's import path; better, decide shadowing by ownership (is the existing type a local declaration) rather than by side metadata. Found by reviewer v5 runs 1-3 (a concern in runs 1 and 2, IMPORTANT in run 3)."
+    },
+    {
+      "key": "interface-union-redeclare-merges",
+      "kind": "bug",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/slots.go:1013", "pkg/dang/slots.go:1121", "pkg/dang/slots.go:350"],
+      "summary": "Interface and union Hoist pass 0 used to create a fresh module every time; now they go through declareLocalType, which reuses any existing local type whatever its kind. In the REPL's persistent type env a redeclaration merges with the stale one: `union U = A | B` then `union U = A | C` leaves members A, B, A, C; redeclaring an interface field with a new type fails with 'already defined as', or keeps the old field so implementers fail with 'missing'; `type Foo` then `interface Foo` keeps ObjectKind. Suggested fix: keep a fresh module for interface/union pass 0 (only clear the shadowed import), or reuse only when the existing module's kind matches. Found by reviewer v5 runs 1-3 (a concern in runs 1 and 3; a one-line overflow concern in run 2; also named inside run 3's REPL item)."
     }
   ],
   "sound": [

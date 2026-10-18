@@ -5,7 +5,7 @@
   "repo": "https://github.com/vito/dang",
   "head": "338e5fdbf23ec6eb1687040aaf8babecc36b19b9",
   "base": "6e8ca566d3034f10571793cacaf158e1280560ad",
-  "notes": "A known-clean change, to measure noise: vito/dang#160, +255/-84 over 7 files (162 of the added lines are gqlgen output in tests/gqlserver/generated.go). Merged 2026-06-30; as of 2026-10-17 no later commit touches pkg/querybuilder/querybuilder.go or pkg/dang/builtins.go, and none of the later commits to pkg/dang/eval.go fixes number or argument conversion. Nothing was fixed in history; the one issue below was found by a reviewer run and holds by code inspection, so it is claimed, not confirmed. Absence of a follow-up fix is not proof of correctness, so a well-argued finding can still be guidance, but a good review should say the change is fine and raise little.",
+  "notes": "A known-clean change, to measure noise: vito/dang#160, +255/-84 over 7 files (162 of the added lines are gqlgen output in tests/gqlserver/generated.go). Merged 2026-06-30; as of 2026-10-17 no later commit touches pkg/querybuilder/querybuilder.go or pkg/dang/builtins.go, and none of the later commits to pkg/dang/eval.go fixes number or argument conversion. Nothing was fixed in history; the two issues below were found by reviewer runs and hold by code inspection, so they are claimed, not confirmed. Absence of a follow-up fix is not proof of correctness, so a well-argued finding can still be guidance, but a good review should say the change is fine and raise little.",
   "issues": [
     {
       "key": "float-arg-six-decimals",
@@ -15,6 +15,15 @@
       "vetted": null,
       "locations": ["pkg/querybuilder/marshal.go:69", "pkg/dang/eval.go:863"],
       "summary": "querybuilder's argument marshaller formats float64 with %f, which keeps six decimal places, and this change lets Float arguments reach it (dangValueToGo now serializes FloatValue). So 0.1234567 is sent as 0.123457 and 0.0000001 as 0.000000: a Float result passed back as an argument comes back altered, with no error. Before the change such calls failed with an unsupported value type. The new round-trip test only uses 4.5 and 2.5. Found by a reviewer run (run-v2-standard.md); no later commit fixes it."
+    },
+    {
+      "key": "fragment-leaf-float-as-int",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/ast_expressions.go:2026", "pkg/dang/builtins.go:138"],
+      "summary": "Leaf fields of a nested selection inside an inline fragment are still converted by the untyped ToValue (convertNestedSelectionResult, ast_expressions.go:2026), where convertInlineFragmentResult looks up the schema field. The change decodes responses with UseNumber and gives ToValue a json.Number case that turns any integral number into an IntValue (builtins.go:138), so a Float field whose value is whole (gqlgen writes 4.0 as `4`) comes back as an Int under a Float-typed field, and `score / 8` or `rating / 2` divides as integers (0 instead of 0.5). At the base the same leaf was a float64 and a FloatValue. ToValue's new comment says typed leaves never reach it. Suggested fix: in convertNestedSelectionResult, look up the leaf's schema field and convert with graphQLResultToValue and its TypeRef, with a nested inline-fragment Float test. Found by every reviewer run since v2 (5/5), holding by inspection at base and head; builtins.go is untouched since, and whether a later commit to ast_expressions.go fixes it is not checked."
     }
   ],
   "sound": [

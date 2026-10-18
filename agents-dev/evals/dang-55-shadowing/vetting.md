@@ -4,7 +4,9 @@ The range is d7b82e0 alone, the first commit of vito/dang#55 ("shadow imported
 types locally", fixes #52), against its parent 8406a0c. The labels come from
 history, not from reviews: every issue below was fixed by a later commit of
 the same PR, which added a regression test (or golden) that fails at d7b82e0.
-That is why each one is vetted `real` here already.
+That is why each one is vetted `real` here already, except the last two, which
+came from reviewer runs (whether a later commit fixed them is not checked) and
+await a label (`real` or `dismiss`).
 
 Not labelled: 01ee56e ("protect import aliases") also landed in the PR, but a
 local `type Test` reusing the import alias module predates this commit, and
@@ -29,6 +31,20 @@ vetted: real
 concern · minor · confirmed. The change's own golden shows `cannot use User! as
 User!`. Fixed by 9dc903dfda and af13384818, which qualify imported type names in
 diagnostics.
+
+### repl-imports-untracked
+vetted:
+bug · important · claimed (from reviewer runs). Shadowing is detected through
+unqualifiedTypeImports, which the REPL's BuildEnvFromImports never fills
+(eval.go:382), so in the REPL a local `type Container` still reuses and
+mutates Dagger.Container.
+
+### interface-union-redeclare-merges
+vetted:
+bug · minor · claimed (from reviewer runs). Interface and union pass 0 now
+reuse an existing local module (slots.go:1013, :1121), so a REPL redeclaration
+merges with the stale one (`union U = A | C` after `A | B` has members A, B,
+A, C).
 
 ## Sound items
 

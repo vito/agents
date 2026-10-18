@@ -150,6 +150,24 @@
       "vetted": null,
       "locations": ["pkg/dang/rescue_analysis.go:564", "pkg/dang/rescue_analysis.go:303"],
       "summary": "The rescue analysis update misses nullable root fields reached through the schema's module name: `Test.maybeUser(id: \"User:1\") rescue null` still warns that a lazy value leaves the rescue without executing, though at runtime it is probed inside the rescue; the unqualified form doesn't warn. classifyGQLSelect and selectMayBeNull don't treat the import-module receiver as a root. Found by reviewer v4 run 2."
+    },
+    {
+      "key": "mutation-union-case-fails",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/ast_patterns.go:444", "pkg/dang/ast_patterns.go:420", "docs/lit/types/interfaces-unions.md:81"],
+      "summary": "A `case` over a union returned by a mutation, with one type pattern per member and no `else`, still type-checks as exhaustive, but the change never resolves an abstract handle on a mutation chain (`if g.IsMutation || !g.isAbstract() { return false }`: asking for its type would re-send the mutation). At runtime no arm matches and the program fails with the internal \"exhaustive case did not match the value\" error, which the code describes as a compiler bug. The new docs say such values match only interface patterns or `else`, which a union has no interface pattern for. Result unions (`User | ValidationError`) are a common mutation return type. Suggested fixes: treat a mutation-rooted abstract operand as non-exhaustive at inference (require `else`), or raise a clear error in Case.Eval pointing to `.{{... on A}}`. Found by reviewer v5 runs 1-3 (all three; reproduced with a probe schema in run 1); run 1 showed it only as a one-line overflow concern."
+    },
+    {
+      "key": "nonnull-fragment-on-null",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/ast_expressions.go:1998", "pkg/dang/ast_expressions.go:1635", "tests/test_graphql_nullable_object.dang:109", "docs/lit/graphql/interop.md:72"],
+      "summary": "A non-null lazy inline fragment `... on User!` on a null receiver now evaluates to null instead of raising the type-assertion error, though the result is still typed `User!`: `let u = node(id: \"nope\").{{... on User!}}` binds null and `u.name == null` holds for a `String!`, and the null only fails later at some typed boundary (\"null is not allowed for Test.User!\"). At the merge base the unprobed handle's empty __typename made matchLazyInlineFragment raise. The change's own test (test_graphql_nullable_object.dang:109) asserts the null. Suggested fix: in evalGraphQLLazyInlineFragments (and the list variant, and ObjectSelection.Eval's null-receiver early return), raise the assertion error when the receiver is null and any fragment is NonNull, or infer the result nullable when the receiver is. Found by reviewer v5 runs 2 and 3 (a voter reproduced it in run 3)."
     }
   ],
   "sound": [

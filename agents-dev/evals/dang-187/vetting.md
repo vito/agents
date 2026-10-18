@@ -120,6 +120,21 @@ that the rescue guards nothing, though it is probed inside it; the unqualified
 form doesn't warn. rescue_analysis.go:564, :303. Author: real, a consistency
 gap the PR left in the rescue analysis update.
 
+### mutation-union-case-fails
+vetted:
+bug · important · claimed. A `case` over a mutation-returned union with one
+arm per member and no `else` type-checks as exhaustive, but mutation handles
+are never resolved (that would re-send the mutation), so no arm matches and it
+fails at runtime with the internal "exhaustive case did not match the value".
+ast_patterns.go:444, :420; interfaces-unions.md:81. Found by every v5 run.
+
+### nonnull-fragment-on-null
+vetted:
+bug · important · claimed. `node(id: "nope").{{... on User!}}` now gives null
+typed `User!` instead of raising the assertion error it raised at the merge
+base; the change's test at test_graphql_nullable_object.dang:109 asserts the
+null. ast_expressions.go:1998. Found by v5 runs 2 and 3.
+
 ## Sound items
 
 Things the same two reviews checked and found correct. Mark each one after its
