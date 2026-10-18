@@ -14,8 +14,11 @@
 # - noise: speed bumps + false findings + alarmist findings (lower is
 #   better);
 # - findings and the review's length in words: the reader's time;
-# - recall on confirmed issues (reproduced by a reviewer), and on issues the
-#   PR author vetted "real", once there are any.
+# - recall on issues the PR author vetted "real" (the headline recall once
+#   there are any), and on confirmed issues (reproduced by a reviewer);
+# - fix given: the share of findings that carry an actionable fix or a
+#   reasoned "no clear fix, because..." (a decision to record, a risk to
+#   the approach), as the judge reads them.
 # Raw recall over all known issues, per kind and severity-weighted, is
 # informational only.
 #
@@ -38,8 +41,9 @@
 # a plain-directory fixture workspace, see there for why), has a judge with
 # no tools split the review into numbered findings, then rate every finding
 # N times, independently: its match (an issue key, a sound key, or none),
-# its value (guardrail, guidance, quick-fix, speed-bump, false, duplicate)
-# and whether it is alarmist. The engine offers no temperature setting, so
+# its value (guardrail, guidance, quick-fix, speed-bump, false, duplicate),
+# whether it is alarmist, and its fix (actionable, reasoned, vague,
+# missing). The engine offers no temperature setting, so
 # robustness comes from the vote: each field takes the answer a strict
 # majority of samples gave, else "disputed" (alarmism: true only on a strict
 # majority); an unparseable or unknown answer is "unjudged". The
@@ -103,6 +107,10 @@ type ReviewerEvalCase {
 
 let reviewerEvalKinds: [String!]! = ["bug", "concern", "cleanup", "docs"]
 let reviewerEvalValues: [String!]! = ["guardrail", "guidance", "quick-fix", "speed-bump", "false", "duplicate"]
+# Whether a finding carries a suggested fix: a concrete change, a reasoned
+# "no clear fix" (a decision to record, a risk to the approach), a vague
+# direction, or none. The first two count as given.
+let reviewerEvalFixes: [String!]! = ["actionable", "reasoned", "vague", "missing"]
 # Labels a key cannot take: they mean something else in a vote.
 let reviewerEvalReserved: [String!]! = ["none", "disputed", "unjudged"]
 let reviewerEvalMaxSamples: Int! = 9
@@ -478,8 +486,8 @@ let reviewerEvalJsonBody(reply: String!): String! {
   if (m != null) { m.string } else { inner.trimSpace }
 }
 
-let decodeReviewerEvalJudgements(reply: String!): [{{finding: Int, match: String, value: String, alarmism: Boolean}}!]! {
-  let wrapped: {{judgements: [{{finding: Int, match: String, value: String, alarmism: Boolean}}!]}}! = JSON.decode(reviewerEvalJsonBody(reply))
+let decodeReviewerEvalJudgements(reply: String!): [{{finding: Int, match: String, value: String, alarmism: Boolean, fix: String}}!]! {
+  let wrapped: {{judgements: [{{finding: Int, match: String, value: String, alarmism: Boolean, fix: String}}!]}}! = JSON.decode(reviewerEvalJsonBody(reply))
   let listed = wrapped.judgements
   if (listed == null) {
     raise "no `judgements` list"
@@ -487,12 +495,12 @@ let decodeReviewerEvalJudgements(reply: String!): [{{finding: Int, match: String
   listed
 }
 
-let reviewerEvalUnjudged: {{match: String!, value: String!, alarm: Boolean!}}! = {{match: "unjudged", value: "unjudged", alarm: false}}
+let reviewerEvalUnjudged: {{match: String!, value: String!, alarm: Boolean!, fix: String!}}! = {{match: "unjudged", value: "unjudged", alarm: false, fix: "unjudged"}}
 
 # One sample's vote on each finding: the first judgement it gives the
-# finding, with a match or value it does not know read as "unjudged"; every
-# finding is unjudged in a sample that does not parse.
-let reviewerEvalSampleVotes(reply: String!, matches: [String!]!, findings: [String!]!): [{{match: String!, value: String!, alarm: Boolean!}}!]! {
+# finding, with a match, value or fix it does not know read as
+# "unjudged"; every finding is unjudged in a sample that does not parse.
+let reviewerEvalSampleVotes(reply: String!, matches: [String!]!, findings: [String!]!): [{{match: String!, value: String!, alarm: Boolean!, fix: String!}}!]! {
   let decoded = decodeReviewerEvalJudgements(reply) rescue {
     e: Error => return findings.map { f => reviewerEvalUnjudged }
   }
@@ -504,9 +512,11 @@ let reviewerEvalSampleVotes(reply: String!, matches: [String!]!, findings: [Stri
     } else {
       let m = (first.match ?? "").trimSpace.toLower
       let v = (first.value ?? "").trimSpace.toLower
+      let x = (first.fix ?? "").trimSpace.toLower
       let match = if (matches.contains(m)) { m } else { "unjudged" }
       let value = if (reviewerEvalValues.contains(v)) { v } else { "unjudged" }
-      {{match: match, value: value, alarm: first.alarmism ?? false}}
+      let fix = if (reviewerEvalFixes.contains(x)) { x } else { "unjudged" }
+      {{match: match, value: value, alarm: first.alarmism ?? false, fix: fix}}
     }
   }
 }
@@ -609,7 +619,7 @@ let reviewerEvalScorecard(
   let unanimous = 0
   let judged: [{{
     id: Int!, text: String!, value: String!, alarmism: Boolean!, match: String!, note: String!,
-    matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!,
+    matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!, fix: String!, fixVotes: [String!]!,
   }}!]! = []
   # Findings matched to a sound item, reported on their own: the item's
   # vetting, the judge's majority value and the value scored.
@@ -662,9 +672,12 @@ let reviewerEvalScorecard(
     judged += [{{
       id: i + 1, text: text, value: value, alarmism: alarm, match: match, note: note,
       matchVotes: matchVotes, valueVotes: valueVotes, alarmVotes: alarmVotes,
+      fix: reviewerEvalMajority(votes.map { v => v.fix }), fixVotes: votes.map { v => v.fix },
     }}]
   }
   let values = judged.map { f => f.value }
+  let fixes = judged.map { f => f.fix }
+  let fixGiven = fixes.filter { x => x == "actionable" or x == "reasoned" }.length
   let alarms = judged.filter { f => f.alarmism }.length
   let speedBumps = reviewerEvalCount(values, "speed-bump")
   let falses = reviewerEvalCount(values, "false")
@@ -703,6 +716,15 @@ let reviewerEvalScorecard(
       confirmedRecall: reviewerEvalRatio(confirmed.filter { i => matched.contains(i.key) }.length, confirmed.length),
       vettedRealRecall: reviewerEvalRatio(vettedReal.filter { i => matched.contains(i.key) }.length, vettedReal.length),
       vettedDismissRaised: reviewerEvalRatio(vettedDismiss.filter { i => matched.contains(i.key) }.length, vettedDismiss.length),
+      fixGiven: reviewerEvalRatio(fixGiven, judged.length),
+    }},
+    fixes: {{
+      actionable: reviewerEvalCount(fixes, "actionable"),
+      reasoned: reviewerEvalCount(fixes, "reasoned"),
+      vague: reviewerEvalCount(fixes, "vague"),
+      missing: reviewerEvalCount(fixes, "missing"),
+      disputed: reviewerEvalCount(fixes, "disputed"),
+      unjudged: reviewerEvalCount(fixes, "unjudged"),
     }},
     values: {{
       guardrail: reviewerEvalCount(values, "guardrail"),
@@ -742,6 +764,13 @@ let reviewerEvalScorecard(
   } else {
     reviewerEvalRow("vetted-real recall", card.headline.vettedRealRecall)
   }
+  # Once the author has vetted issues real, their recall is the headline
+  # recall; confirmed (reproduced by a reviewer) follows.
+  let recallRows = if (vettedReal.isEmpty) {
+    [reviewerEvalRow("confirmed recall", card.headline.confirmedRecall), vettedLine]
+  } else {
+    [vettedLine, reviewerEvalRow("confirmed recall", card.headline.confirmedRecall)]
+  }
   lines += [
     `judge votes: ${toString(replies.length)} per finding, strict majority per field; ${toString(unanimous)}/${toString(judged.length)} findings unanimous`,
     "",
@@ -749,8 +778,9 @@ let reviewerEvalScorecard(
     reviewerEvalNumberRow("noise", toString(card.headline.noise),
       `speed-bump ${toString(speedBumps)} + false ${toString(falses)} + alarmist ${toString(alarms)}; lower is better`),
     reviewerEvalNumberRow("findings", toString(judged.length), `the review is ${toString(words)} words`),
-    reviewerEvalRow("confirmed recall", card.headline.confirmedRecall),
-    vettedLine,
+  ] + recallRows + [
+    reviewerEvalRow("fix given", card.headline.fixGiven) +
+      `   actionable ${toString(card.fixes.actionable)} + reasoned ${toString(card.fixes.reasoned)}; vague ${toString(card.fixes.vague)}, missing ${toString(card.fixes.missing)}`,
   ]
   if (!vettedDismiss.isEmpty) {
     lines += [reviewerEvalRow("dismissed raised", card.headline.vettedDismissRaised) + "   lower is better"]
@@ -782,7 +812,7 @@ let reviewerEvalScorecard(
   lines += [
     reviewerEvalRow("  severity (3/1)", card.informational.severityWeighted),
     "",
-    "per finding (value · match <- votes as match/value, ! = alarmist):",
+    "per finding (value · match <- votes as match/value, ! = alarmist; its fix):",
   ]
   judged.each { f =>
     let flag = if (f.alarmism) { " ALARMIST" } else { "" }
@@ -793,7 +823,7 @@ let reviewerEvalScorecard(
     let short = f.text.split("").takeFirst(110).join("")
     let more = if (short == f.text) { "" } else { "…" }
     lines += [
-      `  #${toString(f.id)} ${f.value}${flag} · ${f.match}${why} <- ${votes.join(", ")}; alarmist ${toString(f.alarmVotes)}/${toString(f.matchVotes.length)}` +
+      `  #${toString(f.id)} ${f.value}${flag} · ${f.match}${why} <- ${votes.join(", ")}; alarmist ${toString(f.alarmVotes)}/${toString(f.matchVotes.length)}; fix ${f.fix}` +
         "\n      " + short + more,
     ]
   }
@@ -960,6 +990,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
       confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!,
       vettedRealRecall: {{hit: Int!, total: Int!, percent: Int!}}!,
       vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!,
+      fixGiven: {{hit: Int!, total: Int!, percent: Int!}}!,
     }}!,
     values: {{guardrail: Int!, guidance: Int!, quickFix: Int!, speedBump: Int!, falseFinding: Int!, duplicate: Int!, disputed: Int!, unjudged: Int!}}!,
     soundContradictions: [{{finding: Int!, key: String!, vetted: String!, judged: String!, value: String!}}!]!,
@@ -1087,6 +1118,36 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let unvetted = decodeReviewerEvalCase(reviewerEvalSyntheticCase.replace("\"vetted\": \"real\"", "\"vetted\": null"))
   let quiet = reviewerEvalScorecard(unvetted, "canned", "x", ["one"], [reviewerEvalVote(1, "a", "guardrail", false)], reviewerEvalNoMeta)
   assert(message: quiet.text) { quiet.text.contains("vetted-real recall  (no issue vetted real yet)") }
+  # With an issue vetted real, its recall leads; without, confirmed does.
+  assert(message: card.text) { (card.text.split("vetted-real recall")[0] ?? "").contains("findings") and !(card.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
+  assert(message: quiet.text) { (quiet.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
+
+  # Whether each finding carries a fix, by majority; actionable and
+  # reasoned count as given. Votes without the field are unjudged.
+  assert(message: msg) { r.headline.fixGiven == {{hit: 0, total: 7, percent: 0}} }
+  assert(message: card.text) { card.text.contains(reviewerEvalRow("fix given", {{hit: 0, total: 7, percent: 0}}) + "   actionable 0 + reasoned 0; vague 0, missing 0") }
+  #   1: actionable x3                   -> actionable
+  #   2: reasoned reasoned vague         -> reasoned
+  #   3: vague x3                        -> vague
+  #   4: missing actionable reasoned     -> disputed
+  let fixReplies = [
+    ["actionable", "reasoned", "vague", "missing"],
+    ["actionable", "reasoned", "vague", "actionable"],
+    ["Actionable", "vague", "vague", "reasoned"],
+  ].map { xs =>
+    "{\"judgements\": [" + xs.map { x, j => JSON.encode({{finding: j + 1, match: "none", value: "guidance", alarmism: false, fix: x}}) }.join(", ") + "]}"
+  }
+  let fixCard = reviewerEvalScorecard(good, "canned", "x", ["one", "two", "three", "four"], fixReplies, reviewerEvalNoMeta)
+  let fc: {{
+    headline: {{fixGiven: {{hit: Int!, total: Int!, percent: Int!}}!}}!,
+    fixes: {{actionable: Int!, reasoned: Int!, vague: Int!, missing: Int!, disputed: Int!, unjudged: Int!}}!,
+    judged: [{{fix: String!, fixVotes: [String!]!}}!]!,
+  }}! = JSON.decode(fixCard.json)
+  let fmsg = fixCard.text + "\n" + fixCard.json
+  assert(message: fmsg) { fc.judged.map { f => f.fix } == ["actionable", "reasoned", "vague", "disputed"] }
+  assert(message: fmsg) { fc.headline.fixGiven == {{hit: 2, total: 4, percent: 50}} }
+  assert(message: fmsg) { fc.fixes == {{actionable: 1, reasoned: 1, vague: 1, missing: 0, disputed: 1, unjudged: 0}} }
+  assert(message: fmsg) { fixCard.text.contains("   actionable 1 + reasoned 1; vague 1, missing 0") and fixCard.text.contains("alarmist 0/3; fix reasoned\n") }
   # A judge that answers in prose leaves every finding unjudged.
   let prose: {{headline: {{valueScore: Int!, noise: Int!}}!, values: {{unjudged: Int!}}!}}! = JSON.decode(
     reviewerEvalScorecard(good, "canned", "x", ["one", "two"], ["I could not decide."], reviewerEvalNoMeta).json
