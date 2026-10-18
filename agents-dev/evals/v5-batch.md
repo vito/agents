@@ -13,6 +13,8 @@ check span, the judge's included (reviewer + judge).
 | dang-59 | v5-1 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1166 | 9.0 | 293 (289 + 4) |
 | dang-59 | v5-2 | +13 | 1 | 6 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 6/6 | 986 | 10.1 | 280 (276 + 4) |
 | dang-59 | v5-3 | +15 | 0 | 7 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 7/7 | 1180 | 8.5 | 344 (340 + 4) |
+| dang-55-shadowing | v5-1 | +9 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 5/5 | 935 | 8.5 | 239 |
+| dang-55-shadowing | v5-2 | +6 | 1 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 4/5 | 857 | 10.4 | 276 (272 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -68,6 +70,20 @@ No run failed for infrastructure reasons; none was retried.
   cannot tell file-local imports from leaking ones. Variable ordering
   matched lockstep-phases again. 7/7 unanimous, 14 voters, 2/2
   confirmed; phase-groups-by-index missed.
+- dang-55-shadowing v5-1 (b3930ee, before this batch): 2 guardrails and 3
+  guidance; constant-annotation-before-hoist (IMPORTANT 2/2, guardrail
+  3/3) and fragment-resolves-local-type lead as IMPORTANT, then three
+  concerns: the REPL's untracked imports, the bare-name type errors and
+  interface/union pass 0 reusing a local type of another kind. Its model
+  calls were counted without recording the judge's share.
+- dang-55-shadowing v5-2: constant-annotation-before-hoist leads as
+  IMPORTANT (2/3 votes, a tie-break), then three concerns: the REPL's
+  untracked imports (unmatched, guidance), the bare-name type errors
+  (guidance) and fragment-resolves-local-type (guardrail, a concern this
+  time). The noise is run 1's fifth finding, interface/union pass 0
+  reusing a local type, demoted to a fixless "Also raised, past the 3
+  strongest concerns" one-liner and judged false 3/3, as on dang-187 v5-1.
+  11 voters; 3/3 confirmed.
 
 ## Summary
 
