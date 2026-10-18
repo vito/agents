@@ -497,6 +497,7 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
 | dang-55-shadowing | v6-1 | +13 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 2/2 | 5/5 | 926 | 6.9 | 224 (220 + 4) |
 | dang-59 | v6-1 | +13 | 0 | 5 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 3/3 | 5/5 | 923 | 10.5 | 287 (283 + 4) |
 | dang-160-clean | v6-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 2/2 | 437 | 6.5 | 120 (116 + 4) |
+| agents-tools-version | v6-1 | +3 | 0 | 1 | 1/1 | continuations-bind-version-zero | - | 1/1 | 301 | 4.5 | 99 (95 + 4) |
 
 - dang-55-shadowing v6-1: 4 guardrails and 1 guidance, every finding
   unanimous 3/3. fragment-resolves-local-type leads as IMPORTANT (run 3
@@ -526,3 +527,9 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
   eval.go:869 was voted down 1/3. The verdict is milder than v5's ("don't
   round-trip cleanly yet. Fix eval.go:863 first"), with no "before
   merging" or "confirmed bugs". No concerns, no overflow. 7 voters.
+- agents-tools-version v6-1: as v5-1 and v5-3, the one IMPORTANT
+  finding, continuations-bind-version-zero (guardrail 3/3, the four call
+  sites 388, 818, 1453, 1477, all four finders' copies merged), and
+  nothing else; 2 voters. finder-design's probe, a check in its own copy
+  (repro-committer-version), failed to load (`"name" not found`), a
+  reviewer-side reproduction error that did not reach the review.
