@@ -9,6 +9,7 @@ check span, the judge's included (reviewer + judge).
 |---|---|---|---|---|---|---|---|---|---|---|
 | dang-187 | v5-1 | -4 | 4 | 6 | 2/12 | redundant-round-trips, docs-skill-graphql-laziness | 4/6 | 737 | 9.1 | 176 (172 + 4) |
 | dang-187 | v5-2 | +9 | 0 | 6 | 2/12 | fragment-nesting, docs-skill-graphql-laziness | 6/6 | 896 | 12.8 | 232 (228 + 4) |
+| dang-187 | v5-3 | +12 | 1 | 9 | 4/12 | fragment-nesting, redundant-round-trips, docs-skill-graphql-laziness, qualified-root-rescue | 9/9 | 1194 | 12.8 | 226 (222 + 4) |
 
 ## Run notes
 
@@ -26,3 +27,13 @@ check span, the judge's included (reviewer + judge).
   union finding is run 1's fixless "also raised" one-liner that scored
   false; with evidence and a fix it is a guardrail 3/3. 10 voters (13 in
   run 1); 3/7 confirmed.
+- dang-187 v5-3: 3 guardrails (the `User!` null fragment, the mutation
+  union `case`, fragment-nesting), 3 quick fixes (mutation narrowing docs,
+  qualified-root-rescue, skill laziness docs), redundant-round-trips as a
+  nit (guidance by its real label; the judge said speed bump 2/3),
+  error-path-node as a decision (neutral), and one speed bump: a lazy
+  fragment on an already concrete handle stacking a second fragment. The
+  mutation narrowing nit contradicts the unvetted sound item
+  mutation-sent-once (judged on its value, quick-fix); it is run 1's
+  second "also raised" one-liner, false there. 14 voters; one nit over
+  the cap of 5 not reported. 3/7 confirmed.
