@@ -31,8 +31,8 @@
 # durable half — markdown + front matter under context/, verification
 # (anchors/asserts/drift) and its CI checks — is not here; `promote` is the
 # bridge, landing a Block in the workspace changeset for review. resolve()
-# is not here either, because it is composition: delegate the noisy legwork
-# to modules/delegate, then blockWrite only the distilled answer.
+# is not here either, because it is composition: hand the noisy legwork to
+# a staff worker, then blockWrite only the distilled answer.
 #
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build

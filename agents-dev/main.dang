@@ -91,7 +91,7 @@ type AgentsDev {
     null
   }
 
-  """Check a worker's live roster sees later hires, resolves addresses, and reaches the escape hatches."""
+  """Check a worker's live roster sees later hires, resolves addresses, and reaches the escape hatches, all derived from `me`."""
   staffPeers(source: Workspace!): Void @check {
     print(testStaffPeers(source: source))
     null
@@ -103,9 +103,27 @@ type AgentsDev {
     null
   }
 
-  """Check retained-origin composition after checkout, without model calls."""
-  staffComposition: Void @check {
-    print(testStaffComposition)
+  """Check the worker role: worker tools without chief tools, its name and parent, reload, and explicit promotion."""
+  staffWorker(source: Workspace!): Void @check {
+    print(testStaffWorker(source: source))
+    null
+  }
+
+  """Check workers inherit the chief's recorded composition, including later installs, without model calls."""
+  staffComposition(source: Workspace!): Void @check {
+    print(testStaffComposition(source: source))
+    null
+  }
+
+  """Check a worker's checkout of a repository installing staff keeps it a worker, takes the target's versions of recorded modules, and composes the target's new agents."""
+  staffCheckout(source: Workspace!): Void @check {
+    print(testStaffCheckout(source: source))
+    null
+  }
+
+  """Check the worker role is found through the chief's own staff entry after the chief checks out a repository without staff, and survives reload there."""
+  staffRoleWithoutStaff(source: Workspace!): Void @check {
+    print(testStaffRoleWithoutStaff(source: source))
     null
   }
 
