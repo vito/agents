@@ -176,15 +176,28 @@ let parseExtraction(reply: String!): [String!]! {
   if (listed == null) {
     raise "no `findings` list"
   }
+  let decisions = decodeDecisions(jsonBody(reply)) rescue { e: Error => [] :: [Boolean!]! }
   listed
-    .filter { f => (f.text ?? "").trimSpace != "" }
-    .map { f =>
+    .map { f, i =>
       let framing = (f.framing ?? "").trimSpace
       let text = (f.text ?? "").trimSpace
       let fix = (f.fix ?? "").trimSpace
       let said = if (fix == "") { " Suggested fix: (none given)." } else { " Suggested fix: " + fix }
-      (if (framing == "") { text } else { "[" + framing + "] " + text }) + said
+      # The scorecard reads "[decision to record; ...]" as a finding the
+      # review files as a decision rather than a defect.
+      let framed = if ((decisions[i] ?? false) and !framing.containsMatch(`(?i)\bdecisions? to record\b`)) {
+        if (framing == "") { "decision to record" } else { "decision to record; " + framing }
+      } else {
+        framing
+      }
+      if (text == "") { "" } else { (if (framed == "") { text } else { "[" + framed + "] " + text }) + said }
     }
+    .filter { t => t != "" }
+}
+
+let decodeDecisions(body: String!): [Boolean!]! {
+  let p: {{findings: [{{decision: Boolean}}!]}}! = JSON.decode(body)
+  (p.findings ?? []).map { f => f.decision ?? false }
 }
 
 # A JSON object in a reply, possibly inside a ```json fence or prose.
@@ -233,9 +246,12 @@ let extractPrompt: String! = """
     most two sentences: a change to make, a decision to record and where,
     or its stated reason for having no clear fix. "" when it suggests
     nothing. Do not invent one.
+  - decision: true when the review files it as a decision to record (a
+    defensible choice to write down, e.g. under "Decisions to record")
+    rather than as a defect to fix; otherwise false.
 
   Reply with ONLY one JSON object, no prose around it:
-  {"findings": [{"id": 1, "framing": "...", "text": "...", "fix": "..."}]}
+  {"findings": [{"id": 1, "framing": "...", "text": "...", "fix": "...", "decision": false}]}
   Reply {"findings": []} when the review reports nothing.
 """
 

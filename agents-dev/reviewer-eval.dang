@@ -49,8 +49,11 @@
 # majority); an unparseable or unknown answer is "unjudged". The
 # deterministic half is here: the majorities, then mechanical overrides (a
 # later finding on an already matched issue is a duplicate; one matching an
-# issue vetted "dismiss" is a speed bump, and one matching an issue vetted
-# "real" is at least guidance), the arithmetic and the scorecard.
+# issue vetted "dismiss" is a speed bump, unless the review raises it as a
+# decision to record, which is the outcome the author agreed with and
+# scores 0, counted apart as "dismissed, raised as decision"; one matching
+# an issue vetted "real" is at least guidance), the arithmetic and the
+# scorecard.
 #
 # A finding matching a sound item is a sound contradiction, listed on its
 # own. Sound items come from earlier reviews too, and a finding with a
@@ -124,6 +127,9 @@ let reviewerEvalValueWeights: [{{name: String!, weight: Int!}}!]! = [
   {{name: "speed-bump", weight: -1}},
   {{name: "false", weight: -2}},
   {{name: "duplicate", weight: -1}},
+  # Set by the scorer, never the judge: an issue the author vetted dismiss,
+  # raised as a decision to record.
+  {{name: "dismissed-decision", weight: 0}},
   {{name: "disputed", weight: 0}},
   {{name: "unjudged", weight: 0}},
 ]
@@ -599,6 +605,13 @@ let reviewerEvalWords(text: String!): Int! {
   text.splitMatches(`\s+`).filter { w => w != "" }.length
 }
 
+# Whether the review files a finding as a decision to record rather than a
+# defect: the judge's extraction frames it "[decision to record; ...]",
+# or its framing names the review's decisions section.
+let reviewerEvalRaisedAsDecision(text: String!): Boolean! {
+  text.containsMatch(`(?i)^\[[^\]]*\bdecisions? to record\b`)
+}
+
 # The scorecard: every finding's majorities and overrides, then
 # deterministic arithmetic over the case. `replies` are the judge samples'
 # raw replies; `review` is the review's text, for its length.
@@ -624,6 +637,9 @@ let reviewerEvalScorecard(
   # Findings matched to a sound item, reported on their own: the item's
   # vetting, the judge's majority value and the value scored.
   let contradictions: [{{finding: Int!, key: String!, vetted: String!, judged: String!, value: String!}}!]! = []
+  # Issues vetted dismiss whose first match the review raised as a
+  # decision to record.
+  let asDecision: [String!]! = []
   findings.each { text, i =>
     let votes = samples.map { s => s[i] ?? reviewerEvalUnjudged }
     let matchVotes = votes.map { v => v.match }
@@ -661,7 +677,13 @@ let reviewerEvalScorecard(
       note = o.note
     } else if (isIssue) {
       let vetted = reviewerEvalVettedOf(c, match)
-      if (vetted == "dismiss" and value != "speed-bump" and value != "false") {
+      if (vetted == "dismiss" and reviewerEvalRaisedAsDecision(text)) {
+        # The author dismissed it as intended; asking to record that
+        # decision is the outcome they agree with, so it costs nothing.
+        value = "dismissed-decision"
+        note = "its issue is vetted dismiss, raised as a decision to record: neutral"
+        asDecision += [match]
+      } else if (vetted == "dismiss" and value != "speed-bump" and value != "false") {
         value = "speed-bump"
         note = "its issue is vetted dismiss"
       } else if (vetted == "real" and value != "guardrail" and value != "guidance" and value != "quick-fix") {
@@ -715,7 +737,8 @@ let reviewerEvalScorecard(
       words: words,
       confirmedRecall: reviewerEvalRatio(confirmed.filter { i => matched.contains(i.key) }.length, confirmed.length),
       vettedRealRecall: reviewerEvalRatio(vettedReal.filter { i => matched.contains(i.key) }.length, vettedReal.length),
-      vettedDismissRaised: reviewerEvalRatio(vettedDismiss.filter { i => matched.contains(i.key) }.length, vettedDismiss.length),
+      vettedDismissRaised: reviewerEvalRatio(vettedDismiss.filter { i => matched.contains(i.key) and !asDecision.contains(i.key) }.length, vettedDismiss.length),
+      vettedDismissAsDecision: reviewerEvalRatio(vettedDismiss.filter { i => asDecision.contains(i.key) }.length, vettedDismiss.length),
       fixGiven: reviewerEvalRatio(fixGiven, judged.length),
     }},
     fixes: {{
@@ -733,6 +756,7 @@ let reviewerEvalScorecard(
       speedBump: speedBumps,
       falseFinding: falses,
       duplicate: reviewerEvalCount(values, "duplicate"),
+      dismissedDecision: reviewerEvalCount(values, "dismissed-decision"),
       disputed: reviewerEvalCount(values, "disputed"),
       unjudged: reviewerEvalCount(values, "unjudged"),
     }},
@@ -783,14 +807,18 @@ let reviewerEvalScorecard(
       `   actionable ${toString(card.fixes.actionable)} + reasoned ${toString(card.fixes.reasoned)}; vague ${toString(card.fixes.vague)}, missing ${toString(card.fixes.missing)}`,
   ]
   if (!vettedDismiss.isEmpty) {
-    lines += [reviewerEvalRow("dismissed raised", card.headline.vettedDismissRaised) + "   lower is better"]
+    lines += [
+      reviewerEvalRow("dismissed raised", card.headline.vettedDismissRaised) + "   lower is better",
+      reviewerEvalRow("dismissed, raised as decision", card.headline.vettedDismissAsDecision) + "   scored 0: the author's call, to record",
+    ]
   }
   let missedConfirmed = card.missedConfirmed
   lines += [
     "",
     `values: guardrail ${toString(card.values.guardrail)}, guidance ${toString(card.values.guidance)}, ` +
       `quick-fix ${toString(card.values.quickFix)}, speed-bump ${toString(speedBumps)}, false ${toString(falses)}, ` +
-      `duplicate ${toString(card.values.duplicate)}, disputed ${toString(card.values.disputed)}, unjudged ${toString(card.values.unjudged)}`,
+      `duplicate ${toString(card.values.duplicate)}, disputed ${toString(card.values.disputed)}, unjudged ${toString(card.values.unjudged)}` +
+      (if (card.values.dismissedDecision == 0) { "" } else { `, dismissed-decision ${toString(card.values.dismissedDecision)}` }),
     "sound contradictions: " + (if (contradictions.isEmpty) { "(none)" } else {
       contradictions.map { s =>
         let scored = if (s.value == s.judged) { s.value } else { s.judged + " -> " + s.value }
@@ -1108,6 +1136,36 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   # A speed bump against an unvetted sound item counts as false.
   let bump = reviewerEvalScorecard(good, "canned", "x", ["one"], ["{\"judgements\": [" + reviewerEvalVote(1, "s", "speed-bump", false) + "]}"], reviewerEvalNoMeta)
   assert(message: bump.text) { bump.text.contains("#1 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
+
+  # A dismissed issue raised as a decision to record scores 0 and is
+  # counted apart; raised as a defect it stays a speed bump. A later
+  # finding on it is still a duplicate.
+  #   1: b/guidance x3, framed a decision          -> dismissed-decision, 0
+  #   2: b/guardrail x3                            -> b again: duplicate
+  let decided = reviewerEvalScorecard(good, "canned", "x", ["[decision to record; 2/2 votes] b is a choice to write down", "[nit] b breaks"], [1, 2, 3].map { k =>
+    "{\"judgements\": [" + reviewerEvalVote(1, "b", "guidance", false) + ", " + reviewerEvalVote(2, "b", "guardrail", false) + "]}"
+  }, reviewerEvalNoMeta)
+  let dc: {{
+    headline: {{valueScore: Int!, noise: Int!, speedBumps: Int!, vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!, vettedDismissAsDecision: {{hit: Int!, total: Int!, percent: Int!}}!}}!,
+    values: {{dismissedDecision: Int!, duplicate: Int!}}!,
+    judged: [{{value: String!, match: String!}}!]!,
+  }}! = JSON.decode(decided.json)
+  let dmsg = decided.text + "\n" + decided.json
+  assert(message: dmsg) { dc.judged.map { f => f.value } == ["dismissed-decision", "duplicate"] and dc.judged.map { f => f.match } == ["b", "b"] }
+  assert(message: dmsg) { dc.headline.valueScore == -1 and dc.headline.noise == 0 and dc.headline.speedBumps == 0 }
+  assert(message: dmsg) { dc.values == {{dismissedDecision: 1, duplicate: 1}} }
+  assert(message: dmsg) { dc.headline.vettedDismissRaised == {{hit: 0, total: 1, percent: 0}} and dc.headline.vettedDismissAsDecision == {{hit: 1, total: 1, percent: 100}} }
+  assert(message: dmsg) { decided.text.contains("#1 dismissed-decision · b (its issue is vetted dismiss, raised as a decision to record: neutral)") }
+  assert(message: dmsg) { decided.text.contains(reviewerEvalRow("dismissed, raised as decision", {{hit: 1, total: 1, percent: 100}})) and decided.text.contains(reviewerEvalRow("dismissed raised", {{hit: 0, total: 1, percent: 0}})) }
+  # The review's own section heading in the framing counts too; a defect
+  # framing, or "decision" alone, does not.
+  assert { reviewerEvalRaisedAsDecision("[DECISIONS TO RECORD, 2/3 votes] x") and reviewerEvalRaisedAsDecision("[Decision to record] x") }
+  assert { !reviewerEvalRaisedAsDecision("[CONCERN] a decision to record is missing") and !reviewerEvalRaisedAsDecision("[a design decision] x") and !reviewerEvalRaisedAsDecision("x [decision to record]") }
+  let defect: {{headline: {{valueScore: Int!, speedBumps: Int!, vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!, vettedDismissAsDecision: {{hit: Int!, total: Int!, percent: Int!}}!}}!}}! = JSON.decode(
+    reviewerEvalScorecard(good, "canned", "x", ["[CONCERN] b breaks"], ["{\"judgements\": [" + reviewerEvalVote(1, "b", "guidance", false) + "]}"], reviewerEvalNoMeta).json
+  )
+  assert(message: JSON.encode(defect)) { defect.headline.valueScore == -1 and defect.headline.speedBumps == 1 }
+  assert(message: JSON.encode(defect)) { defect.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} and defect.headline.vettedDismissAsDecision == {{hit: 0, total: 1, percent: 0}} }
   # The judge sees the case without the sound items vetted dismiss.
   let judgeCase: {{title: String!, issues: [{{key: String!}}!]!, sound: [{{key: String!}}!]!}}! = JSON.decode(reviewerEvalJudgeCase(good))
   assert(message: JSON.encode(judgeCase)) {
