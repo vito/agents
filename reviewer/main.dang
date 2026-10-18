@@ -509,8 +509,8 @@ type Reviewer {
   as are style-only ones; findings describing the same problem are merged;
   independent voters must confirm the rest is real and worth the author's
   time. Prints a summary: a short verdict, then the findings by severity
-  (IMPORTANT bugs and regressions; at most three CONCERNs, design
-  questions, with any others mentioned in one line each; NITs, quick
+  (IMPORTANT bugs and regressions; at most three CONCERNs in full, design
+  questions, with any others as a claim and a fix each; NITs, quick
   fixes; PRE-EXISTING), each as path:line, claim, why it is worth the
   time, evidence, a suggested fix (or why there is none), votes and
   fingerprint, then decisions to record (defensible choices to write down
