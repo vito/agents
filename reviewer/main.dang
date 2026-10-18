@@ -1106,7 +1106,7 @@ let angleBrief(angle: String!): String! {
     "design" => "design and claims: the assumptions the approach rests on (about inputs, other systems, environments, ordering, callers) that a realistic case breaks; whether it fits the rest of the system and its conventions; inconsistencies between parts of the change; and the claims in the briefing, commit messages, comments and docs, checked against what the code actually does, including docs the change leaves out of date"
     "correctness" => "correctness: logic errors, wrong results, broken invariants, empty, missing and boundary inputs, the new behavior combined with the existing features it touches (nested, chained, repeated, several at once), error paths that lose or corrupt data, fixes that treat a symptom instead of the cause, and tests that do not actually exercise the changed behavior"
     "security" => "security: injection, untrusted input reaching commands, paths, queries or templates, secrets and tokens leaking into logs, layers or output, missing authorization checks, and unsafe defaults"
-    else => "everything: bugs and regressions you can reproduce, the new behavior combined with the existing features it touches (nested, chained, repeated, several at once), security holes, behavior that changed from the merge base, inconsistencies, claims in the briefing, commits or docs that do not hold, and docs the change leaves out of date"
+    else => "everything: bugs and regressions you can reproduce, the new behavior combined with the existing features it touches (nested, chained, repeated, several at once) and with its inputs in another order (declared, imported or called before or after what they depend on), security holes, behavior that changed from the merge base, inconsistencies, claims in the briefing, commits or docs that do not hold, and docs the change leaves out of date"
   }
 }
 
@@ -2565,10 +2565,10 @@ let finderPrompt: String! = """
   consequences those sources do not state are fair game.
 
   EVERY FINDING HAS A SUGGESTED FIX. In "fix", a concrete sketch: what to
-  change, where, roughly how, in at most two sentences ("in cache.go key
-  the entry on (path, locale), and add a two-locale test"). When there is
+  change, where, roughly how, under 35 words ("in cache.go key the entry
+  on (path, locale), and add a two-locale test"). When there is
   no clear fix, leave "fix" out and give "noClearFix" instead, with a
-  "kind" and a "why":
+  "kind" and a "why" (under 35 words):
   - "foundational": the approach itself is at risk; say why it is a
     one-way door and what to reconsider before merging.
   - "decision": the behavior is a defensible choice, not a defect, that
@@ -2737,7 +2737,8 @@ let voterPrompt: String! = """
 
   THE FIX: "plausible" when the finder's fix (or its reason for having
   none) would work and fits the code; "implausible" when it would not,
-  with your own sketch in "betterFix" if you have one; "decision" as
+  with your own sketch in "betterFix" (under 35 words) if you have one;
+  "decision" as
   above. A finding with no fix gets your sketch in "betterFix" if you see
   one.
 
