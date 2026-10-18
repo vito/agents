@@ -589,11 +589,12 @@ let reviewerEvalSoundOverride(vetted: String!, value: String!): {{value: String!
   }
 }
 
-# One scorecard row: name, hit/total, percent.
+# One scorecard row: name, hit/total, percent. A name of 20 characters or
+# more still gets a space before the numbers.
 let reviewerEvalRow(name: String!, r: {{hit: Int!, total: Int!, percent: Int!}}!): String! {
   let frac = `${toString(r.hit)}/${toString(r.total)}`
   let pct = if (r.total == 0) { "-" } else { toString(r.percent) + "%" }
-  name.padRight(20) + frac.padRight(8) + pct.padLeft(5)
+  name.padRight(19) + " " + frac.padRight(8) + pct.padLeft(5)
 }
 
 # One scorecard row: name, a number, a note.
@@ -1157,6 +1158,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert(message: dmsg) { dc.headline.vettedDismissRaised == {{hit: 0, total: 1, percent: 0}} and dc.headline.vettedDismissAsDecision == {{hit: 1, total: 1, percent: 100}} }
   assert(message: dmsg) { decided.text.contains("#1 dismissed-decision · b (its issue is vetted dismiss, raised as a decision to record: neutral)") }
   assert(message: dmsg) { decided.text.contains(reviewerEvalRow("dismissed, raised as decision", {{hit: 1, total: 1, percent: 100}})) and decided.text.contains(reviewerEvalRow("dismissed raised", {{hit: 0, total: 1, percent: 0}})) }
+  assert(message: dmsg) { decided.text.contains("\ndismissed, raised as decision 1/1      100%") and decided.text.contains("\ndismissed raised    0/1        0%") }
   # The review's own section heading in the framing counts too; a defect
   # framing, or "decision" alone, does not.
   assert { reviewerEvalRaisedAsDecision("[DECISIONS TO RECORD, 2/3 votes] x") and reviewerEvalRaisedAsDecision("[Decision to record] x") }
