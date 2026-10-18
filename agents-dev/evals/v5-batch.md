@@ -484,3 +484,27 @@ finder probe was a top-level `TestRepro…` (voters still ran TestDang 3
 times), the slowest finder took 8m24 (design) and the review 11.4 min.
 One run is not a trend: the rest of the tail is model time, which varies
 run to run, and v6-2 made more model calls than any v5 dang-187 run (253).
+
+## v6: the other four cases
+
+One live STANDARD run each at 43b2484 (bf98c01 and 0a0e226 in), one at
+a time, judge 3 samples, scored as above, to check v6 regressed none of
+the cases it was not tried on. Model calls: reviewer + judge, the judge's
+4 counted from its own LLM loop under the eval span.
+
+| case | run | value | noise | findings | vetted-real | vetted-real hit | claimed hit | fix given | words | review min | model calls |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| dang-55-shadowing | v6-1 | +13 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 2/2 | 5/5 | 926 | 6.9 | 224 (220 + 4) |
+
+- dang-55-shadowing v6-1: 4 guardrails and 1 guidance, every finding
+  unanimous 3/3. fragment-resolves-local-type leads as IMPORTANT (run 3
+  of v5 missed it), then three concerns: repl-imports-untracked,
+  constant-annotation-before-hoist and indistinguishable-type-errors (the
+  guidance, asked as a question). The fourth concern,
+  interface-union-redeclare-merges, went past the cap: the first live run
+  of the overflow rendering. It kept its whole claim and its fix (no stake,
+  quote or fingerprint, as designed) and scored a guardrail 3/3 with an
+  actionable fix, where v5-2's one-liner of the same finding scored false.
+  The header counts the three concerns in full ("1 important, 3
+  concerns"), as reviewerConcerns expects. 10 voters, all 2/2; one finding
+  dropped by the evidence checks (a golden-file quote).
