@@ -21,6 +21,7 @@ check span, the judge's included (reviewer + judge).
 | dang-160-clean | v5-3 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 470 | 4.9 | 138 (134 + 4) |
 | agents-tools-version | v5-1 | +3 | 0 | 1 | 1/1 | continuations-bind-version-zero | 1/1 | 285 | 4.1 | 106 (102 + 4) |
 | agents-tools-version | v5-2 | +2 | 0 | 2 | 1/1 | continuations-bind-version-zero | 2/2 | 380 | 4.7 | 118 (114 + 4) |
+| agents-tools-version | v5-3 | +3 | 0 | 1 | 1/1 | continuations-bind-version-zero | 1/1 | 294 | 4.1 | 106 (102 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -143,6 +144,10 @@ No run failed for infrastructure reasons; none was retried.
   the same issue 3/3 (quick-fix each time), so it scores a duplicate (-1,
   not noise); its fix is the same shared `stateVersion` the IMPORTANT
   item already asks for. 3 voters.
+- agents-tools-version v5-3: as run 1, the one IMPORTANT finding
+  (guardrail 3/3, the four call sites, all four finders' copies merged).
+  A second finding citing staff/main.dang:67, Staff's own versioned
+  binding, failed its vote 0/2; 4 voters.
 
 ## Summary
 
