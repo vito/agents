@@ -495,6 +495,7 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
 | case | run | value | noise | findings | vetted-real | vetted-real hit | claimed hit | fix given | words | review min | model calls |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | dang-55-shadowing | v6-1 | +13 | 0 | 5 | 3/3 | fragment-resolves-local-type, constant-annotation-before-hoist, indistinguishable-type-errors | 2/2 | 5/5 | 926 | 6.9 | 224 (220 + 4) |
+| dang-59 | v6-1 | +13 | 0 | 5 | 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 3/3 | 5/5 | 923 | 10.5 | 287 (283 + 4) |
 
 - dang-55-shadowing v6-1: 4 guardrails and 1 guidance, every finding
   unanimous 3/3. fragment-resolves-local-type leads as IMPORTANT (run 3
@@ -508,3 +509,11 @@ the cases it was not tried on. Model calls: reviewer + judge, the judge's
   The header counts the three concerns in full ("1 important, 3
   concerns"), as reviewerConcerns expects. 10 voters, all 2/2; one finding
   dropped by the evidence checks (a golden-file quote).
+- dang-59 v6-1: 4 guardrails and 1 guidance, all unanimous 3/3, no
+  noise. Three IMPORTANT (schema-module-per-file,
+  focused-inference-skips-sibling-variables, variables-ordered-per-file)
+  and two concerns (shared-mutable-parse-cache, the guidance;
+  imports-shared-at-runtime, a guardrail as a concern). The same five
+  problems as v5, without the schema-env-rebuilt concern that cost v5-1
+  its duplicate or the RunFile/RunDir alias item. phase-groups-by-index
+  missed again. Two concerns, no overflow. 10 voters, all 2/2.
