@@ -19,6 +19,7 @@ check span, the judge's included (reviewer + judge).
 | dang-160-clean | v5-1 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 439 | 4.9 | 122 (118 + 4) |
 | dang-160-clean | v5-2 | +7 | 0 | 3 | - | (none vetted real) | 3/3 | 544 | 4.9 | 103 (99 + 4) |
 | dang-160-clean | v5-3 | +6 | 0 | 2 | - | (none vetted real) | 2/2 | 470 | 4.9 | 138 (134 + 4) |
+| agents-tools-version | v5-1 | +3 | 0 | 1 | 1/1 | continuations-bind-version-zero | 1/1 | 285 | 4.1 | 106 (102 + 4) |
 
 No run failed for infrastructure reasons; none was retried.
 
@@ -129,6 +130,10 @@ No run failed for infrastructure reasons; none was retried.
   2` gives 1). Both are labelled "confirmed bug", and the verdict says
   "two confirmed bugs need fixing before merge". The MapValue finding
   came back as unescaped map keys, a concern, and failed its vote 0/2.
+- agents-tools-version v5-1: one finding, continuations-bind-version-zero,
+  IMPORTANT 2/2, guardrail 3/3, naming all four call sites (388, 818,
+  1453, 1477). All four finders reported it; the triage merged them.
+  Nothing else raised; 2 voters.
 
 ## Summary
 
