@@ -5,6 +5,10 @@ ballots), three live runs per case at STANDARD, one at a time, judge 3
 samples. Model calls: `LLM HTTP POST /v1/messages` spans under the eval's
 check span, the judge's included (reviewer + judge).
 
+The table and notes below are as first scored. "Rescored" near the end
+scores the same saved reviews again under the later scorer and cases, and
+"v6" adds two runs after the fixes.
+
 | case | run | value | noise | findings | vetted-real | vetted-real hit | fix given | words | review min | model calls |
 |---|---|---|---|---|---|---|---|---|---|---|
 | dang-187 | v5-1 | -4 | 4 | 6 | 2/12 | redundant-round-trips, docs-skill-graphql-laziness | 4/6 | 737 | 9.1 | 176 (172 + 4) |
@@ -338,3 +342,145 @@ against 876 and 368), at about 5 min and 121 calls.
 No speed bumps or false findings. With one issue the ceiling is +3,
 reached in runs 1 and 3; the review is about half v2's length (320 words
 against 607) and faster (4.3 min against 7.3).
+
+## Rescored
+
+The same 15 saved reviews (run-v5-*-standard.md), judged again with no
+new review: judge only, 3 samples, 4 model calls each. Two things changed
+since the first scoring, and both are in these numbers:
+
+- the scorer (790225e): a finding can cover several issue keys ("also"),
+  each with the part of the finding that covers it, which must be in the
+  finding's text, on a strict majority of samples; recall counts every key
+  covered, value counts the finding once;
+- the cases (412c756): eight recurring findings are now claimed, unvetted
+  issues (mutation-union-case-fails, nonnull-fragment-on-null;
+  schema-module-per-file, variables-ordered-per-file,
+  shared-mutable-parse-cache; repl-imports-untracked,
+  interface-union-redeclare-merges; fragment-leaf-float-as-int).
+
+"claimed hit" counts those new issues found. Judge variance also moves a
+few findings by itself (noted where it does).
+
+| case | run | value (first → rescored) | noise | vetted-real | vetted-real hit, rescored | claimed hit | fix given |
+|---|---|---|---|---|---|---|---|
+| dang-187 | v5-1 | -4 → +2 | 4 → 2 | 2/12 → 4/12 | redundant-round-trips, docs-interop-laziness, docs-skill-graphql-laziness, docs-skill-mutation-laziness | 1/2 | 4/6 |
+| dang-187 | v5-2 | +9 → +11 | 0 → 0 | 2/12 → 5/12 | fragment-nesting, docs-interop-laziness, docs-skill-graphql-laziness, docs-skill-mutation-laziness, docs-skill-execution-points | 2/2 | 6/6 |
+| dang-187 | v5-3 | +12 → +12 | 1 → 1 | 4/12 → 5/12 | fragment-nesting, redundant-round-trips, docs-skill-graphql-laziness, docs-skill-execution-points, qualified-root-rescue | 2/2 | 9/9 |
+| dang-59 | v5-1 | +15 → +13 | 0 → 0 | 2/3 → 2/3 | imports-shared-at-runtime, focused-inference-skips-sibling-variables | 3/3 | 7/7 |
+| dang-59 | v5-2 | +13 → +15 | 1 → 1 | 2/3 → 2/3 | (same) | 3/3 | 6/6 |
+| dang-59 | v5-3 | +15 → +15 | 0 → 0 | 2/3 → 2/3 | (same) | 3/3 | 7/7 |
+| dang-55-shadowing | v5-1 | +9 → +13 | 0 → 0 | 3/3 → 3/3 | (all three) | 2/2 | 5/5 |
+| dang-55-shadowing | v5-2 | +6 → +8 | 1 → 1 | 3/3 → 3/3 | (all three) | 2/2 | 4/5 |
+| dang-55-shadowing | v5-3 | +10 → +10 | 0 → 0 | 2/3 → 2/3 | constant-annotation-before-hoist, indistinguishable-type-errors | 2/2 | 4/4 |
+| dang-160-clean | v5-1 | +6 → +6 | 0 → 0 | - | (none vetted real) | 2/2 | 2/2 |
+| dang-160-clean | v5-2 | +7 → +7 | 0 → 0 | - | (none vetted real) | 2/2 | 3/3 |
+| dang-160-clean | v5-3 | +6 → +6 | 0 → 0 | - | (none vetted real) | 2/2 | 2/2 |
+| agents-tools-version | v5-1 | +3 → +3 | 0 → 0 | 1/1 → 1/1 | continuations-bind-version-zero | - | 1/1 |
+| agents-tools-version | v5-2 | +2 → +4 | 0 → 0 | 1/1 → 1/1 | continuations-bind-version-zero | - | 2/2 |
+| agents-tools-version | v5-3 | +3 → +3 | 0 → 0 | 1/1 → 1/1 | continuations-bind-version-zero | - | 1/1 |
+
+| case | value mean, first → rescored | noise mean | vetted-real mean |
+|---|---|---|---|
+| dang-187 | +5.7 → +8.3 | 1.7 → 1.0 | 2.7/12 → 4.7/12 (22% → 39%) |
+| dang-59 | +14.3 → +14.3 | 0.3 → 0.3 | 2/3 → 2/3 |
+| dang-55-shadowing | +8.3 → +10.3 | 0.3 → 0.3 | 2.7/3 → 2.7/3 |
+| dang-160-clean | +6.3 → +6.3 | 0 → 0 | - |
+| agents-tools-version | +2.7 → +3.3 | 0 → 0 | 1/1 → 1/1 |
+
+What moved:
+
+- dang-187 recall: the skill-docs nit now also covers
+  docs-interop-laziness and docs-skill-mutation-laziness (runs 1 and 2)
+  and docs-skill-execution-points (runs 2 and 3), as the first scoring's
+  notes said it did. No finding got an "also" key it does not name.
+- dang-187 v5-1 (-4 → +2): its two fixless "Also raised" one-liners scored
+  false (-4) as unmatched findings; now the first matches
+  mutation-union-case-fails and scores a guardrail even fixless, and the
+  second (the mutation narrowing advice) a duplicate of it (-1). The
+  rendering is still what costs: in full, the second scored a quick fix
+  in run 3.
+- dang-187 v5-2: the `User!` null fragment is a guardrail now
+  (nonnull-fragment-on-null; guidance unmatched before).
+- dang-59 v5-1 (+15 → +13): the concern that the schema env is rebuilt per
+  file now matches schema-module-per-file, whose summary names that cost,
+  so it is a duplicate of the IMPORTANT item (-2). Same mechanism, same
+  fix; the case summary is the cause, not the review.
+- dang-59 v5-2 (+13 → +15): judge variance: the extraction split the
+  runtime-imports item again, but the split-off sentence (the stale RunDir
+  comment) scored a quick fix, alarmist (0) instead of a duplicate (-2).
+- dang-55 v5-1 (+9 → +13): the REPL and interface/union concerns match
+  their new issues and score guardrails (guidance before).
+- dang-55 v5-2 (+6 → +8): the REPL concern a guardrail now; the fixless
+  interface/union one-liner still scores false (matched, fix missing).
+- agents-tools-version v5-2 (+2 → +4): judge variance: the comment nit is
+  no longer matched to the issue (a duplicate before), so it is a quick
+  fix.
+- variables-ordered-per-file now takes the matches that went to the sound
+  item lockstep-phases: no dang-59 run has a sound contradiction now.
+
+## v6: dang-187 after the fixes
+
+Two live STANDARD runs, one at a time, judge 3 samples, scored under the
+rescoring's scorer and cases. Run 1 is bf98c01 (overflow concerns keep
+their claim and fix; a reproduced concern outranks an argued one at equal
+votes); run 2 adds 0a0e226 (probes outside suite runners, see Speed).
+Model calls: reviewer + judge, the judge's 4 counted from its own span.
+
+| case | run | value | noise | findings | vetted-real | vetted-real hit | claimed hit | fix given | words | review min | model calls |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| dang-187 | v6-1 | +9 | 1 | 7 | 4/12 | redundant-round-trips, docs-interop-laziness, docs-skill-graphql-laziness, docs-skill-mutation-laziness | 2/2 | 7/7 | 975 | 21.0 | 201 (197 + 4) |
+| dang-187 | v6-2 | +10 | 0 | 6 | 6/12 | fragment-nesting, nullable-list-inconsistency, docs-interop-laziness, docs-skill-graphql-laziness, docs-skill-execution-points, qualified-root-rescue | 1/2 | 6/6 | 917 | 11.4 | 257 (253 + 4) |
+
+(v6-1's commit message, 4e76be3, says 197 (193 + 4); the 197 are the
+reviewer's alone.)
+
+- v6-1: 2 guardrails (nonnull-fragment-on-null IMPORTANT,
+  mutation-union-case-fails as a concern), 3 guidance
+  (redundant-round-trips, by its real label; the mutation narrowing
+  advice, matched to the unvetted sound item mutation-sent-once and judged
+  on its value; a rescue-analysis warning lost when a parameter is named
+  like a root field, unmatched), 1 quick fix (the skill-docs nit, covering
+  three docs keys), and one speed bump: error-path-node raised as a
+  concern (vetted dismiss). fragment-nesting is missed: nothing at
+  eval.go:962/1287 reached the review, the merges or the drops. Exactly
+  three concerns, so no overflow. 16 voters.
+- v6-2: no noise. 2 guardrails (nonnull-fragment-on-null, fragment-nesting),
+  3 guidance (qualified-root-rescue, as a false rescue warning on
+  `maybeUser(id:)` and the qualified form; nullable-list-inconsistency, the
+  first run of any version to raise it; the mutation trade-off, unmatched),
+  1 quick fix (the docs nit, covering three docs keys). The mutation
+  concern cites ast_patterns.go:444 but argues the docs' trade-off, so
+  mutation-union-case-fails is not credited. error-path-node was voted
+  down 1/3. Two concerns, no overflow. 16 voters.
+
+Against the rescored v5 runs: +9 and +10 against +2, +11, +12 (mean +9.5
+against +8.3), noise 0.5 against 1.0, vetted-real 5/12 against 4.7/12,
+fix given 13/13 against 19/21. Neither run had more than three concerns,
+so the overflow rendering was not exercised live; reviewerConcerns and
+reviewerTriage cover it on canned replies.
+
+### Speed
+
+v5's two 12.8-minute runs (ReadTrace timings on v5-2 and v5-3's eval
+spans): the review waits for the slowest finder, then the slowest voter.
+
+- v5-1 (9.1 min): slowest finder 7m14 (behavior), voters about 1m15.
+- v5-2 (12.8 min): slowest finder 9m45 (behavior, 52 model calls), the
+  others 3m15 to 7m36; voters 10m06 to 12m31 (slowest 2m22).
+- v5-3 (12.8 min): slowest finder 8m45 (general-2), the others 4m47 to
+  6m20; the slowest voter took 3m21 over 27 turns, a TestDang run to
+  reproduce its finding and two 30-second FindSpans calls among them.
+
+v6-1 (21.0 min) showed the cause plainly: finder-behavior took 18m15. It
+wrote its probes as `func (DangSuite) TestReproProbes`, a suite method
+that runs under TestDang, so each of its five check runs selected
+`go-test=TestDang` and ran all ~775 cases: 1.5 to 6.5 minutes a run, about
+11 minutes in all. In v5-2 the same finder wrote a top-level
+`TestReproProbe`, and each run took 6 seconds. The prompts said to run the
+narrowest test, but not that a case inside a suite runner is never
+narrow. 0a0e226 says so in the finder and voter prompts. In v6-2 every
+finder probe was a top-level `TestRepro…` (voters still ran TestDang 3
+times), the slowest finder took 8m24 (design) and the review 11.4 min.
+One run is not a trend: the rest of the tail is model time, which varies
+run to run, and v6-2 made more model calls than any v5 dang-187 run (253).
