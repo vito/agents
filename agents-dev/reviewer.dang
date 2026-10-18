@@ -361,8 +361,9 @@ let checkReviewerConcerns: String! {
   # The decisions come after every defect, and never under a severity.
   assert(message: fixed) { !(fixed.split("DECISIONS TO RECORD")[1] ?? "").contains("NIT:") and !(fixed.split("DECISIONS TO RECORD")[0] ?? "").contains("bare number") }
 
-  # At most three concerns, the strongest: of four confirmed at DEEP, the
-  # one with two of three votes is only mentioned, in one line.
+  # At most three concerns in full, the strongest: of four confirmed at
+  # DEEP, the one with two of three votes keeps its claim and its fix,
+  # without the quote or a fingerprint.
   let four = reviewerFindingsReply([
     reviewerCitedJson("CONCERN", "concern one", "design", true, [reviewerLocationJson("calc.py", 1, "def discount(total, percent):")]),
     reviewerCitedJson("CONCERN", "concern two", "design", true, [reviewerLocationJson("calc.py", 2, "rate = percent / 10")]),
@@ -383,7 +384,8 @@ let checkReviewerConcerns: String! {
   assert(message: capped) { (capped.split("\n")[0] ?? "") == "3 concerns" }
   assert(message: capped) { capped.contains("CONCERN:\n- calc.py:2 — concern two") and capped.contains("- calc.py:3 — concern three") and capped.contains("- notes.txt:25 — concern four") }
   assert(message: capped) { !capped.contains("CONCERN:\n- calc.py:1") }
-  assert(message: capped) { capped.contains("3/3 votes · fingerprint ") and capped.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:1 — concern one (2/3 votes)\n") }
+  assert(message: capped) { capped.contains("3/3 votes · fingerprint ") and capped.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:1 — concern one\n  fix: none suggested · 2/3 votes\n") }
+  assert(message: capped) { !capped.contains("      def discount(total, percent):") }
 
   # A location's line given as text still reads ("2-3" is line 2); a line
   # that reads as neither number nor text loses the locations, so the
@@ -708,7 +710,22 @@ let checkReviewerTriage: String! {
     tieBreakReplies: [concernYes],
   ).lastSummary
   assert(message: ranked) { (ranked.split("\n")[0] ?? "") == "3 concerns" and ranked.contains("CONCERN:\n- calc.py:2 — concern two") }
-  assert(message: ranked) { ranked.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:1 — concern one (2/3 votes)\n") }
+  assert(message: ranked) { ranked.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:1 — concern one\n  fix: none suggested · 2/3 votes\n") }
+  # Among equal shares, the one its finder reproduced outranks the ones
+  # only argued, though it came last; the one pushed out keeps its fix.
+  let reproduced = reviewerFindingsReply([
+    JSON.encode({{severity: "CONCERN", claim: "concern one", category: "design", locations: [{{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}}]}}),
+    JSON.encode({{severity: "CONCERN", claim: "concern two", category: "design", locations: [{{path: "calc.py", line: 2, evidence: "rate = percent / 10"}}]}}),
+    JSON.encode({{severity: "CONCERN", claim: "concern three", category: "design", fix: "rename it", locations: [{{path: "calc.py", line: 3, evidence: "return total - total * rate"}}]}}),
+    JSON.encode({{severity: "CONCERN", claim: "concern four", category: "design", reproduction: "ran it and line 25 lost its number", locations: [{{path: "notes.txt", line: 25, evidence: "changed"}}]}}),
+  ])
+  let byRepro = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: [reproduced, reviewerFindingsReply([]), reviewerFindingsReply([])],
+    voterReplies: [concernYes, concernYes, concernYes, concernYes, concernYes, concernYes, concernYes, concernYes],
+  ).lastSummary
+  assert(message: byRepro) { (byRepro.split("\n")[0] ?? "") == "3 concerns" and byRepro.contains("- notes.txt:25 — concern four") and !byRepro.contains("Also raised, past the 3 strongest concerns:\n- notes.txt:25") }
+  assert(message: byRepro) { byRepro.contains("\nAlso raised, past the 3 strongest concerns:\n- calc.py:3 — concern three\n  fix: rename it · 2/2 votes\n") }
   "Reviewer triage checks passed."
 }
 

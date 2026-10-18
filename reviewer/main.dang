@@ -91,9 +91,9 @@ enum Depth {
 How much a finding matters, by evidence. IMPORTANT: a bug or regression,
 reproduced (by its finder or a voter) or called important by every voter
 confirming it. CONCERN: design guidance (a behavior change, assumption,
-inconsistency, or claim that does not hold, caused by the change), at most
-three per review. NIT: a quick fix. PREEXISTING: real, but outside the
-change's hunks and not caused by it.
+inconsistency, or claim that does not hold, caused by the change), three
+per review in full, any more as a claim and a fix each. NIT: a quick fix.
+PREEXISTING: real, but outside the change's hunks and not caused by it.
 """
 enum Severity {
   IMPORTANT
@@ -948,14 +948,7 @@ type Reviewer {
     }
     lines += renderGroup("IMPORTANT", important)
     lines += renderGroup("CONCERN", concerns)
-    # Concerns past the cap, weakest last, in a line each: still visible,
-    # but not worth a reader's minute in full.
-    if (!capped.concerns.isEmpty) {
-      let lead = if (concerns.isEmpty) { [""] } else { [] :: [String!]! }
-      lines += lead + [`Also raised, past the ${toString(maxConcerns)} strongest concerns:`] + capped.concerns.map { f =>
-        `- ${f.path}:${toString(f.line)} — ${clip(firstSentence(f.claim), maxMentionChars)} (${toString(f.confirmations)}/${toString(f.voters)} votes)`
-      }
-    }
+    lines += renderOverflow(capped.concerns, concerns.isEmpty)
     lines += renderGroup("NIT", nits)
     lines += renderGroup("PRE-EXISTING (outside the hunks, not caused by the change)", preexisting)
     lines += renderDecisions(decisions)
@@ -1826,10 +1819,12 @@ let votedFix(f: Finding!, yes: [Vote!]!): {{text: String!, kind: String!}}! {
 
 # What the caps leave out of the summary: nits past the nit cap, in order,
 # and every concern but the `maxConcerns` strongest: the largest share of
-# its voters confirming, then the most confirmations, ties keeping the
-# earlier (so a unanimous 2/2 outranks a 2/3 that needed a tie-break).
-# Concerns are design guidance: a few strong ones are worth a reader's
-# minute, a long list is not.
+# its voters confirming, then the most confirmations, then one its finder
+# reproduced over one only argued, ties keeping the earlier (so a
+# unanimous 2/2 outranks a 2/3 that needed a tie-break). At STANDARD most
+# concerns pass 2/2, so without the reproduction the order they came in
+# would decide alone. Concerns are design guidance: a few strong ones are
+# worth a reader's minute in full, the rest a claim and a fix each.
 let overCaps(confirmed: [Finding!]!, nitCap: Int!): {{nits: [Finding!]!, concerns: [Finding!]!}}! {
   # Decisions to record have their own section, outside both caps.
   let defects = confirmed.filter { f => f.fixKind != "decision" }
@@ -1839,7 +1834,8 @@ let overCaps(confirmed: [Finding!]!, nitCap: Int!): {{nits: [Finding!]!, concern
   # tier's five.
   let strength = concerns.map { f =>
     let unit = [0, 60, 30, 20, 15, 12][f.voters] ?? 0
-    f.confirmations * unit * 10 + f.confirmations
+    let shown = if (f.reproduction != "") { 1 } else { 0 }
+    (f.confirmations * unit * 10 + f.confirmations) * 2 + shown
   }
   let ranked: [Finding!]! = []
   let left = concerns.map { f, i => i }
@@ -2375,6 +2371,24 @@ let renderGroup(title: String!, group: [Finding!]!): [String!]! {
   }
 }
 
+# Concerns past the cap, weakest last: confirmed like the others, so each
+# keeps its whole claim and its fix (every finding carries one), but not
+# the stake or the quote, which is what a reader skims past once three
+# concerns have had theirs. They are not kept in state (nothing to
+# resolve), so no fingerprint either.
+let renderOverflow(group: [Finding!]!, lead: Boolean!): [String!]! {
+  if (group.isEmpty) {
+    return []
+  }
+  let head = if (lead) { [""] } else { [] :: [String!]! }
+  head + [`Also raised, past the ${toString(maxConcerns)} strongest concerns:`] + group.map { f =>
+    [
+      `- ${f.path}:${toString(f.line)} — ${f.claim}`,
+      `  ${fixLine(f)} · ${toString(f.confirmations)}/${toString(f.voters)} votes`,
+    ].join("\n")
+  }
+}
+
 # Decisions to record: defensible choices, not defects, so a line each with
 # what to record where, and the meta line; no stake, no quote.
 let renderDecisions(group: [Finding!]!): [String!]! {
@@ -2425,15 +2439,13 @@ let indented(evidence: String!): String! {
   evidence.split("\n").map { l => "      " + l }.join("\n")
 }
 
-# The claim's first sentence, for a one-line mention: up to the first
-# sentence end past 40 characters that a capital follows ("e.g. a" is no
-# end), else the whole claim.
+# The claim's first sentence, for a short mention (a merged finding's
+# gist): up to the first sentence end past 40 characters that a capital
+# follows ("e.g. a" is no end), else the whole claim.
 let firstSentence(claim: String!): String! {
   let m = squash(claim).match(`^(.{40,}?[.?!])\s+[A-Z]`)
   if (m != null) { m.captures[0] ?? claim } else { squash(claim) }
 }
-
-let maxMentionChars: Int! = 160
 
 # The first `n` lines of a quote, with an ellipsis line when there is more.
 let quoteLines(s: String!, n: Int!): String! {
