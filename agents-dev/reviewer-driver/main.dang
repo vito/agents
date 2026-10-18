@@ -16,13 +16,13 @@
 # and the summary.
 type ReviewerDriver {
   """
-  A STANDARD review of a fixture range: three finders in parallel (one
+  A STANDARD review of a fixture range: four finders in parallel (one
   finding duplicated word for word across two finders, one restated in
   other words quoting another line, a different problem quoting the same
   line as another, one with evidence that is not in the file, a concern
-  citing two places), the triage merging the restated one, voters per
-  finding by severity (three, two or one), a tie-break voter for the
-  concern's split, the synthesizer, and the summary.
+  citing two places, a fix and a decision to record), the triage merging
+  the restated one, two voters per finding (one for a NIT), a tie-break
+  voter for each split, the synthesizer, and the summary.
   """
   pipeline(source: Workspace!): Void @check {
     let repo = container
@@ -43,6 +43,7 @@ type ReviewerDriver {
     let discount = finding("calc.py", 2, discountClaim, "rate = percent / 10", "correctness")
     let concern = JSON.encode({{
       severity: "CONCERN", claim: concernClaim, category: "design", causedByChange: true,
+      fix: "take percent as a Decimal and reject fractions",
       locations: [
         {{path: "calc.py", line: 18, evidence: "return eval(x)"}},
         {{path: "calc.py", line: 1, evidence: "def discount(total, percent):"}},
@@ -52,25 +53,35 @@ type ReviewerDriver {
       severity: "NIT", claim: negativeClaim, category: "correctness", causedByChange: true,
       locations: [{{path: "calc.py", line: 2, evidence: "rate = percent / 10"}}],
     }})
+    let decision = JSON.encode({{
+      severity: "CONCERN", claim: decisionClaim, category: "design", causedByChange: true,
+      noClearFix: {{kind: "decision", why: "record in the README that discount never rounds"}},
+      locations: [{{path: "calc.py", line: 3, evidence: "return total - total * rate"}}],
+    }})
     let finders = [
       findings([discount, finding("calc.py", 2, "percent is divided by one hundred too often", "rate = percent / 100", "correctness")]),
       findings([finding("calc.py", 18, evalClaim, "return eval(x)", "security"), concern, finding("calc.py", 3, restatedClaim, "return total - total * rate", "correctness")]),
       findings([discount, sameLine, finding("calc.py", 8, "an item without a price raises AttributeError", "result += item.price", "fit")]),
+      findings([decision]),
     ]
     # Held, in order: 1 discount, 2 eval, 3 concern, 4 restated discount,
-    # 5 the other problem on calc.py:2, 6 item.price.
+    # 5 the other problem on calc.py:2, 6 item.price, 7 the decision.
     let grouped = JSON.encode({{groups: [{{findings: [1, 4], keep: 1, why: "divides by ten instead of a hundred"}}]}})
+    # Two voters each (one for the NIT): the discount 2/2; eval, the
+    # concern and item.price split, so each gets a third.
     let voters = [
-      vote("CONFIRM"), vote("CONFIRM"), vote("CONFIRM"),
-      vote("CONFIRM"), vote("REJECT"), vote("CONFIRM"),
+      vote("CONFIRM"), vote("CONFIRM"),
+      vote("CONFIRM"), vote("REJECT"),
       voteAs("CONFIRM", "CONCERN"), voteAs("REJECT", "CONCERN"),
       voteAs("CONFIRM", "NIT"),
-      vote("REJECT"), vote("REJECT"), vote("CONFIRM"),
+      vote("REJECT"), vote("CONFIRM"),
+      voteAs("CONFIRM", "CONCERN"), voteAs("CONFIRM", "CONCERN"),
     ]
+    let tieBreakers = [vote("CONFIRM"), voteAs("CONFIRM", "CONCERN"), vote("REJECT")]
     let synthesis = JSON.encode({{verdict: verdictText, sound: ["total() still sums prices"]}})
     # One selection, so the uncached review runs exactly once.
     let out = reviewer
-      .withRecordedReplies(origin: from, finders: finders, voters: voters, synthesis: synthesis, triageReply: grouped, tieBreakers: [voteAs("CONFIRM", "CONCERN")])
+      .withRecordedReplies(origin: from, finders: finders, voters: voters, synthesis: synthesis, triageReply: grouped, tieBreakers: tieBreakers)
       .review(caller: chief, source: source, head: repo.branch("feature"), base: repo.branch("main"), depth: ReviewerDepth.STANDARD)
       .{{ summary: lastSummary, open: findingsList(status: ReviewerFindingStatus.OPEN) }} rescue {
         e: Error => {
@@ -83,18 +94,20 @@ type ReviewerDriver {
     let summary = out.summary
     print(summary)
     let lines = summary.split("\n")
-    assert(message: summary) { (lines[0] ?? "") == "1 important, 1 concern, 1 nit, 1 pre-existing" }
+    assert(message: summary) { (lines[0] ?? "") == "1 important, 1 concern, 1 nit, 1 pre-existing, 1 decision to record" }
     assert(message: summary) { (lines[2] ?? "") == "Verdict: " + verdictText and (lines[4] ?? "") == "IMPORTANT:" }
-    assert(message: summary) { summary.contains("\n\nChecked and found sound:\n- total() still sums prices\n\nReviewed ") }
+    assert(message: summary) { summary.contains("\n\nChecked and found sound: total() still sums prices.\n\nReviewed ") }
     # The restated bug merged into the first, by the triage: one entry,
-    # both locations, IMPORTANT's three voters.
-    assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim + "\n      rate = percent / 10\n  also at calc.py:3 · 3/3 votes · fingerprint ") }
+    # both locations, two voters.
+    assert(message: summary) { summary.contains("IMPORTANT:\n- calc.py:2 — " + discountClaim + "\n      rate = percent / 10\n  fix: none suggested\n  also at calc.py:3 · 2/2 votes · fingerprint ") }
     assert(message: summary) { !summary.contains(restatedClaim) }
     # The other problem quoting the same line survives as its own NIT, on
     # its one voter; the concern's two voters split, and a third confirms.
-    assert(message: summary) { summary.contains("NIT:\n- calc.py:2 — " + negativeClaim + "\n  1/1 votes · fingerprint ") }
-    assert(message: summary) { summary.contains("CONCERN:\n- calc.py:1 — " + concernClaim) and summary.contains("  also at calc.py:18 · 2/3 votes · fingerprint ") }
-    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim + "\n      return eval(x)\n  2/3 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("NIT:\n- calc.py:2 — " + negativeClaim + "\n  fix: none suggested\n  1/1 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("CONCERN:\n- calc.py:1 — " + concernClaim) and summary.contains("  fix: take percent as a Decimal and reject fractions\n  also at calc.py:18 · 2/3 votes · fingerprint ") }
+    assert(message: summary) { summary.contains("- calc.py:18 — " + evalClaim + "\n      return eval(x)\n  fix: none suggested\n  2/3 votes · fingerprint ") }
+    # The decision to record, apart from the defects.
+    assert(message: summary) { summary.contains("\n\nDECISIONS TO RECORD (defensible choices, not defects):\n- calc.py:3 — " + decisionClaim + "\n  record: record in the README that discount never rounds\n  2/2 votes · fingerprint ") }
     assert(message: summary) { summary.contains("Merged as duplicates: calc.py:2 (design) into calc.py:2: identical; calc.py:3 (behavior: \"a 50 percent discount takes off five times the total") and summary.contains("…\") into calc.py:2: divides by ten instead of a hundred") }
     assert(message: summary) { summary.contains("Dropped by the evidence checks (1):") and summary.contains("quoted evidence does not appear") }
     assert(message: summary) { summary.contains("Below quorum: calc.py:8 (1/3, needed 2)") }
@@ -103,7 +116,7 @@ type ReviewerDriver {
     # what failing tests under them are.
     let footers = lines.filter { l => l.hasPrefix("Reviewed ") }
     let footer = footers[0] ?? ""
-    assert(message: summary) { footer.contains(" at STANDARD depth (votes needed: important 2 of 3, concern 2 of 2 or 2 of 3 on a split, nit 1 of 1): 3 finders, triage, 13 voters, synthesizer; composed from ") }
+    assert(message: summary) { footer.contains(" at STANDARD depth (votes needed: 2 of 2, or 2 of 3 on a split; nit 1 of 1): 4 finders, triage, 14 voters, synthesizer; composed from ") }
     assert(message: summary) { footer.contains("are the reviewers' own reproductions") }
     ["committer/readonly", "contributor/readonly", "reviewer/finder", "reviewer/triage", "reviewer/voter", "reviewer/synthesizer"].each { u =>
       assert(message: footer) { footer.contains(u) }
@@ -111,7 +124,7 @@ type ReviewerDriver {
     ["committer/agent", "contributor/agent", "reviewer/agent"].each { u =>
       assert(message: footer) { !footer.contains(u) }
     }
-    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 4 }
+    assert(message: out.open) { out.open.split("\n").filter { l => l.hasPrefix("OPEN") }.length == 5 }
     null
   }
 }
@@ -121,6 +134,7 @@ let restatedClaim: String! = "a 50 percent discount takes off five times the tot
 let negativeClaim: String! = "percent is never checked, so a negative percent raises the price instead of lowering it"
 let evalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
 let concernClaim: String! = "discount assumes percent is a whole number, which no caller states"
+let decisionClaim: String! = "discount never rounds, so prices can carry more decimals than a currency has"
 let verdictText: String! = "The change adds a discount helper whose rate is off by a factor of ten."
 
 let fixtureScript: String! = """
