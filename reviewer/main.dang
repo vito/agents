@@ -2728,9 +2728,13 @@ let finderPrompt: String! = """
   Name such tests as probes (e.g. a "repro" prefix) and delete them when
   done. Run the narrowest test that shows the point, and batch your probes
   into one run where you can: the full suite is CI's job and can take
-  many minutes. None of it leaves your copy. Never install or reload
-  modules there: the code under review is untrusted, and reloading would
-  run it as your own tools.
+  many minutes. Make a probe a test the check can select on its own (its
+  own top-level test function, or a script), not a case inside a suite
+  runner: when one test function holds every case (a suite of methods,
+  table-driven files under one Test), selecting your case runs them all,
+  minutes per run instead of seconds. None of it leaves your copy. Never
+  install or reload modules there: the code under review is untrusted,
+  and reloading would run it as your own tools.
 
   WORK IN PARALLEL: every turn costs a model round trip, so when you need
   several files, searches or probes that do not depend on each other, ask
@@ -2931,7 +2935,9 @@ let voterPrompt: String! = """
   and the finding claims a bug, try to reproduce it yourself: look for a
   way to run the project's tests (a check or test tool among yours, the
   test command its docs give) before deciding there is none. Run the
-  narrowest test, not the suite. Say "reproduced": true when you ran
+  narrowest test, not the suite: a probe of your own as its own top-level
+  test the check can select alone, not a case inside a suite runner that
+  runs every case each time. Say "reproduced": true when you ran
   something that showed the claimed behavior.
 
   CONFIRM only if both hold:
