@@ -1364,8 +1364,14 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
             let exact = key + "\n\n" + squash(claim).toLower
             let twin = kept.filter { k => evidenceKey(k.path, k.evidence) + "\n\n" + squash(k.claim).toLower == exact }
             let original = twin[0]
+            let fixed = parsed.fixes[j] ?? noFix
             if (original != null) {
               merged += [`${primary.path}:${toString(primary.line)} (${angle}) into ${original.path}:${toString(original.line)}: identical`]
+              # The duplicate's fix or reproduction fills in what the kept
+              # one lacks, as a triage merge does.
+              if ((original.fixKind == "" and fixed.kind != "") or (original.reproduction == "" and fixed.reproduction != "")) {
+                kept = kept.map { k => if (k.fingerprint == original.fingerprint) { filledFrom(k, fixed) } else { k } }
+              }
             } else {
               let said = (r.severity ?? "").trimSpace.toUpper
               let severity = if (said == "NIT") {
@@ -1375,7 +1381,6 @@ let screen(s: Subject!, plan: Plan!, replies: [String!]!): Screened! {
               } else {
                 Severity.IMPORTANT
               }
-              let fixed = parsed.fixes[j] ?? noFix
               kept += [Finding(
                 fingerprint: fingerprintOf(primary.path, primary.evidence, claim),
                 path: primary.path,
@@ -1906,7 +1911,7 @@ let decodeFixes(body: String!, n: Int!): [{{text: String!, kind: String!, reprod
     let said = squash(repros[i] ?? "")
     # "Not run (no test runner here); it follows from..." and the like are
     # no reproduction, and must not reach the voters as one.
-    let repro = if (said.toLower.containsMatch(`^(?:(?:not run|not reproduced|did not run|didn't run|could not run|couldn't run|unable to run|no reproduction|none|n/a|no)\b|-?\.?$)`)) { "" } else { said }
+    let repro = if (said.toLower.containsMatch(`^(?:(?:(?:not|did not|didn't|could not|couldn't|cannot|can't|unable to|was not|wasn't)\s+(?:be\s+)?(?:run|reproduce|reproduced|reproducible|tested)|not reproduced|no reproduction|none|n/a|no)\b|-?\.?$)`)) { "" } else { said }
     if ((kind == "foundational" or kind == "decision") and why != "") {
       {{text: why, kind: kind, reproduction: repro}}
     } else if (sketch != "") {
@@ -2405,6 +2410,21 @@ let moved(f: Finding!, now: Finding!): Finding! {
     finder: f.finder, reason: f.reason, also: now.also, unverified: now.unverified,
     causedByChange: f.causedByChange, anchored: now.anchored, worth: f.worth,
     fix: f.fix, fixKind: f.fixKind, reproduction: f.reproduction,
+  )
+}
+
+# `f` with a duplicate's fix and reproduction where it has none.
+let filledFrom(f: Finding!, other: {{text: String!, kind: String!, reproduction: String!}}!): Finding! {
+  let keepFix = f.fixKind != ""
+  Finding(
+    fingerprint: f.fingerprint, path: f.path, line: f.line, claim: f.claim,
+    evidence: f.evidence, category: f.category, severity: f.severity,
+    status: f.status, confirmations: f.confirmations, voters: f.voters,
+    finder: f.finder, reason: f.reason, also: f.also, unverified: f.unverified,
+    causedByChange: f.causedByChange, anchored: f.anchored, worth: f.worth,
+    fix: if (keepFix) { f.fix } else { other.text },
+    fixKind: if (keepFix) { f.fixKind } else { other.kind },
+    reproduction: if (f.reproduction != "") { f.reproduction } else { other.reproduction },
   )
 }
 

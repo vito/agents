@@ -605,6 +605,26 @@ let checkReviewerTriage: String! {
   assert(message: tiered) { tiered.contains("IMPORTANT:\n- calc.py:3 — " + reviewerOvershootClaim) and tiered.contains("\n- notes.txt:25 — notes.txt line 25 lost its number") }
   assert(message: tiered) { tiered.contains("CONCERN:\n- calc.py:2 — " + reviewerDiscountClaim) and tiered.contains("\n- calc.py:1 — " + reviewerNegativeClaim) }
   assert(message: tiered) { (tiered.split("CONCERN:")[0] ?? "").contains("calc.py:3") and !(tiered.split("CONCERN:")[0] ?? "").contains("- calc.py:2 — ") }
+  # An exact duplicate merges in the screen, but its fix and reproduction
+  # fill in what the kept one lacks: here the reproduction keeps it
+  # IMPORTANT on a split call. "Could not reproduce ..." is none.
+  let twinned = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: [reviewerFindingsReply([
+      JSON.encode({{path: "calc.py", line: 2, claim: reviewerDiscountClaim, evidence: "rate = percent / 10", category: "correctness", severity: "IMPORTANT", reproduction: "Could not reproduce (no runner); it follows from the code"}}),
+      JSON.encode({{path: "calc.py", line: 2, claim: reviewerDiscountClaim, evidence: "rate = percent / 10", category: "correctness", severity: "IMPORTANT", fix: "divide by 100", reproduction: "ran discount(100, 50) and got -400"}}),
+    ])],
+    voterReplies: [yes, concernYes],
+  ).lastSummary
+  assert(message: twinned) { (twinned.split("\n")[0] ?? "") == "1 important" and twinned.contains("\n  fix: divide by 100\n") and twinned.contains("into calc.py:2: identical") }
+  let unrun = reviewer.tallyReplies(
+    source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, depth: ReviewerDepth.STANDARD,
+    finderReplies: [reviewerFindingsReply([
+      JSON.encode({{path: "calc.py", line: 2, claim: reviewerDiscountClaim, evidence: "rate = percent / 10", category: "correctness", severity: "IMPORTANT", reproduction: "Could not reproduce (no runner); it follows from the code"}}),
+    ])],
+    voterReplies: [yes, concernYes],
+  ).lastSummary
+  assert(message: unrun) { (unrun.split("\n")[0] ?? "") == "1 concern" }
 
   # A re-review that rewords both problems on calc.py:2 keeps each one's
   # earlier fingerprint, by the words their claims share: the bug stays
