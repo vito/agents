@@ -369,6 +369,103 @@ let committerLogSubjects(listing: String!): [String!]! {
   listing.split("\n").filter { l => l.trimSpace.hasPrefix("fixture:") }.map { l => l.trimSpace }
 }
 
+# A `tools` branch off main whose commits flip tool.sh's mode: `plain` and
+# `again` are different commits with the same tree, `exec` differs only in
+# mode, and `mixed` changes content and mode together, turns alias.txt into
+# a symlink and adds a nested directory. Git's own tree hashes are recorded
+# alongside, as the expected answer.
+let committerTreeFixture: Container! {
+  committerRebaseFixture.withExec(["sh", "-eu", "-c", """
+    export GIT_AUTHOR_DATE=2026-09-15T12:05:00Z
+    export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+    git checkout -q -b tools main
+    printf 'x\n' > tool.sh
+    printf 'alias\n' > alias.txt
+    git add tool.sh alias.txt
+    git commit -qm 'fixture: add tool'
+    git tag plain
+    chmod +x tool.sh
+    git commit -qam 'fixture: chmod tool'
+    git tag exec
+    chmod -x tool.sh
+    git commit -qam 'fixture: unchmod tool'
+    git tag again
+    printf 'y\n' > tool.sh
+    chmod +x tool.sh
+    rm alias.txt
+    ln -s tool.sh alias.txt
+    mkdir -p new/deep
+    printf 'n\n' > new/deep/file.txt
+    git add -A
+    git commit -qm 'fixture: mix changes'
+    git tag mixed
+    git checkout -q main
+    git rev-parse 'plain^{tree}' > /plain.tree
+    git rev-parse 'exec^{tree}' > /exec.tree
+  """])
+}
+
+let checkCommitterTreeEqual: String! {
+  let built = committerTreeFixture
+  let repo = built.directory("/repo").asGit
+  let plainTree = built.file("/plain.tree").contents.trimSpace
+  let execTree = built.file("/exec.tree").contents.trimSpace
+  let plainSha = repo.tag("plain").commitSHA
+  let execSha = repo.tag("exec").commitSHA
+  let ws = repo.tag("again").asWorkspace
+
+  # Different commits, same tree: identical, with git's own tree hash.
+  let same = committer.treeEqual(source: ws, against: plainSha)
+  assert { same.hasPrefix("IDENTICAL") }
+  assert { same.contains("tree " + plainTree) }
+  assert { committer.treeEqual(source: ws).hasPrefix("IDENTICAL") }
+
+  # A mode-only change is a difference, reported as one.
+  let mode = committer.treeEqual(source: ws, commit: execSha.split("").takeFirst(7).join(""))
+  assert { mode.hasPrefix("DIFFERENT trees: 1 path(s) differ") }
+  assert { mode.contains("tree " + execTree) and mode.contains("tree " + plainTree) }
+  assert { mode.contains("M  mode 100644 -> 100755  tool.sh") }
+  assert { !mode.contains("content") }
+
+  # Both sides by address, names resolved inside each ref.
+  let tools = repo.branch("tools")
+  let byName = committer.treeEqual(source: ws, commit: "plain", from: tools, against: "exec", againstFrom: tools)
+  assert { byName.contains("M  mode 100755 -> 100644  tool.sh") }
+  let branches = committer.treeEqual(source: ws, from: repo.branch("feature"), againstFrom: repo.branch("main"))
+  assert { branches.hasPrefix("DIFFERENT trees: 4 path(s) differ") }
+  assert { branches.contains("M  content  shared.txt") }
+  assert { branches.contains("A  added  later.txt") and branches.contains("A  added  ours.txt") }
+  assert { branches.contains("D  removed  upstream.txt") }
+
+  # Content and mode together, a file turned symlink, and a new directory,
+  # counted by its file only (3, not 5); a removed one collapses to "dir/".
+  let mixed = committer.treeEqual(source: ws, commit: "mixed", from: tools, against: "again", againstFrom: tools)
+  assert { mixed.hasPrefix("DIFFERENT trees: 3 path(s) differ") }
+  assert { mixed.contains("M  content, mode 100644 -> 100755  tool.sh") }
+  assert { mixed.contains("T  type 100644 -> 120000  alias.txt") }
+  assert { mixed.contains("A  added  new/deep/file.txt") }
+  let reversed = committer.treeEqual(source: ws, commit: "again", from: tools, against: "mixed", againstFrom: tools)
+  assert { reversed.hasPrefix("DIFFERENT trees: 3 path(s) differ") }
+  assert { reversed.contains("M  content, mode 100755 -> 100644  tool.sh") }
+  assert { reversed.contains("T  type 120000 -> 100644  alias.txt") }
+  assert { reversed.contains("D  removed  new/") }
+
+  # A saved workspace's head, against a commit in the checkout.
+  let saved = committer.withSavedWorkspace(workspace: repo.tag("plain").asWorkspace).saved.get(key: plainSha).head
+  assert { committer.treeEqual(source: ws, againstFrom: saved).hasPrefix("IDENTICAL") }
+
+  # A commit recorded by the workspace itself.
+  let added = committer.commit(source: ws.withNewFile("new.txt", "new\n"), message: "test: add a file\n\nFor treeEqual.")
+  let grown = committer.treeEqual(source: added, against: plainSha)
+  assert { grown.contains("A  added  new.txt") }
+  assert { grown.contains("1 path(s) differ") }
+
+  let typo = committer.treeEqual(source: ws, against: "no-such-ref") rescue { e: Error => e.message }
+  assert { typo.contains("cannot resolve commit") }
+  assert { committer.agent(llm.withWorkspace(ws)).tools.contains("treeEqual") }
+  "Tree comparison checks passed."
+}
+
 let checkCommitterMessages(source: Workspace!): String! {
   let fixture = source.git.head.asWorkspace.withNewFile("message-check-" + Random.string, "fixture\n")
   let valid = "committer: enforce commit style\n\nKeep history readable."
