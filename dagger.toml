@@ -58,3 +58,6 @@ source = "github.com/vito/editor@main"
 
 [modules.browser]
 source = "browser"
+
+[modules.reviewer]
+source = "reviewer"

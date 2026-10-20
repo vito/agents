@@ -1,0 +1,77 @@
+{
+  "name": "dang-59-file-local-imports",
+  "title": "feat: file-local imports + LSP performance (first 8 commits)",
+  "pr": "https://github.com/vito/dang/compare/f60848c5ff6ea19875310b5d4249c124011134e1...1058f48268e5984d5e97fc7f832b84a42c6219ae",
+  "repo": "https://github.com/vito/dang",
+  "head": "1058f48268e5984d5e97fc7f832b84a42c6219ae",
+  "base": "f60848c5ff6ea19875310b5d4249c124011134e1",
+  "notes": "vito/dang#59 up to 1058f48, its 8th of 13 commits, before the fixes: +498/-181 over 13 files (make imports file-local, focused LSP inference, parse/mtime caches). Ground truth from history: the PR's later commits fixed the issues below, the bugs each with a regression test that fails at this head, so they are vetted real; the fixing commits are cited in each summary. PR #59 merged with all of them (head b0c575c). The issues marked claimed came from reviewer runs, not history (whether a later commit fixed them is not checked), and are unvetted.",
+  "issues": [
+    {
+      "key": "imports-shared-at-runtime",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/eval.go:2101", "pkg/dang/eval.go:2148"],
+      "summary": "Imports are file-local only during inference (as RunDir's new doc comment says): evaluation still flattens every file's forms into one masterBlock against a shared evalEnv, so imports from one file are installed for all of them and the runtime disagrees with the types. With a.dang `import Dagger` and b.dang `pub container: String! = \"local\"; pub useContainer: String! = container`, inference types b's container as String!, but at runtime SlotDecl.Eval finds the imported `container` already bound and keeps it, so useContainer is a Dagger Container. Fixed by a83340ce72 (fix(dang): scope imports file-locally at runtime: per-file evaluation through a CompositeEvalEnv, with TestRunDirImportedValueDoesNotShadowLocalDeclaration), then b0ffce338a (imports are not 'local' at eval time, for a file that imports and declares the same name)."
+    },
+    {
+      "key": "focused-inference-skips-sibling-variables",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/dir_inference.go:141", "pkg/dang/dir_inference.go:150"],
+      "summary": "InferDirectoryFilesFocused runs only the declaration phases for sibling files, but an unannotated computed variable (`pub answer = \"ok\".toUpper` in defs.dang) gets its type from the body-inference variables phase, not from variable signatures. So when main.dang (`pub use: String! = answer`) is the active LSP buffer, a valid directory that RunDir accepts shows a spurious `\"answer\" not found` diagnostic. Fixed by 131c9eaf7e (fix(lsp): infer sibling variable bodies), which runs the variables phase for siblings too and adds TestDiagnosticsResolvesUnannotatedSiblingVars."
+    },
+    {
+      "key": "phase-groups-by-index",
+      "kind": "cleanup",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": "real",
+      "locations": ["pkg/dang/dir_inference.go:127", "pkg/dang/dir_inference.go:131"],
+      "summary": "declarationPhases = inferencePhases[:6] and bodyPhases = inferencePhases[6:] are hardcoded index slices into the phase list, so adding or reordering a phase silently misaligns both groups. Refactored in b0c575c49b (refactor(dang): name phase groups, not indices), which defines the groups as named slices and concatenates them."
+    },
+    {
+      "key": "schema-module-per-file",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/ast_declarations.go:1222", "pkg/dang/dir_inference.go:54"],
+      "summary": "Auto-imports are now injected into every file, and each file's ImportDecl (`i.inferred = NewEnv(i.Name.Name, config.Schema)`) builds its own schema module, so `Container` in a.dang and `Container` in b.dang are different *Module values, and named modules compare by pointer. With a.dang `pub makeC: Container! { container }` and b.dang `pub useC: Container! { makeC }`, b.dang fails with \"cannot use Container! as Container!\": Dagger modules split across files, which worked with the one injected import before, stop type-checking. It also builds the whole schema env once per file per import instead of once per directory. Suggested fix: build the schema module once per import name per directory run (a name-to-Env map in prepareFileScopes handed to each ImportDecl), with a RunDir test passing Dagger.Container between files. Found by reviewer v5 runs 1-3 (all three, IMPORTANT)."
+    },
+    {
+      "key": "variables-ordered-per-file",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/dir_inference.go:82", "pkg/dang/dir_inference.go:114"],
+      "summary": "runDirectoryPhases now orders top-level computed variables within each file only (`for _, scope := range scopes`), where the old combined topological sort ordered them across the directory. With a.dang `pub x = y + 1` and b.dang `pub y = 1 + 2`, a.dang's variables phase runs first and fails with `\"y\" not found`, so a valid multi-file module fails depending on file names; a cycle across files reports 'not found', not 'circular'. This contradicts the sound item lockstep-phases (each phase runs across every file before the next), which holds for the phase order but not for the order of variables within the variables phase. Suggested fix: run the variables phase once over every file's variables (one orderVariablesForInference), each form inferred in its own file's env, with a two-file test. Found by reviewer v5 runs 1-3 and v4 (IMPORTANT each time)."
+    },
+    {
+      "key": "shared-mutable-parse-cache",
+      "kind": "concern",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/lsp/handler.go:408", "pkg/lsp/handler.go:274", "pkg/dang/dir_inference.go:63"],
+      "summary": "The LSP's parse cache hands the same *ModuleBlock to every file's analysis, and analysis mutates it: editing B re-runs the declaration phases on open file A's cached AST, overwriting FunDecl.InferredScope, ClassDecl.Inferred, declarations' inferred types and block.Env with signature-only state that A's hover and completion then read. jrpc2 does not wait for in-flight requests before a notification, so it can also race with a hover on A. Suggested fix: don't share a block between its own analysis and other files' sibling passes (parse open siblings into a separate copy, or cache sibling-use blocks apart from the AST each file exposes). Found by reviewer v5 runs 1-3 (a concern asked as a question in runs 1 and 3, IMPORTANT in run 2)."
+    }
+  ],
+  "sound": [
+    {
+      "key": "lockstep-phases",
+      "vetted": null,
+      "summary": "runDirectoryPhases runs each phase across every file before starting the next, so every type name is registered before any signature resolves and cross-file references in signatures and bodies work regardless of file order."
+    },
+    {
+      "key": "local-shadows-import-in-inference",
+      "vetted": null,
+      "summary": "Each file's composite env reads the shared dirEnv before the file's own imports and writes to dirEnv, so during inference a local declaration shadows an imported name and declarations stay visible to sibling files."
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "name": "dang-55-shadowing",
+  "title": "fix(dang): shadow imported types locally",
+  "pr": "https://github.com/vito/dang/commit/d7b82e009e594336af9a0ace05ac67cc105a1b68",
+  "repo": "https://github.com/vito/dang",
+  "head": "d7b82e009e594336af9a0ace05ac67cc105a1b68",
+  "base": "8406a0c64f2fe197106acdc71d16ee2e8bba901e",
+  "notes": "The first commit of vito/dang#55 (fixes #52), reviewed alone: +396/-50 over 5 files. Ground truth from history: later commits in the same PR fixed each issue below, each adding a regression test or golden that fails at this head, so they are vetted real and, where a test reproduces them, confirmed. The fixing commits are cited in each summary; PR #55 merged with all of them (head dcc8f89). The issues marked claimed came from reviewer runs, not history (whether a later commit fixed them is not checked), and are unvetted.",
+  "issues": [
+    {
+      "key": "fragment-resolves-local-type",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/ast_expressions.go:1183"],
+      "summary": "inferInlineFragments resolves a fragment's type condition with modEnv.NamedType, the ambient environment, so once a local `type User` shadows the imported Test.User, `... on User` on a Test union or interface (search(...), node(id:)) picks the LOCAL User: fields that exist only on the local type (`origin`) are accepted in the fragment, and real Test.User fields (`age`) are rejected. Fixed by fdc3b6e0de (fix(dang): resolve fragments via receiver), which resolves the condition from the receiver's members/implementers and adds tests/test_inline_fragment_import_shadowing.dang plus two error goldens."
+    },
+    {
+      "key": "constant-annotation-before-hoist",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["pkg/dang/block.go:261", "pkg/dang/block.go:264", "pkg/dang/block.go:588"],
+      "summary": "Local type names are only hoisted (Hoist pass 0) inside the types phase, which InferFormsWithPhases runs after the constants phase. So a constant annotated with a shadowed name and declared before the type, `pub maybe: User = null` above a local `type User`, binds to the imported Test.User, and `pub echoed: User = maybe` then fails as a mismatch between the imported and the local User: shadowing works or not depending on declaration order. Fixed by dcc8f89dfd (fix(dang): hoist local type names earlier), which adds a 'type names' phase right after imports, with tests/test_imported_type_shadowing_annotation.dang and an env_test assertion."
+    },
+    {
+      "key": "indistinguishable-type-errors",
+      "kind": "concern",
+      "severity": "minor",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["tests/testdata/import_shadowing_local_distinct.golden"],
+      "summary": "Now that a local type and an imported one can share a name, mismatch errors print both unqualified: the change's own golden shows `cannot use User! as User!`, `cannot use Status! as Status!`, `cannot use [SearchResult!]! as [SearchResult!]!`, which tell the user nothing. Fixed by 9dc903dfda (fix(dang): qualify imported type errors) and af13384818 (fix(dang): qualify type display paths), which render imported types as `Test.User!` and update the golden."
+    },
+    {
+      "key": "repl-imports-untracked",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/slots.go:350", "pkg/dang/slots.go:331", "pkg/dang/eval.go:382", "cmd/dang/repl_tuist.go:427"],
+      "summary": "The change decides that an existing type is an import to shadow by looking it up in unqualifiedTypeImports, which only ImportDecl fills. The REPL builds its environment with BuildEnvFromImports (eval.go:382), which adds the imported classes with AddClass but never records them, so in the REPL declareLocalType hands back the imported module: `type Container { pub value: String! }` with Dagger loaded still reuses and mutates Dagger.Container, the bug the change fixes for files and RunDir. Suggested fix: have BuildEnvFromImports call TrackUnqualifiedTypeImport (and the value variant) for what it installs, or reuse ImportDecl's import path; better, decide shadowing by ownership (is the existing type a local declaration) rather than by side metadata. Found by reviewer v5 runs 1-3 (a concern in runs 1 and 2, IMPORTANT in run 3)."
+    },
+    {
+      "key": "interface-union-redeclare-merges",
+      "kind": "bug",
+      "severity": "minor",
+      "confidence": "claimed",
+      "vetted": null,
+      "locations": ["pkg/dang/slots.go:1013", "pkg/dang/slots.go:1121", "pkg/dang/slots.go:350"],
+      "summary": "Interface and union Hoist pass 0 used to create a fresh module every time; now they go through declareLocalType, which reuses any existing local type whatever its kind. In the REPL's persistent type env a redeclaration merges with the stale one: `union U = A | B` then `union U = A | C` leaves members A, B, A, C; redeclaring an interface field with a new type fails with 'already defined as', or keeps the old field so implementers fail with 'missing'; `type Foo` then `interface Foo` keeps ObjectKind. Suggested fix: keep a fresh module for interface/union pass 0 (only clear the shadowed import), or reuse only when the existing module's kind matches. Found by reviewer v5 runs 1-3 (a concern in runs 1 and 3; a one-line overflow concern in run 2; also named inside run 3's REPL item)."
+    }
+  ],
+  "sound": [
+    {
+      "key": "imported-module-not-mutated",
+      "vetted": null,
+      "summary": "A local declaration that shadows an unqualified imported type gets a fresh module (declareLocalType) and the unqualified alias is cleared, instead of reusing and mutating the imported schema type, so a qualified reference to a shadowed name (Test.User after a local `type User`) still resolves to the imported type."
+    },
+    {
+      "key": "all-kinds-covered",
+      "vetted": null,
+      "summary": "Type, enum, scalar, interface and union declarations all go through declareLocalType, and the new gqlserver tests cover shadowing for each kind."
+    }
+  ]
+}
