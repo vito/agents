@@ -21,7 +21,7 @@ Mark each `real` (worth raising) or `dismiss` (not worth the time).
 vetted:
 bug · important · claimed. pkg/querybuilder/marshal.go:69 formats float64 with
 `%f` (six decimals), and Float arguments now reach it, so 0.1234567 is sent as
-0.123457. Found by run-v2-standard.md; not fixed in history.
+0.123457. Found by an earlier reviewer run; not fixed in history.
 
 ### fragment-leaf-float-as-int
 vetted:

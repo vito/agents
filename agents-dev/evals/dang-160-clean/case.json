@@ -14,7 +14,7 @@
       "confidence": "claimed",
       "vetted": null,
       "locations": ["pkg/querybuilder/marshal.go:69", "pkg/dang/eval.go:863"],
-      "summary": "querybuilder's argument marshaller formats float64 with %f, which keeps six decimal places, and this change lets Float arguments reach it (dangValueToGo now serializes FloatValue). So 0.1234567 is sent as 0.123457 and 0.0000001 as 0.000000: a Float result passed back as an argument comes back altered, with no error. Before the change such calls failed with an unsupported value type. The new round-trip test only uses 4.5 and 2.5. Found by a reviewer run (run-v2-standard.md); no later commit fixes it."
+      "summary": "querybuilder's argument marshaller formats float64 with %f, which keeps six decimal places, and this change lets Float arguments reach it (dangValueToGo now serializes FloatValue). So 0.1234567 is sent as 0.123457 and 0.0000001 as 0.000000: a Float result passed back as an argument comes back altered, with no error. Before the change such calls failed with an unsupported value type. The new round-trip test only uses 4.5 and 2.5. Found by a reviewer run; no later commit fixes it."
     },
     {
       "key": "fragment-leaf-float-as-int",

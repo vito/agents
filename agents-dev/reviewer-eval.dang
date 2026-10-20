@@ -964,7 +964,7 @@ let reviewerEvalCoverVote(finding: Int!, match: String!, value: String!, also: [
 
 let checkReviewerEvalScoring(source: Workspace!): String! {
   # Every case on disk loads and validates, with its vetting note; files
-  # beside the cases (batch notes, to-vet.md) are not cases.
+  # beside the cases are not cases.
   let names = source.directory("agents-dev/evals").entries.filter { e => e.hasSuffix("/") }.map { e => e.trimSuffix("/") }
   assert(message: names.join(", ")) { names.contains("dang-187") }
   names.each { n => loadReviewerEvalCase(source, n) }
