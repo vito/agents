@@ -1,0 +1,345 @@
+# Reviewer checks without model calls. `tally` runs everything `review` does
+# after its sub-agents reply (evidence checks, the editor's merges and
+# drops, the report) on canned replies; composition and the tool surface are
+# inspected directly.
+
+# A git fixture: `main`, and `feature`, which adds discount() on top of
+# calc.py (so a pre-existing eval sits far from the change) and edits two
+# lines of notes.txt.
+let reviewerFixture: {{main: GitRef!, feature: GitRef!}}! {
+  let repo = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", reviewerFixtureScript])
+    .directory("/repo")
+    .asGit
+  {{main: repo.branch("main"), feature: repo.branch("feature")}}
+}
+
+let reviewerFixtureScript: String! = """
+  git init -q -b main
+  git config user.name 'Review Test'
+  git config user.email review@example.com
+  export GIT_AUTHOR_DATE=2026-09-15T12:00:00Z
+  export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+  printf '%s\n' 'def total(items):' '    result = 0' '    for item in items:' '        result += item.price' '    return result' '' 'def one():' '    return 1' '' 'def two():' '    return 2' '' 'def legacy(x):' '    return eval(x)' > calc.py
+  seq 1 30 | sed 's/^/line /' > notes.txt
+  git add .
+  git commit -q -m 'fixture: base'
+  git checkout -q -b feature
+  { printf '%s\n' 'def discount(total, percent):' '    rate = percent / 10' '    return total - total * rate' ''; cat calc.py; } > calc.new
+  mv calc.new calc.py
+  sed -i -e '2s/.*/++ plus/' -e '25s/.*/changed/' notes.txt
+  git commit -q -am 'calc: add discount'
+"""
+
+# One finding as a finder reports it, and one of its locations.
+let reviewerFinding(severity: String!, claim: String!, locations: [String!]!, extra: String!): String! {
+  let head = JSON.encode({{severity: severity, claim: claim}}).trimSpace.trimSuffix("}")
+  let more = if (extra == "") { "" } else { ", " + extra }
+  head + more + ", \"locations\": [" + locations.join(", ") + "]}"
+}
+
+let reviewerAt(path: String!, line: Int!, evidence: String!): String! {
+  JSON.encode({{path: path, line: line, evidence: evidence}})
+}
+
+let reviewerFindings(findings: [String!]!): String! {
+  "{\"findings\": [" + findings.join(", ") + "]}"
+}
+
+let reviewerDiscountClaim: String! = "percent / 10 divides by ten instead of a hundred, so a 50 percent discount takes off five times the total"
+let reviewerEvalClaim: String! = "legacy passes its argument to eval, so any caller-supplied string runs as code"
+let reviewerStaleClaim: String! = "notes.txt line 10 still describes the numbering the change replaced"
+let reviewerDecisionClaim: String! = "discount takes percent as a bare number, not a Decimal"
+let reviewerSpeculativeClaim: String! = "If a future caller passes a fraction, the discount will be tiny."
+let reviewerShapeClaim: String! = "subtracting a rate from a total cannot express tiered discounts"
+
+let checkReviewerReport: String! {
+  let fx = reviewerFixture
+  let general = reviewerFindings([
+    # 1: cited a line off; anchored where the quote is (line 2).
+    reviewerFinding("IMPORTANT", reviewerDiscountClaim, [reviewerAt("calc.py", 3, "rate = percent / 10")],
+      "\"worth\": \"every discount is wrong\", \"fix\": \"divide by 100\", \"reproduction\": \"ran discount(100, 50) and got -400\""),
+    # 2: outside every hunk and not caused by the change: PRE-EXISTING. A
+    # multi-line quote with the read tool's line prefixes.
+    reviewerFinding("IMPORTANT", reviewerEvalClaim, [reviewerAt("calc.py", 18, "    17→def legacy(x):\n    18→    return eval(x)")],
+      "\"fix\": \"use ast.literal_eval\", \"causedByChange\": false"),
+    # Dropped mechanically.
+    reviewerFinding("IMPORTANT", "nope.py is broken", [reviewerAt("nope.py", 1, "x = 1")], ""),
+    reviewerFinding("IMPORTANT", "line 99 is broken", [reviewerAt("calc.py", 99, "rate = percent / 10")], ""),
+    reviewerFinding("IMPORTANT", "the rate is wrong", [reviewerAt("calc.py", 2, "rate = percent / 100")], ""),
+    # 3: stale docs outside the hunks, caused by the change.
+    reviewerFinding("NIT", reviewerStaleClaim, [reviewerAt("notes.txt", 10, "line 10")],
+      "\"fix\": \"renumber it\", \"causedByChange\": true, \"reproduction\": \"not run\""),
+  ])
+  let behavior = reviewerFindings([
+    # 4: finding 1 again, quoting where it shows.
+    reviewerFinding("CONCERN", "a 50 percent discount makes the total negative", [reviewerAt("calc.py", 3, "return total - total * rate")], "\"fix\": \"divide by 100\""),
+    # 5: a decision to record, as the finder files it.
+    reviewerFinding("CONCERN", reviewerDecisionClaim, [reviewerAt("calc.py", 1, "def discount(total, percent):")],
+      "\"noClearFix\": {\"kind\": \"Decision\", \"why\": \"record in CLAUDE.md that percent is a plain number\"}"),
+    # 6: speculation the editor drops.
+    reviewerFinding("CONCERN", reviewerSpeculativeClaim, [reviewerAt("calc.py", 2, "rate = percent / 10")], "\"fix\": \"clamp it\""),
+    # 7: foundational.
+    reviewerFinding("CONCERN", reviewerShapeClaim, [reviewerAt("calc.py", 3, "return total - total * rate")],
+      "\"noClearFix\": {\"kind\": \"foundational\", \"why\": \"the signature is public; tiers need a different shape before release\"}, \"fix\": \"ignored\""),
+  ])
+  let editor = JSON.encode({{
+    problems: [
+      {{findings: [4, 1], lead: 1, severity: "IMPORTANT", decision: ""}},
+      {{findings: [7], lead: 7, severity: "CONCERN", decision: ""}},
+      {{findings: [3, 99], lead: 3, severity: "NIT", decision: ""}},
+      {{findings: [5], lead: 5, severity: "CONCERN", decision: ""}},
+      {{findings: [2], lead: 2, severity: "IMPORTANT", decision: ""}},
+      {{findings: [99], lead: 99, severity: "NIT", decision: ""}},
+    ],
+    dropped: [
+      {{finding: 6, why: "speculative: no caller passes fractions"}},
+      {{finding: 1, why: "already merged, so ignored"}},
+    ],
+  }})
+  let report = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: [general, behavior, "Looks good to me!", "REVIEWER SUB-AGENT FAILED: boom"],
+    editorReply: "```json\n" + editor + "\n```",
+  )
+  let lines = report.split("\n")
+  assert(message: report) { (lines[0] ?? "") == "1 important, 1 concern, 1 nit, 1 pre-existing, 1 decision to record" }
+  assert(message: report) { (lines[1] ?? "").hasPrefix("Incomplete: a finder did not answer") }
+  # The merged problem: the lead's claim, stake, quote, reproduction and
+  # fix, the other member's location, both finders.
+  assert(message: report) {
+    report.contains("\n\nIMPORTANT:\n- calc.py:2 — " + reviewerDiscountClaim + "\n" +
+      "  worth it: every discount is wrong\n" +
+      "      rate = percent / 10\n" +
+      "  reproduced: ran discount(100, 50) and got -400\n" +
+      "  fix: divide by 100\n" +
+      "  also at calc.py:3 · found by general, behavior\n")
+  }
+  assert(message: report) {
+    report.contains("\n\nCONCERN:\n- calc.py:3 — " + reviewerShapeClaim + "\n" +
+      "      return total - total * rate\n" +
+      "  no clear fix, the approach is at risk: the signature is public; tiers need a different shape before release\n" +
+      "  found by behavior\n")
+  }
+  # A nit: no stake or quote; "not run" is no reproduction.
+  assert(message: report) {
+    report.contains("\n\nNIT:\n- notes.txt:10 — " + reviewerStaleClaim + "\n" +
+      "  fix: renumber it\n" +
+      "  outside the hunks but caused by the change: post it on the conversation · found by general\n")
+  }
+  assert(message: report) { report.contains("\n\nPRE-EXISTING (outside the hunks, not caused by the change):\n- calc.py:18 — " + reviewerEvalClaim + "\n") }
+  assert(message: report) {
+    report.contains("\n\nDECISIONS TO RECORD (defensible choices, not defects):\n- calc.py:1 — " + reviewerDecisionClaim + "\n" +
+      "  record: record in CLAUDE.md that percent is a plain number\n" +
+      "  found by behavior\n")
+  }
+  # Sections in order.
+  let order = ["IMPORTANT:", "CONCERN:", "NIT:", "PRE-EXISTING", "DECISIONS TO RECORD", "Reviewed ", "Dropped by the editor", "Dropped by the evidence checks"]
+  order.each { h, i =>
+    let next = order[i + 1]
+    if (next != null) {
+      assert(message: h + " before " + next + "\n" + report) { (report.split(next)[0] ?? "").contains(h) }
+    }
+  }
+  # One footer line: the range, the sub-agents and what failing tests under
+  # them are.
+  assert(message: report) { report.contains("(1 commit, 2 files changed) with 4 finders and an editor; composed from (canned replies). Failing tests or checks under these sub-agents are the reviewers' own reproductions, not this change's CI.") }
+  # What was dropped, and why, one line each.
+  assert(message: report) { report.contains("Dropped by the editor (1):\n- calc.py:2 — " + reviewerSpeculativeClaim + " (behavior): speculative: no caller passes fractions") }
+  assert(message: report) {
+    report.contains("Dropped by the evidence checks (5):\n" +
+      "- nope.py:1 (general): path does not exist at head\n" +
+      "- calc.py:99 (general): line does not exist at head (calc.py has 18 lines)\n" +
+      "- calc.py:2 (general): quoted code does not appear in that file at head\n" +
+      "- finder \"design\" replied without readable findings JSON\n" +
+      "- finder \"general-2\" failed: boom")
+  }
+  # No state, no votes, no caps.
+  assert(message: report) { !report.contains("fingerprint") and !report.contains("votes") and !report.contains("Editor:") }
+
+  # The editor can file a finding as a decision to record; a finding it
+  # does not rule on is shown unedited, and the report says so. A location
+  # that does not hold is named, not fatal.
+  let partial = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: [reviewerFindings([
+      reviewerFinding("CONCERN", reviewerDecisionClaim, [reviewerAt("calc.py", 2, "rate = percent / 10"), reviewerAt("calc.py", 99, "x")], "\"fix\": \"use Decimal\""),
+      reviewerFinding("NIT", "line 25 lost its number", [reviewerAt("notes.txt", 25, "changed")], "\"fix\": \"renumber it\""),
+    ])],
+    editorReply: "{\"problems\": [{\"findings\": [1], \"lead\": 1, \"severity\": \"CONCERN\", \"decision\": \"record in CLAUDE.md that percent is a whole number\"}]}",
+  )
+  assert(message: partial) { (partial.split("\n")[0] ?? "") == "1 nit, 1 decision to record" }
+  assert(message: partial) { (partial.split("\n")[1] ?? "") == "Editor: the editor did not rule on 1 finding, shown unedited." }
+  assert(message: partial) {
+    partial.contains("- calc.py:2 — " + reviewerDecisionClaim + "\n" +
+      "  record: record in CLAUDE.md that percent is a whole number\n" +
+      "  cited but not found at head: calc.py:99 (line does not exist at head (calc.py has 18 lines)) · found by general")
+  }
+  # An added "++ plus" line reads "+++ plus" in the diff; it is content, so
+  # the later hunk at line 25 still belongs to notes.txt.
+  assert(message: partial) { partial.contains("NIT:\n- notes.txt:25 — line 25 lost its number\n  fix: renumber it\n  found by general") }
+
+  # An editor that fails or answers in prose changes nothing, and says so.
+  let two = [reviewerFindings([
+    reviewerFinding("NIT", "line 25 lost its number", [reviewerAt("notes.txt", 25, "changed")], "\"fix\": \"renumber it\""),
+    reviewerFinding("NIT", reviewerStaleClaim, [reviewerAt("notes.txt", 10, "line 10")], "\"fix\": \"renumber it\", \"causedByChange\": true"),
+  ])]
+  let prose = reviewer.tally(source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, finderReplies: two, editorReply: "Both look fine to me.")
+  assert(message: prose) { (prose.split("\n")[0] ?? "") == "2 nits" and prose.contains("Editor: the editor replied without the JSON, so nothing was merged or dropped.") }
+  let failed = reviewer.tally(source: fx.feature.asWorkspace, head: fx.feature, base: fx.main, finderReplies: two, editorReply: "REVIEWER SUB-AGENT FAILED: out of tokens")
+  assert(message: failed) { (failed.split("\n")[0] ?? "") == "2 nits" and failed.contains("Editor: the editor failed, so nothing was merged or dropped: out of tokens.") }
+
+  # Nothing found: no editor runs, whatever reply is canned.
+  let none = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: ["```json\n{\"findings\": []}\n```"],
+    editorReply: "{\"problems\": [], \"dropped\": []}",
+  )
+  assert(message: none) { (none.split("\n")[0] ?? "") == "Nothing to fix." and none.contains(" with 1 finder; composed from") and !none.contains("Incomplete") }
+
+  # A reply that does not fit the shape is no answer.
+  let sloppy = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: ["{\"error\": \"timed out\"}"],
+  )
+  assert(message: sloppy) { (sloppy.split("\n")[1] ?? "").hasPrefix("Incomplete") and sloppy.contains("finder \"general\" replied without readable findings JSON") }
+
+  # A mistyped optional field loses only itself: a line as text still
+  # reads ("25-27" is line 25), a causedByChange that is not a boolean is
+  # false, and a bare list of findings is an answer.
+  let lenient = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: [
+      "[{\"severity\": \"NIT\", \"claim\": \"line 25 lost its number\", \"fix\": \"renumber it\", \"causedByChange\": \"yes\", \"locations\": [{\"path\": \"notes.txt\", \"line\": \"25-27\", \"evidence\": \"changed\"}]}]",
+    ],
+  )
+  assert(message: lenient) { (lenient.split("\n")[0] ?? "") == "1 nit" and lenient.contains("- notes.txt:25 — line 25 lost its number") and !lenient.contains("Incomplete") }
+
+  # A merged problem is anchored in the hunks whichever member leads, and
+  # the editor's say on causedByChange wins over the finder's.
+  let anchoring = reviewer.tally(
+    source: fx.feature.asWorkspace,
+    head: fx.feature,
+    base: fx.main,
+    finderReplies: [reviewerFindings([
+      reviewerFinding("IMPORTANT", reviewerDiscountClaim, [reviewerAt("calc.py", 2, "rate = percent / 10")], "\"fix\": \"divide by 100\""),
+      reviewerFinding("IMPORTANT", "an item without a price raises AttributeError", [reviewerAt("calc.py", 8, "result += item.price")], "\"fix\": \"default the price\", \"reproduction\": \"total([object()]) raised\""),
+      reviewerFinding("CONCERN", reviewerEvalClaim, [reviewerAt("calc.py", 18, "return eval(x)")], "\"fix\": \"use ast.literal_eval\", \"causedByChange\": true"),
+    ])],
+    editorReply: "{\"problems\": [{\"findings\": [1, 2], \"lead\": 2, \"severity\": \"IMPORTANT\"}, {\"findings\": [3], \"lead\": 3, \"severity\": \"CONCERN\", \"causedByChange\": false}]}",
+  )
+  assert(message: anchoring) { (anchoring.split("\n")[0] ?? "") == "1 important, 1 pre-existing" }
+  assert(message: anchoring) {
+    anchoring.contains("IMPORTANT:\n- calc.py:2 — an item without a price raises AttributeError\n" +
+      "      rate = percent / 10\n" +
+      "  reproduced: total([object()]) raised\n" +
+      "  fix: default the price\n" +
+      "  also at calc.py:8 · found by general\n")
+  }
+  assert(message: anchoring) { anchoring.contains("PRE-EXISTING (outside the hunks, not caused by the change):\n- calc.py:18 — " + reviewerEvalClaim) }
+  "Reviewer report checks passed."
+}
+
+let checkReviewerComposition(source: Workspace!): String! {
+  # Default composition picks the reviewer's agent, never its roles.
+  let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "reviewer/**").items.{{ uri }}.map { a => a.uri }
+  assert(message: defaults.join(", ")) { defaults.any { u => u.contains("reviewer/agent") } }
+  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("reviewer/finder") or u.contains("reviewer/editor") } }
+
+  let chief = llm.withWorkspace(source).spawn(
+    name: "reviewer-composition-chief",
+    expertise: expertiseAt(source, "dag://committer/agent")
+      + expertiseAt(source, "dag://contributor/agent")
+      + expertiseAt(source, "dag://staff/agent")
+      + expertiseAt(source, "dag://reviewer/agent"),
+  )
+  let picked = reviewer.subagentExpertise(caller: chief, role: "finder").{{ id, artifact.{{ uri }} }}
+  let selected = picked.map { e => node(id: e.id).{{ ... on Expertise! }} }
+  let editors = reviewer.subagentExpertise(caller: chief, role: "editor").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri }
+  let finder = llm.withWorkspace(source).spawn(name: "reviewer-composition-finder", expertise: selected);
+  {
+    # Staff and reviewer are gone; contributor and committer are read-only.
+    let uris = picked.map { e => e.artifact.uri }
+    assert(message: uris.join(", ")) { uris.length == 3 }
+    assert(message: uris.join(", ")) { (uris[0] ?? "").contains("committer/readonly") and (uris[1] ?? "").contains("contributor/readonly") and (uris[2] ?? "").contains("reviewer/finder") }
+    assert(message: editors.join(", ")) { editors.length == 3 and (editors[2] ?? "").contains("reviewer/editor") }
+
+    let conversation = finder.snapshot.sync
+    assert(message: recordedUris(conversation).join(", ")) { recordedUris(conversation) == uris }
+    let names = composedToolNames(conversation, llm.withWorkspace(source))
+    ["gh", "reviewComments", "checkout", "commit", "cherryPick", "diff"].each { n =>
+      assert(message: names.join(", ")) { names.any { t => t == n or t.hasSuffix("_" + n) } }
+    }
+    ["push", "comment", "updateComment", "pushBranch", "review", "spawn", "sendTo", "askChief"].each { n =>
+      assert(message: names.join(", ")) { !names.any { t => t == n or t.hasSuffix("_" + n) } }
+    }
+    let prompts = systemTexts(conversation)
+    assert { prompts.any { t => t.contains("You are an adversarial reviewer in a code review") } }
+    assert { prompts.any { t => t.contains("READ-ONLY GitHub tools") } }
+    assert { !prompts.any { t => t.contains("You can hire and direct a staff") or t.contains("You have a code reviewer") } }
+
+    # Without a reviewer entry there is no role to compose.
+    let bare = llm.withWorkspace(source).spawn(name: "reviewer-composition-bare", expertise: expertiseAt(source, "dag://committer/agent"))
+    let missing = reviewer.subagentExpertise(caller: bare, role: "finder").{{ id }}.length rescue { e: Error => -1 }
+    bare.stop
+    assert { missing == -1 }
+
+    # A committer entry discovered in a workspace whose committer has no
+    # read-only role (an older one) gets the role from where reviewer's
+    # entry came from, never the full agent.
+    let older = directory
+      .withNewFile("dagger.toml", "[modules.committer]\nsource = \"committer\"\n")
+      .withDirectory("committer", agentModule("committer", "Committer", "older committer", "olderRead"))
+      .asWorkspace
+    let mixed = llm.withWorkspace(source).spawn(
+      name: "reviewer-composition-mixed",
+      expertise: expertiseAt(older, "dag://committer/agent") + expertiseAt(source, "dag://reviewer/agent"),
+    )
+    let fallback = reviewer.subagentExpertise(caller: mixed, role: "editor").{{ artifact.{{ uri }} }}.map { e => e.artifact.uri } rescue {
+      err: Error => {
+        mixed.stop
+        raise err.message
+      }
+    }
+    mixed.stop
+    assert(message: fallback.join(", ")) { fallback.length == 2 and (fallback[0] ?? "").contains("committer/readonly") and (fallback[1] ?? "").contains("reviewer/editor") }
+    null
+  } rescue { e: Error => {
+    finder.stop
+    chief.stop
+    raise e.message
+  }}
+  finder.stop
+  chief.stop
+  "Reviewer composition checks passed."
+}
+
+let checkReviewerTools(source: Workspace!): String! {
+  let plumbing = ["finder", "editor", "subagentExpertise", "tally", "agent"]
+  # review takes the calling agent, which only an owning agent supplies.
+  let unowned = composedToolNames(reviewer.agent(llm.withWorkspace(source)), llm.withWorkspace(source))
+  assert(message: unowned.join(", ")) { !unowned.contains("review") }
+  let caller = llm.withWorkspace(source).spawn(name: "reviewer-tools-caller", expertise: expertiseAt(source, "dag://reviewer/agent"))
+  let conversation = caller.snapshot.sync
+  caller.stop
+  let names = composedToolNames(conversation, llm.withWorkspace(source))
+  assert(message: names.join(", ")) { names == ["review"] }
+  plumbing.each { n =>
+    assert(message: names.join(", ")) { !names.contains(n) }
+  }
+  assert { systemTexts(conversation).any { t => t.contains("REVIEW YOUR OWN CHANGE") and t.contains("THE REVIEWERS' REPRODUCTIONS") and t.contains("SEVERAL REVIEWS RUN AT ONCE") } }
+  "Reviewer tool visibility checks passed."
+}

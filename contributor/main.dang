@@ -122,6 +122,16 @@ type Contributor {
   # The GitHub repository bare issue/PR numbers resolve against. Private:
   # configured in settings, not steered per-call.
   let remote: String! = ""
+  # Set only by the read-only role (via asReadOnly); private and never
+  # cleared, so no caller or tool can flip it back. When set, gh runs read
+  # verbs only, the write tools refuse, and checkout never adopts the
+  # target's agents.
+  let readOnlyMode: Boolean! = false
+
+  # Never tools: the read-only role and the self-call it binds through.
+  let plumbing = ["readonly", "asReadOnly"]
+  # Tools with effects outside the workspace, hidden from the read-only role.
+  let writeTools = ["comment", "updateComment", "pushBranch"]
 
   new(
     """
@@ -160,9 +170,51 @@ type Contributor {
   Compose the contributor tools onto a base LLM.
   """
   agent(base: LLM!): LLM! @agent {
+    # Read-only is sticky: once the read-only role is recorded on the
+    # conversation, a later composition of this default entry (an editor
+    # install, a checkout adopting a target that installs contributor) adds
+    # nothing. Refreshing the module reruns the recorded role, which keeps
+    # the read-only binding; binding the full toolset here would replace it,
+    # since the engine keeps one binding per object type.
+    if (readOnlyRecorded(base)) {
+      return base
+    }
     base
-      .withTools(currentNode)
+      .withTools(currentNode, except: plumbing)
       .withSystemPrompt(systemPrompt)
+  }
+
+  """
+  The read-only role: compose the contributor tools minus everything with an
+  effect on GitHub or another remote. `comment`, `updateComment` and
+  `pushBranch` are not tools; `gh` runs read verbs only (view/list/diff/
+  checks/status, search, and `api` GET requests); `checkout` switches the
+  workspace but never adopts the target's agents.
+
+  Not @agent, so default composition never selects it. A role that must not
+  publish anything (e.g. a reviewer's finders and editor) composes it by
+  address as `dag://contributor/readonly` INSTEAD of `dag://contributor/agent`.
+  The engine records it on the conversation, so reload refreshes the role in
+  place, and a later composition of `contributor/agent` leaves it read-only.
+  """
+  readonly(base: LLM!): LLM! {
+    base
+      # A distinct binding version: if a recomposition ever swaps the full
+      # binding for this one, the engine resets the receiver to the new
+      # (read-only) object instead of carrying the old object's state over
+      # (core/agents_reload.go preserveRecomposedTools).
+      .withTools(currentNode.{{... on Dagger.Contributor!}}.asReadOnly, except: plumbing + writeTools, version: 1)
+      .withSystemPrompt(readOnlyPrompt)
+  }
+
+  """
+  This toolset in read-only mode. Internal plumbing for the read-only role:
+  a real self-call, so the bound object has engine identity. There is no
+  way back.
+  """
+  asReadOnly: Contributor! {
+    self.readOnlyMode = true
+    self
   }
 
   """
@@ -215,6 +267,13 @@ type Contributor {
     let skipNext = false
     let hasRepoFlag = false
     let done = false
+    # Flags gh does not know take a value are ambiguous to this parser but
+    # not to gh: cobra assumes an unknown flag takes one, so in
+    # `pr --comment list close 1` gh runs `close`, while this loop reads
+    # `list`. Read-only mode refuses any such flag before the command or
+    # subcommand it gates on (see ghReadOnlyAllowed).
+    let flagBeforeCmd = false
+    let flagBeforeSub = false
     args.each { a =>
       if (done) {
         # Everything after "--" is positional to gh, but never the command.
@@ -231,6 +290,11 @@ type Contributor {
           hasRepoFlag = true
         } else if (a == "--hostname") {
           skipNext = true
+        } else if (positional.length == 0) {
+          flagBeforeCmd = true
+          flagBeforeSub = true
+        } else if (positional.length == 1) {
+          flagBeforeSub = true
         }
       } else if (positional.length < 2) {
         positional = positional + [a]
@@ -238,6 +302,12 @@ type Contributor {
     }
     let cmd = positional[0] ?? ""
     let sub = positional[1] ?? ""
+
+    # Read-only mode is an ALLOWLIST, not a longer denylist: a verb gh adds
+    # later stays refused until someone decides it only reads.
+    if (readOnlyMode and !ghReadOnlyAllowed(cmd, sub, args, flagBeforeCmd, flagBeforeSub)) {
+      raise `gh ${args.join(" ")} is not available in read-only mode: ` + "only read verbs run here (view/list/diff/checks/status, search, and `api` GET requests without graphql). Nothing in this role may change GitHub."
+    }
 
     if (["auth", "config", "secret", "ssh-key", "gpg-key", "extension", "extensions", "ext", "alias", "codespace", "cs"].contains(cmd)) {
       raise `gh ${cmd} is not available from this tool: it manages the gh installation or the GitHub account, not the project.`
@@ -359,6 +429,9 @@ type Contributor {
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): posting a comment is a side effect, not something to
     # replay from the session cache.
+    if (readOnlyMode) {
+      raise readOnlyError("comment")
+    }
     let tok = token
     if (tok == null) {
       raise noTokenError
@@ -458,6 +531,9 @@ type Contributor {
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): reads the live text, then edits it — never replay
     # either from the session cache.
+    if (readOnlyMode) {
+      raise readOnlyError("updateComment")
+    }
     let tok = token
     if (tok == null) {
       raise noTokenError
@@ -628,6 +704,9 @@ type Contributor {
   ): String! @cache(policy: FunctionCachePolicy.Never) {
     # @cache(Never): pushing is an effect on the remote; a later identical
     # call must push again, not replay the first result.
+    if (readOnlyMode) {
+      raise readOnlyError("pushBranch")
+    }
     if (branch.trimSpace == "") {
       raise "pushBranch: the destination branch must not be empty"
     }
@@ -807,6 +886,12 @@ type Contributor {
     let where = prepared.where
 
     let switched = llm.withWorkspace(target)
+    if (readOnlyMode) {
+      # The target's agents are its own code, and a read-only role must not
+      # gain tools from what it is reviewing.
+      print(`Checked out ${where}. Your tools now operate on this checkout, unchanged; ` + "in read-only mode the target's agents are never adopted.")
+      return switched
+    }
     if (!composeAgents) {
       print(`Checked out ${where}. Your tools now operate on this checkout.`)
       return switched
@@ -1104,6 +1189,125 @@ type Contributor {
     before + ["--repo", slug] + args.dropFirst(before.length)
   }
 
+  # ---- read-only mode -----------------------------------------------------
+
+  # Whether the read-only role is recorded on a conversation: the `readonly`
+  # entry of the contributor module. Expertise names are command names,
+  # "<module>:<function>".
+  let readOnlyRecorded(base: LLM!): Boolean! {
+    base.expertise.{{ name, originalModule.{{ name }} }}.any { e =>
+      e.originalModule.name == "contributor" and (e.name == "readonly" or e.name.hasSuffix(":readonly"))
+    }
+  }
+
+  # The gh invocations read-only mode runs: read verbs of each command, every
+  # search, and `api` requests that are GET by construction. Everything else
+  # — create/edit/merge/close/reopen/ready/delete/rerun/cancel/run/fork/...,
+  # and any command gh adds later — is refused. So is any flag before the
+  # token a decision rests on (the command for search/status/api, else the
+  # subcommand), other than -R/--repo/--hostname: gh may read that flag as
+  # taking the next token, and run a different subcommand than this saw.
+  let ghReadOnlyAllowed(cmd: String!, sub: String!, args: [String!]!, flagBeforeCmd: Boolean!, flagBeforeSub: Boolean!): Boolean! {
+    if (flagBeforeCmd) {
+      return false
+    }
+    let reads = ["view", "list", "ls"]
+    if (cmd == "search" or (cmd == "status" and sub == "")) {
+      return true
+    }
+    if (cmd == "api") {
+      return apiReadOnly(args)
+    }
+    if (flagBeforeSub) {
+      return false
+    }
+    if (cmd == "pr") {
+      return (reads + ["diff", "checks", "status"]).contains(sub)
+    }
+    if (cmd == "issue") {
+      return (reads + ["status"]).contains(sub)
+    }
+    if (["release", "run", "workflow", "repo", "gist"].contains(cmd)) {
+      return reads.contains(sub)
+    }
+    if (cmd == "label" or cmd == "cache") {
+      return ["list", "ls"].contains(sub)
+    }
+    if (cmd == "ruleset") {
+      return (reads + ["check"]).contains(sub)
+    }
+    false
+  }
+
+  # A `gh api` call that cannot write, decided by an ALLOWLIST parse of the
+  # whole command line rather than by looking for write flags, which gh's
+  # parser (pflag) can hide: combined short flags (`-iXPUT`, `-iftitle=x`)
+  # and decoys consumed as another flag's value (`-q -XGET`). Every token
+  # must be the `api` command, one endpoint that is not graphql (queries and
+  # mutations share it), or a flag gh reads the way this does: read-only
+  # flags spelled alone, value flags with their value, a GET/HEAD method,
+  # and fields only with an explicit GET (gh defaults to POST once a -f/-F
+  # field is given). Anything else — --input, an unknown or combined flag,
+  # a second positional — is refused.
+  let apiReadOnly(args: [String!]!): Boolean! {
+    let switches = ["-i", "--include", "--paginate", "--slurp", "--silent", "--verbose"]
+    let valued = ["-H", "--header", "-q", "--jq", "-t", "--template", "--cache", "-R", "--repo", "--hostname"]
+    let fieldFlags = ["-f", "-F", "--field", "--raw-field"]
+    let ok = true
+    let expect = ""
+    let sawApi = false
+    let endpoint = ""
+    let fields = false
+    let readMethod = false
+    args.each { t =>
+      if (!ok) {
+        null
+      } else if (expect == "value") {
+        expect = ""
+      } else if (expect == "method") {
+        expect = ""
+        let m = t.toUpper
+        if (m == "GET" or m == "HEAD") { readMethod = true } else { ok = false }
+      } else if (t == "-X" or t == "--method") {
+        expect = "method"
+      } else if (t.hasPrefix("--method=") or t.hasPrefix("-X")) {
+        let m = t.trimPrefix("--method=").trimPrefix("-X").toUpper
+        if (m == "GET" or m == "HEAD") { readMethod = true } else { ok = false }
+      } else if (valued.contains(t)) {
+        expect = "value"
+      } else if (fieldFlags.contains(t)) {
+        fields = true
+        expect = "value"
+      } else if (t.hasPrefix("--field=") or t.hasPrefix("--raw-field=")) {
+        fields = true
+      } else if (switches.contains(t)) {
+        null
+      } else if (valued.any { v => v.hasPrefix("--") and t.hasPrefix(v + "=") }) {
+        null
+      } else if (t.hasPrefix("-")) {
+        ok = false
+      } else if (!sawApi) {
+        sawApi = t == "api"
+        ok = sawApi
+      } else if (endpoint == "") {
+        endpoint = t
+      } else {
+        ok = false
+      }
+    }
+    if (!ok or expect != "" or endpoint == "") {
+      return false
+    }
+    if (endpoint == "graphql" or endpoint.hasSuffix("/graphql")) {
+      return false
+    }
+    !fields or readMethod
+  }
+
+  let readOnlyError(tool: String!): String! {
+    `${tool} is not available in read-only mode: this role must not change anything on GitHub or any other remote.`
+  }
+
   # Adopt the target's agents onto a conversation switched to it, in one
   # compose: every recorded entry is looked up again by its URI in the target
   # (a module the target also provides runs the target's version; one it
@@ -1238,6 +1442,22 @@ type Contributor {
     Comments posted by this tool are agent-authored and must be marked as
     such: start the body with ":robot:" so readers can tell the comment was
     written by a machine, not the human operator.
+  """
+
+  # Instructions for the agent holding the read-only role.
+  let readOnlyPrompt: String! = """
+    You have READ-ONLY GitHub tools: `gh` runs the GitHub CLI's read verbs
+    (`gh pr view 14174`, `gh pr diff 14174`, `gh pr checks 14174`, `gh issue
+    view 8`, `gh issue list --label bug`, `gh run view <id> --log-failed`,
+    `gh search ...`, and `gh api <path>` GET requests); `reviewComments` reads
+    a pull request's review threads with their diff context; `mount`
+    attaches another repository's checkout under mnt/<name>; `checkout`
+    switches this conversation to another repository.
+
+    Nothing you do here may change GitHub or any other remote: there is no
+    tool to comment, edit, push, merge, close or create anything, and `gh`
+    refuses every write verb. Local edits in your workspace are fine and stay
+    there. Report what you find in your reply instead of publishing it.
   """
 
   # Instructions for the agent holding these tools.

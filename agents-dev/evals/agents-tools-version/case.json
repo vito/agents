@@ -1,0 +1,32 @@
+{
+  "name": "agents-tools-version",
+  "title": "agents: version committer and staff tool state",
+  "pr": "https://github.com/vito/agents/commit/dfc7196a9f78876e51933c6d7283022f05e3e527",
+  "repo": "https://github.com/vito/agents",
+  "head": "dfc7196a9f78876e51933c6d7283022f05e3e527",
+  "base": "0e90428b9bc5b6b6f704cc275bde95fa70bc3af4",
+  "notes": "A 6-line commit (+6/-2 in committer/main.dang and staff/main.dang) whose bug lives outside the diff: it bumps the agent entries to withTools version 1 but leaves Committer's continuations binding at version 0. Ground truth from history: fixed by vito/agents#34 (416f96fbe2, merged 2026-10-16), and again as c6765e4 (committer: rebind tools at the agent's version) in this repository's history, so it is vetted real. Tests whether a reviewer reads the code the diff relies on, and stays quiet otherwise.",
+  "issues": [
+    {
+      "key": "continuations-bind-version-zero",
+      "kind": "bug",
+      "severity": "important",
+      "confidence": "confirmed",
+      "vetted": "real",
+      "locations": ["committer/main.dang:87", "committer/main.dang:388", "committer/main.dang:818", "committer/main.dang:1453", "committer/main.dang:1477"],
+      "summary": "Committer's agent entry now binds `withTools(currentNode, except: plumbing, version: 1)`, but reset, rebaseAbort and the rebase stop/finish paths return a continuation that rebinds Committer with `llm.withTools(tools, except: plumbing)`, i.e. version 0. After any of those tools, the next tool reload sees the version change (0 -> 1) and resets Committer's state: saved workspaces and an in-progress rebase are lost ('resetting tool state: its withTools version changed'). Fixed by vito/agents#34 (committer: keep the tools version in continuations: a shared toolsVersion and a continueWith helper) and c6765e4, which pass the same version in all four continuations."
+    }
+  ],
+  "sound": [
+    {
+      "key": "staff-has-no-continuations",
+      "vetted": null,
+      "summary": "Staff is bound with withTools only in its agent entry; its other withTools calls bind different objects (peers, chiefLine), so bumping Staff's version needs no other change."
+    },
+    {
+      "key": "version-discards-stale-state",
+      "vetted": null,
+      "summary": "A withTools version bump discards saved tool state from an older version instead of failing to load it, which is the commit's stated purpose (reloading sessions saved before the address/collection refactors)."
+    }
+  ]
+}
