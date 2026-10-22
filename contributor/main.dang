@@ -251,7 +251,8 @@ type Contributor {
   configured; pass `--repo owner/name` to target another repository.
 
   The gh-stack extension is installed: `gh stack link` links pull requests
-  into a stack on GitHub (see the system prompt on stacked pull requests).
+  into a stack on GitHub (see the system prompt on stacked pull requests;
+  not available in read-only mode).
 
   Not available here: account, config, secret, key, extension, alias and
   codespace management; `repo delete/archive/rename/edit`; `api` with a
@@ -350,16 +351,23 @@ type Contributor {
     # A configured remote is what bare numbers mean; inject it for the
     # subcommands that take --repo, unless the caller named a repository
     # themselves. `gh api` has no --repo: GH_REPO resolves its
-    # {owner}/{repo} placeholders instead, and `gh stack` (the gh-stack
-    # extension) reads it as the repository its stacks live in. Without a
-    # configured remote, gh resolves the repository from the mounted
-    # checkout's origin.
+    # {owner}/{repo} placeholders instead. `gh stack` (the gh-stack
+    # extension) has no --repo either and reads GH_REPO as the repository
+    # its stacks live in; it takes only the number from a PR URL, so PR URLs
+    # name the repository instead. Without a configured remote, gh resolves
+    # the repository from the mounted checkout's origin.
     let slug = remoteSlug
     let full = args
     if (slug != "" and !hasRepoFlag and ["issue", "pr", "release", "label", "run", "workflow"].contains(cmd)) {
       full = withRepoFlag(args, slug)
     }
-    let apiRepo = if (cmd == "api" or cmd == "stack") { slug } else { "" }
+    let apiRepo = if (cmd == "api") {
+      slug
+    } else if (cmd == "stack") {
+      stackRepo(args, slug)
+    } else {
+      ""
+    }
 
     # Plain, non-interactive output: no prompts, no pager, no color, no
     # update nag. The arguments reach gh as argv, never spliced into shell
@@ -1031,9 +1039,11 @@ type Contributor {
   }
 
   # The gh-stack agent skill, installed with `gh skill install` at a pinned
-  # version (so the exec caches) for the agent role's withSkills. Null when
-  # it cannot be installed: without a token gh cannot fetch it, and a skill
-  # that fails to install must not break composition of the tools.
+  # version for the agent role's withSkills. Null when it cannot be
+  # installed: without a token gh cannot fetch it, and a skill that fails to
+  # install must not break composition of the tools. The install never fails
+  # the exec, so a failure is cached like a success instead of re-running
+  # on every composition.
   let stackSkills: Directory {
     let tok = token
     if (tok == null) {
@@ -1043,7 +1053,8 @@ type Contributor {
       set -eu
       GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
       export GH_TOKEN
-      gh skill install github/gh-stack skills/gh-stack --pin "$GH_STACK_VERSION" --dir /skills
+      mkdir -p /skills
+      gh skill install github/gh-stack skills/gh-stack --pin "$GH_STACK_VERSION" --dir /skills || true
     """
     let dir = ghImage
       .withEnvVariable("GH_PROMPT_DISABLED", "1")
@@ -1052,12 +1063,11 @@ type Contributor {
       .withSecretVariable("GH_TOKEN", tok)
       .withExec(["sh", "-c", script])
       .directory("/skills")
-    # Force the install HERE, so a failure is rescued instead of surfacing
-    # later from inside the conversation.
-    dir.entries rescue {
-      e: Error => return null
+    # Decide HERE, so nothing surfaces later from inside the conversation.
+    let installed = dir.exists("gh-stack/SKILL.md") rescue {
+      e: Error => false
     }
-    dir
+    if (installed) { dir } else { null }
   }
 
   # The workspace files the toolbox sees. Workspace.directory includes
@@ -1264,6 +1274,25 @@ type Contributor {
   let withRepoFlag(args: [String!]!, slug: String!): [String!]! {
     let before = args.takeWhile { t => t != "--" }
     before + ["--repo", slug] + args.dropFirst(before.length)
+  }
+
+  # The repository a `gh stack` call operates on: the one its PR URL
+  # arguments name, else the configured remote ("" leaves it to the
+  # checkout's origin). gh-stack reads only the number from a PR URL and
+  # looks it up in GH_REPO, so URLs naming several repositories are refused.
+  let stackRepo(args: [String!]!, slug: String!): String! {
+    let named: [String!]! = []
+    args.each { a =>
+      let m = a.match(`github\.com/([^/]+)/([^/]+)/pull/\d+`)
+      if (m != null) {
+        named = named + [(m.captures[0] ?? "") + "/" + (m.captures[1] ?? "")]
+      }
+    }
+    let repos = named.uniq
+    if (repos.length > 1) {
+      raise `gh stack: these pull requests live in different repositories (${repos.join(", ")}); a stack lives in one repository`
+    }
+    repos[0] ?? slug
   }
 
   # ---- read-only mode -----------------------------------------------------
@@ -1595,7 +1624,8 @@ type Contributor {
     Stacked pull requests split a large change into a chain of small,
     dependent PRs, each based on the branch of the one below it, so each
     shows only its own layer's diff. The gh-stack skill (ReadSkill
-    "gh-stack") documents GitHub's `gh stack` extension, which `gh` runs —
+    "gh-stack", when ListSkills lists it; `gh stack <command> --help`
+    otherwise) documents GitHub's `gh stack` extension, which `gh` runs —
     but its local-branch commands (init, add, checkout, up/down/top/bottom,
     push, submit, sync, rebase, modify, view) are no use here: gh runs in a
     throwaway snapshot of the workspace, so whatever they do to local
@@ -1615,10 +1645,12 @@ type Contributor {
       ...`. Then link them, bottom to top, by URL: `gh stack link --base main
       <url-a> <url-b>` (URLs, not branch names, which link would try to push
       from the snapshot). Exit code 9 means stacked PRs are not enabled on
-      the repository: the chained PRs still stand; tell the user.
-    - Each description covers only its own layer. Do not list the other PRs
-      of the stack or say what it depends on: GitHub shows the stack's order
-      and navigation on every PR in it.
+      the repository: the chained PRs still stand, but GitHub shows no
+      stack, so add a one-line "Depends on #<predecessor>" to each PR above
+      the bottom with `updateComment`, and tell the user.
+    - Each description of a linked stack covers only its own layer. Do not
+      list the other PRs of the stack or say what it depends on: GitHub
+      shows the stack's order and navigation on every PR in it.
     - To change a lower layer, check out its branch, commit and push, then
       rebase each layer above onto the one below it and push it with
       `expectedRemoteSHA` (a lease). Merge with `gh stack merge <pr> --yes`

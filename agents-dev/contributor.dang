@@ -42,8 +42,14 @@ let checkContributorStack: String! {
   let fake = contributor(githubToken: setSecret("contributor-stack-test-token", "not-a-real-token"))
   let help = fake.gh(source: ws, args: ["stack", "link", "--help"])
   assert(message: help) { help.contains("Create or update a stack on GitHub") }
+  # gh-stack reads only the number from a PR URL, so URLs from two
+  # repositories are refused before gh runs.
+  let mixed = fake.gh(source: ws, args: ["stack", "link", "https://github.com/a/one/pull/1", "https://github.com/b/two/pull/2"]) rescue {
+    e: Error => e.message
+  }
+  assert(message: mixed) { mixed.contains("live in different repositories") }
   let composed = fake.agent(llm.withWorkspace(ws))
-  assert { composed.tools.contains("gh") }
+  assert { toolNames(composed.tools).contains("gh") }
   let skills = composed.skills.{{name}}.map { s => s.name }
   assert(message: skills.join(", ")) { !skills.contains("gh-stack") }
   "gh stack runs through gh; a failed skill install leaves the tools composed"
