@@ -41,26 +41,26 @@ let checkContributorStack: String! {
     .asWorkspace
   let fake = contributor(githubToken: setSecret("contributor-stack-test-token", "not-a-real-token"))
   let help = fake.gh(source: ws, args: ["stack", "link", "--help"])
-  assert(message: help) { help.contains("Create or update a stack on GitHub") }
+  assert("gh stack runs through the gh tool") { help.contains("Create or update a stack on GitHub") }
   # gh-stack reads only the number from a PR URL, so URLs from two
   # repositories are refused before gh runs.
   let mixed = fake.gh(source: ws, args: ["stack", "link", "https://github.com/a/one/pull/1", "https://github.com/b/two/pull/2"]) rescue {
     e: Error => e.message
   }
-  assert(message: mixed) { mixed.contains("live in different repositories") }
+  assert("refuses linking PRs from different repositories") { mixed.contains("live in different repositories") }
   # Merging a stack is the user's call, refused before gh runs.
   let merge = fake.gh(source: ws, args: ["stack", "merge", "42", "--yes"]) rescue {
     e: Error => e.message
   }
-  assert(message: merge) { merge.contains("gh stack merge is not available") }
+  assert("refuses gh stack merge") { merge.contains("gh stack merge is not available") }
   let hidden = fake.gh(source: ws, args: ["stack", "--remote", "origin", "merge", "42"]) rescue {
     e: Error => e.message
   }
-  assert(message: hidden) { hidden.contains("gh stack merge is not available") }
+  assert("refuses gh stack merge behind a leading flag") { hidden.contains("gh stack merge is not available") }
   let composed = fake.agent(llm.withWorkspace(ws))
-  assert { toolNames(composed.tools).contains("gh") }
+  assert("composes the gh tool") { toolNames(composed.tools).contains("gh") }
   let skills = composed.skills.{{name}}.map { s => s.name }
-  assert(message: skills.join(", ")) { !skills.contains("gh-stack") }
+  assert("omits the gh-stack skill when it cannot be installed") { !skills.contains("gh-stack") }
   "gh stack runs through gh; a failed skill install leaves the tools composed"
 }
 
