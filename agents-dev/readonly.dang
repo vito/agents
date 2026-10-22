@@ -82,15 +82,7 @@ let testContributorReadonly(source: Workspace!): String! {
   assert("full and read-only together keep gh") { bothNames.contains("gh") }
 
   # gh in read-only mode: write verbs are refused before gh runs.
-  let ws = container
-    .from("alpine:3.22")
-    .withExec(["apk", "add", "--no-cache", "git"])
-    .withWorkdir("/repo")
-    .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
-    .directory("/repo")
-    .asGit
-    .head
-    .asWorkspace
+  let ws = contributorEmptyRepo
   let token = setSecret("contributor-readonly-test-token", "not-a-real-token")
   let writable = contributor(githubToken: token)
   let reader = writable.asReadOnly

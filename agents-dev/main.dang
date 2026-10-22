@@ -85,7 +85,7 @@ type AgentsDev {
     null
   }
 
-  """Check `gh stack` runs through the gh tool, and a failed gh-stack skill install leaves the tools composed."""
+  """Check `gh stack` runs through the gh tool, merge and PR URLs from several repositories are refused, and a failed gh-stack skill install leaves the tools composed."""
   contributorStack: Void @check {
     print(checkContributorStack)
     null

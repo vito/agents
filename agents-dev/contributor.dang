@@ -1,8 +1,7 @@
-# Exercise the public GitHub command without authentication or an API request.
-# gh reads -F files before making a request; the final missing file keeps this
-# offline even if a regression allows the mounted dependency into the toolbox.
-let checkContributorMountsOutsideToolbox: String! {
-  let ws = container
+# A workspace on a one-commit git repository, for gh tool checks that need a
+# checkout but no remote.
+let contributorEmptyRepo: Workspace! {
+  container
     .from("alpine:3.22")
     .withExec(["apk", "add", "--no-cache", "git"])
     .withWorkdir("/repo")
@@ -11,6 +10,13 @@ let checkContributorMountsOutsideToolbox: String! {
     .asGit
     .head
     .asWorkspace
+}
+
+# Exercise the public GitHub command without authentication or an API request.
+# gh reads -F files before making a request; the final missing file keeps this
+# offline even if a regression allows the mounted dependency into the toolbox.
+let checkContributorMountsOutsideToolbox: String! {
+  let ws = contributorEmptyRepo
     .withNewFile("tmp/body.md", "draft\n")
     .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
   assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
@@ -26,19 +32,12 @@ let checkContributorMountsOutsideToolbox: String! {
   "mounts are excluded from the toolbox snapshot"
 }
 
-# The gh-stack extension runs through the gh tool (help needs no
-# authentication), and a token that cannot install the gh-stack skill still
-# composes the tools, just without the skill.
+# `gh stack` through the gh tool, offline with a fake token: the extension
+# runs (help needs no authentication), the guards refuse merging and PR URLs
+# from several repositories before gh runs, and a token that cannot install
+# the gh-stack skill still composes the tools, just without the skill.
 let checkContributorStack: String! {
-  let ws = container
-    .from("alpine:3.22")
-    .withExec(["apk", "add", "--no-cache", "git"])
-    .withWorkdir("/repo")
-    .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
-    .directory("/repo")
-    .asGit
-    .head
-    .asWorkspace
+  let ws = contributorEmptyRepo
   let fake = contributor(githubToken: setSecret("contributor-stack-test-token", "not-a-real-token"))
   let help = fake.gh(source: ws, args: ["stack", "link", "--help"])
   assert("gh stack runs through the gh tool") { help.contains("Create or update a stack on GitHub") }
@@ -61,7 +60,7 @@ let checkContributorStack: String! {
   assert("composes the gh tool") { toolNames(composed.tools).contains("gh") }
   let skills = composed.skills.{{name}}.map { s => s.name }
   assert("omits the gh-stack skill when it cannot be installed") { !skills.contains("gh-stack") }
-  "gh stack runs through gh; a failed skill install leaves the tools composed"
+  "gh stack runs through gh, merge and mixed repositories are refused, and a failed skill install leaves the tools composed"
 }
 
 let checkContributorCheckoutRefs: String! {
