@@ -1334,9 +1334,10 @@ type Contributor {
     let extras = expertise.{{ name }}.map { a => a.name }
     let adopted = llm.withWorkspace(target).compose(expertise: refreshed + expertise)
     # Composition is lazy: force it HERE, so a failure reaches checkout's
-    # rescue instead of poisoning the continuation.
-    adopted.model
-    {{conversation: adopted, extras: extras}}
+    # rescue instead of poisoning the continuation. Use sync, not model:
+    # resolving the model needs an LLM endpoint, which checkout must not.
+    let composed = adopted.sync
+    {{conversation: composed, extras: extras}}
   }
 
   # A plain switch: the fallback when adopting the target's agents fails,
