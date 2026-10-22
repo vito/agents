@@ -966,12 +966,12 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   # Every case on disk loads and validates, with its vetting note; files
   # beside the cases are not cases.
   let names = source.directory("agents-dev/evals").entries.filter { e => e.hasSuffix("/") }.map { e => e.trimSuffix("/") }
-  assert(message: names.join(", ")) { names.contains("dang-187") }
+  assert("the dang-187 case is on disk") { names.contains("dang-187") }
   names.each { n => loadReviewerEvalCase(source, n) }
   # What a live run's fixture carries over from this workspace's dagger.toml.
   let editor = reviewerEvalEditorSource(source)
   let token = reviewerEvalGithubToken(source)
-  assert(message: editor + " / " + token) { editor.contains("editor") and token != "" }
+  assert("the live fixture carries the editor source and github token") { editor.contains("editor") and token != "" }
 
   # Validation catches what it should.
   let bad = decodeReviewerEvalCase(reviewerEvalSyntheticCase
@@ -980,24 +980,24 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     .replace("\"vetted\": \"dismiss\"", "\"vetted\": \"maybe\"")
     .replace("\"key\": \"s\"", "\"key\": \"duplicate\""))
   let problems = reviewerEvalProblems(bad).join("\n")
-  assert(message: problems) { problems.contains("head \"1111111\" is not a full 40-character commit SHA") }
-  assert(message: problems) { problems.contains("key \"a\" is used more than once") }
-  assert(message: problems) { problems.contains("a: kind \"nit\" is not one of") }
-  assert(message: problems) { problems.contains("a: severity \"high\" is not important or minor") }
-  assert(message: problems) { problems.contains("a: vetted \"maybe\" is not null, real or dismiss") }
-  assert(message: problems) { problems.contains("u: vetted \"maybe\" is not null, sound or dismiss") }
-  assert(message: problems) { problems.contains("key \"duplicate\" is reserved") }
-  assert(message: problems) { !problems.contains("base") }
+  assert("validation rejects a short head SHA") { problems.contains("head \"1111111\" is not a full 40-character commit SHA") }
+  assert("validation rejects a duplicate issue key") { problems.contains("key \"a\" is used more than once") }
+  assert("validation rejects an unknown issue kind") { problems.contains("a: kind \"nit\" is not one of") }
+  assert("validation rejects an unknown severity") { problems.contains("a: severity \"high\" is not important or minor") }
+  assert("validation rejects an unknown issue vetted label") { problems.contains("a: vetted \"maybe\" is not null, real or dismiss") }
+  assert("validation rejects an unknown sound vetted label") { problems.contains("u: vetted \"maybe\" is not null, sound or dismiss") }
+  assert("validation rejects a reserved key") { problems.contains("key \"duplicate\" is reserved") }
+  assert("validation accepts a valid base") { !problems.contains("base") }
   let good = decodeReviewerEvalCase(reviewerEvalSyntheticCase)
   let none = reviewerEvalProblems(good)
-  assert(message: none.join("\n")) { none.isEmpty }
+  assert("the synthetic case validates cleanly") { none.isEmpty }
   # A known-clean case: no issues is fine with sound items, not without.
   let clean = ReviewerEvalCase(
     name: good.name, title: good.title, pr: good.pr, repo: good.repo, head: good.head, base: good.base,
     notes: good.notes, issues: [] :: [ReviewerEvalIssue!]!, sound: good.sound,
   )
   let cleanProblems = reviewerEvalProblems(clean)
-  assert(message: cleanProblems.join("\n")) { cleanProblems.isEmpty }
+  assert("a case with sound items and no issues validates") { cleanProblems.isEmpty }
   let blank = ReviewerEvalCase(
     name: good.name, title: good.title, pr: good.pr, repo: good.repo, head: good.head, base: good.base,
     notes: good.notes, issues: [] :: [ReviewerEvalIssue!]!, sound: [] :: [ReviewerEvalSound!]!,
@@ -1018,7 +1018,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     "### t", "vetted:", "",
     "### u", "vetted: dismiss",
   ].join("\n"))
-  assert(message: JSON.encode(note)) {
+  assert("the vetting note parses each heading's vetted line") {
     note == [
       {{key: "a", vetted: "real"}}, {{key: "b", vetted: ""}}, {{key: "c", vetted: "dismiss"}},
       {{key: "d", vetted: "real"}}, {{key: "e", vetted: "real"}},
@@ -1026,25 +1026,25 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     ]
   }
   let notProblems = reviewerEvalVettingProblems(good, note)
-  assert(message: notProblems.join("\n")) { notProblems.isEmpty }
+  assert("a vetting note that agrees with the case has no problems") { notProblems.isEmpty }
   let withNote = reviewerEvalWithVetting(good, note)
   let vetted = withNote.issues.map { i => i.vetted ?? "" }
-  assert(message: vetted.join(", ")) { vetted == ["real", "dismiss", "dismiss", "real", "real"] }
+  assert("the vetting note fills unvetted issues") { vetted == ["real", "dismiss", "dismiss", "real", "real"] }
   let vettedSound = withNote.sound.map { s => s.vetted ?? "" }
-  assert(message: vettedSound.join(", ")) { vettedSound == ["sound", "sound", "dismiss"] }
+  assert("the vetting note fills unvetted sound items") { vettedSound == ["sound", "sound", "dismiss"] }
   let clash = reviewerEvalVettingProblems(good, [
     {{key: "a", vetted: "dismiss"}}, {{key: "zz", vetted: "nope"}}, {{key: "t", vetted: "dismiss"}}, {{key: "s", vetted: "real"}},
   ]).join("\n")
-  assert(message: clash) { clash.contains("a: vetted \"real\" in case.json but \"dismiss\" in the vetting note") }
-  assert(message: clash) { clash.contains("\"zz\" is not an issue or sound key") and clash.contains("zz: \"nope\" is not blank, real or dismiss") }
-  assert(message: clash) { clash.contains("does not list b") and clash.contains("does not list e") and clash.contains("does not list u") }
-  assert(message: clash) { clash.contains("t: vetted \"sound\" in case.json but \"dismiss\" in the vetting note") }
-  assert(message: clash) { clash.contains("s: \"real\" is not blank, sound or dismiss") }
+  assert("the vetting note may not contradict an issue's label") { clash.contains("a: vetted \"real\" in case.json but \"dismiss\" in the vetting note") }
+  assert("the vetting note rejects unknown keys and labels") { clash.contains("\"zz\" is not an issue or sound key") and clash.contains("zz: \"nope\" is not blank, real or dismiss") }
+  assert("the vetting note must list every issue and sound item") { clash.contains("does not list b") and clash.contains("does not list e") and clash.contains("does not list u") }
+  assert("the vetting note may not contradict a sound item's label") { clash.contains("t: vetted \"sound\" in case.json but \"dismiss\" in the vetting note") }
+  assert("the vetting note rejects an issue label on a sound item") { clash.contains("s: \"real\" is not blank, sound or dismiss") }
   assert { reviewerEvalVettingProblems(good, [] :: [{{key: String!, vetted: String!}}!]!).isEmpty }
 
   # Rounding and weights.
   assert { reviewerEvalPercent(4, 9) == 44 and reviewerEvalPercent(2, 3) == 67 and reviewerEvalPercent(1, 2) == 50 and reviewerEvalPercent(0, 0) == 0 }
-  assert(message: reviewerEvalWeightsText) {
+  assert("the weights text lists every value weight") {
     reviewerEvalWeightsText == "guardrail +3, guidance +1, quick-fix +1, speed-bump -1, false -2, duplicate -1, alarmism -1"
   }
 
@@ -1109,19 +1109,18 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     }}!,
     judged: [{{id: Int!, value: String!, alarmism: Boolean!, match: String!, matchVotes: [String!]!, valueVotes: [String!]!, alarmVotes: Int!}}!]!,
   }}! = JSON.decode(card.json)
-  let msg = card.text + "\n" + card.json
-  assert(message: msg) { r.caseName == "synthetic" and r.samples == 3 and r.unanimous == 1 }
-  assert(message: msg) { r.judged.map { f => f.value } == ["guidance", "duplicate", "quick-fix", "disputed", "speed-bump", "false", "speed-bump"] }
-  assert(message: msg) { r.judged.map { f => f.match } == ["a", "a", "d", "none", "b", "s", "none"] }
-  assert(message: msg) { r.judged.map { f => f.alarmism } == [false, true, false, false, true, false, false] }
-  assert(message: msg) { r.judged.map { f => f.alarmVotes } == [0, 2, 0, 0, 3, 0, 0] }
-  assert(message: msg) {
+  assert("the scorecard names the case, sample count and unanimous findings") { r.caseName == "synthetic" and r.samples == 3 and r.unanimous == 1 }
+  assert("each finding gets its majority value") { r.judged.map { f => f.value } == ["guidance", "duplicate", "quick-fix", "disputed", "speed-bump", "false", "speed-bump"] }
+  assert("each finding gets its majority match") { r.judged.map { f => f.match } == ["a", "a", "d", "none", "b", "s", "none"] }
+  assert("a finding is alarmist by majority") { r.judged.map { f => f.alarmism } == [false, true, false, false, true, false, false] }
+  assert("alarm votes are counted per finding") { r.judged.map { f => f.alarmVotes } == [0, 2, 0, 0, 3, 0, 0] }
+  assert("match votes are kept per sample, missing ones unjudged") {
     r.judged.map { f => f.matchVotes } == [
       ["a", "a", "a"], ["a", "a", "b"], ["d", "none", "d"], ["none", "none", "none"],
       ["b", "b", "unjudged"], ["s", "s", "s"], ["none", "none", "unjudged"],
     ]
   }
-  assert(message: msg) {
+  assert("value votes are normalized and kept per sample") {
     r.judged.map { f => f.valueVotes } == [
       ["speed-bump", "speed-bump", "guardrail"], ["guardrail", "guardrail", "guardrail"],
       ["quick-fix", "quick-fix", "quick-fix"], ["guidance", "speed-bump", "false"],
@@ -1131,33 +1130,33 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   }
   # guidance +1, duplicate -1, quick-fix +1, disputed 0, speed-bump -1,
   # false -2, speed-bump -1, and two alarmist findings -1 each: -5.
-  assert(message: msg) { r.headline.valueScore == -5 }
-  assert(message: msg) { r.headline.noise == 5 and r.headline.speedBumps == 2 and r.headline.falseFindings == 1 and r.headline.alarmist == 2 }
-  assert(message: msg) { r.headline.findings == 7 and r.headline.words == 4 }
-  assert(message: msg) { r.headline.confirmedRecall == {{hit: 2, total: 2, percent: 100}} }
-  assert(message: msg) { r.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
-  assert(message: msg) { r.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} }
-  assert(message: msg) { r.values == {{guardrail: 0, guidance: 1, quickFix: 1, speedBump: 2, falseFinding: 1, duplicate: 1, disputed: 1, unjudged: 0}} }
-  assert(message: msg) { r.matched == ["a", "b", "d"] and r.missedConfirmed == [] }
-  assert(message: msg) { r.soundContradictions == [{{finding: 6, key: "s", vetted: "unvetted", judged: "false", value: "false"}}] }
-  assert(message: msg) { r.informational.recall == {{hit: 3, total: 5, percent: 60}} and r.informational.missed == ["c", "e"] }
-  assert(message: msg) { r.informational.byKind.bug == {{hit: 2, total: 2, percent: 100}} and r.informational.byKind.concern == {{hit: 0, total: 1, percent: 0}} }
-  assert(message: msg) { r.informational.byKind.cleanup == {{hit: 0, total: 1, percent: 0}} and r.informational.byKind.docs == {{hit: 1, total: 1, percent: 100}} }
+  assert("value score sums the weights") { r.headline.valueScore == -5 }
+  assert("noise counts speed bumps, false findings and alarmism") { r.headline.noise == 5 and r.headline.speedBumps == 2 and r.headline.falseFindings == 1 and r.headline.alarmist == 2 }
+  assert("the headline counts findings and review words") { r.headline.findings == 7 and r.headline.words == 4 }
+  assert("confirmed recall counts matched confirmed issues") { r.headline.confirmedRecall == {{hit: 2, total: 2, percent: 100}} }
+  assert("vetted-real recall counts matched real issues") { r.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
+  assert("raising a vetted-dismiss issue is counted") { r.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} }
+  assert("values tally each finding's verdict") { r.values == {{guardrail: 0, guidance: 1, quickFix: 1, speedBump: 2, falseFinding: 1, duplicate: 1, disputed: 1, unjudged: 0}} }
+  assert("matched lists the issues found, with no confirmed one missed") { r.matched == ["a", "b", "d"] and r.missedConfirmed == [] }
+  assert("a finding against a sound item is a sound contradiction") { r.soundContradictions == [{{finding: 6, key: "s", vetted: "unvetted", judged: "false", value: "false"}}] }
+  assert("informational recall counts all issues and lists the missed") { r.informational.recall == {{hit: 3, total: 5, percent: 60}} and r.informational.missed == ["c", "e"] }
+  assert("recall by kind covers bugs and concerns") { r.informational.byKind.bug == {{hit: 2, total: 2, percent: 100}} and r.informational.byKind.concern == {{hit: 0, total: 1, percent: 0}} }
+  assert("recall by kind covers cleanup and docs") { r.informational.byKind.cleanup == {{hit: 0, total: 1, percent: 0}} and r.informational.byKind.docs == {{hit: 1, total: 1, percent: 100}} }
   # a (3), b (1), d (1) of a and c (3 each) and b, d and e (1 each).
-  assert(message: msg) { r.informational.severityWeighted == {{hit: 5, total: 9, percent: 56}} }
+  assert("severity-weighted recall weighs important issues three times") { r.informational.severityWeighted == {{hit: 5, total: 9, percent: 56}} }
   # The table says the same.
-  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("value score", "-5", "(" + reviewerEvalWeightsText + ")")) }
-  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("noise", "5", "speed-bump 2 + false 1 + alarmist 2; lower is better")) }
-  assert(message: card.text) { card.text.contains(reviewerEvalNumberRow("findings", "7", "the review is 4 words")) }
-  assert(message: card.text) { card.text.contains(reviewerEvalRow("confirmed recall", {{hit: 2, total: 2, percent: 100}})) }
-  assert(message: card.text) { card.text.contains(reviewerEvalRow("vetted-real recall", {{hit: 1, total: 1, percent: 100}})) }
-  assert(message: card.text) { card.text.contains(reviewerEvalRow("  recall (all)", {{hit: 3, total: 5, percent: 60}})) }
-  assert(message: card.text) { card.text.contains("#1 guidance · a (its issue is vetted real) <- a/speed-bump, a/speed-bump, a/guardrail; alarmist 0/3") }
-  assert(message: card.text) { card.text.contains("#2 duplicate ALARMIST · a (an earlier finding matched this issue)") }
-  assert(message: card.text) { card.text.contains("#5 speed-bump ALARMIST · b (its issue is vetted dismiss)") }
-  assert(message: card.text) { card.text.contains("#6 false · s (sound-contradiction, unvetted: judged on its value)") }
-  assert(message: card.text) { card.text.contains("sound contradictions: #6 s (unvetted): false\n") }
-  assert(message: card.text) { card.text.contains("1/7 findings unanimous") and card.text.contains("judge: canned") }
+  assert("the scorecard shows the value score with its weights") { card.text.contains(reviewerEvalNumberRow("value score", "-5", "(" + reviewerEvalWeightsText + ")")) }
+  assert("the scorecard shows noise with its breakdown") { card.text.contains(reviewerEvalNumberRow("noise", "5", "speed-bump 2 + false 1 + alarmist 2; lower is better")) }
+  assert("the scorecard shows findings and review length") { card.text.contains(reviewerEvalNumberRow("findings", "7", "the review is 4 words")) }
+  assert("the scorecard shows confirmed recall") { card.text.contains(reviewerEvalRow("confirmed recall", {{hit: 2, total: 2, percent: 100}})) }
+  assert("the scorecard shows vetted-real recall") { card.text.contains(reviewerEvalRow("vetted-real recall", {{hit: 1, total: 1, percent: 100}})) }
+  assert("the scorecard shows informational recall") { card.text.contains(reviewerEvalRow("  recall (all)", {{hit: 3, total: 5, percent: 60}})) }
+  assert("the scorecard explains a finding on a vetted-real issue") { card.text.contains("#1 guidance · a (its issue is vetted real) <- a/speed-bump, a/speed-bump, a/guardrail; alarmist 0/3") }
+  assert("the scorecard marks an alarmist duplicate") { card.text.contains("#2 duplicate ALARMIST · a (an earlier finding matched this issue)") }
+  assert("the scorecard explains a finding on a vetted-dismiss issue") { card.text.contains("#5 speed-bump ALARMIST · b (its issue is vetted dismiss)") }
+  assert("the scorecard explains a sound contradiction") { card.text.contains("#6 false · s (sound-contradiction, unvetted: judged on its value)") }
+  assert("the scorecard lists sound contradictions") { card.text.contains("sound contradictions: #6 s (unvetted): false\n") }
+  assert("the scorecard shows unanimity and judge metadata") { card.text.contains("1/7 findings unanimous") and card.text.contains("judge: canned") }
 
   # Sound contradictions, three samples each: only a vetted-sound item, or
   # a speed bump against an unvetted one, makes a finding false; a second
@@ -1183,12 +1182,11 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     matched: [String!]!,
     judged: [{{value: String!, match: String!}}!]!,
   }}! = JSON.decode(soundCard.json)
-  let smsg = soundCard.text + "\n" + soundCard.json
-  assert(message: smsg) { sc.judged.map { f => f.match } == ["s", "t", "u", "s", "t"] and sc.matched == [] }
-  assert(message: smsg) { sc.judged.map { f => f.value } == ["guidance", "false", "speed-bump", "duplicate", "false"] }
+  assert("sound contradictions match sound items and are not recall") { sc.judged.map { f => f.match } == ["s", "t", "u", "s", "t"] and sc.matched == [] }
+  assert("sound contradictions are valued by the item's vetting") { sc.judged.map { f => f.value } == ["guidance", "false", "speed-bump", "duplicate", "false"] }
   # guidance +1, false -2, speed-bump -1, duplicate -1, false -2: -5.
-  assert(message: smsg) { sc.headline.valueScore == -5 and sc.headline.noise == 3 and sc.headline.speedBumps == 1 and sc.headline.falseFindings == 2 }
-  assert(message: smsg) {
+  assert("sound contradictions score and count as noise") { sc.headline.valueScore == -5 and sc.headline.noise == 3 and sc.headline.speedBumps == 1 and sc.headline.falseFindings == 2 }
+  assert("each sound contradiction is listed with its vetting and verdict") {
     sc.soundContradictions == [
       {{finding: 1, key: "s", vetted: "unvetted", judged: "guidance", value: "guidance"}},
       {{finding: 2, key: "t", vetted: "sound", judged: "guidance", value: "false"}},
@@ -1197,17 +1195,17 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
       {{finding: 5, key: "t", vetted: "sound", judged: "guardrail", value: "false"}},
     ]
   }
-  assert(message: smsg) {
+  assert("the scorecard lists every sound contradiction") {
     soundCard.text.contains("sound contradictions: #1 s (unvetted): guidance, #2 t (sound): guidance -> false, " +
       "#3 u (dismiss): speed-bump, #4 s (unvetted): speed-bump -> duplicate, #5 t (sound): guardrail -> false")
   }
-  assert(message: smsg) { soundCard.text.contains("#1 guidance · s (sound-contradiction, unvetted: judged on its value)") }
-  assert(message: smsg) { soundCard.text.contains("#2 false · t (sound-contradiction, vetted sound)") }
-  assert(message: smsg) { soundCard.text.contains("#3 speed-bump · u (sound-contradiction, vetted dismiss: judged on its value)") }
-  assert(message: smsg) { soundCard.text.contains("#4 duplicate · s (sound-contradiction, an earlier finding contradicted this item)") }
+  assert("the scorecard explains contradicting an unvetted sound item") { soundCard.text.contains("#1 guidance · s (sound-contradiction, unvetted: judged on its value)") }
+  assert("the scorecard explains contradicting a vetted-sound item") { soundCard.text.contains("#2 false · t (sound-contradiction, vetted sound)") }
+  assert("the scorecard explains contradicting a vetted-dismiss sound item") { soundCard.text.contains("#3 speed-bump · u (sound-contradiction, vetted dismiss: judged on its value)") }
+  assert("the scorecard explains a repeated sound contradiction") { soundCard.text.contains("#4 duplicate · s (sound-contradiction, an earlier finding contradicted this item)") }
   # A speed bump against an unvetted sound item counts as false.
   let bump = reviewerEvalScorecard(good, "canned", "x", ["one"], ["{\"judgements\": [" + reviewerEvalVote(1, "s", "speed-bump", false) + "]}"], reviewerEvalNoMeta)
-  assert(message: bump.text) { bump.text.contains("#1 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
+  assert("a speed bump against an unvetted sound item counts as false") { bump.text.contains("#1 false · s (sound-contradiction, unvetted: a speed bump counts as false)") }
 
   # A dismissed issue raised as a decision to record scores 0 and is
   # counted apart; raised as a defect it stays a speed bump. A later
@@ -1222,14 +1220,13 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     values: {{dismissedDecision: Int!, duplicate: Int!}}!,
     judged: [{{value: String!, match: String!}}!]!,
   }}! = JSON.decode(decided.json)
-  let dmsg = decided.text + "\n" + decided.json
-  assert(message: dmsg) { dc.judged.map { f => f.value } == ["dismissed-decision", "duplicate"] and dc.judged.map { f => f.match } == ["b", "b"] }
-  assert(message: dmsg) { dc.headline.valueScore == -1 and dc.headline.noise == 0 and dc.headline.speedBumps == 0 }
-  assert(message: dmsg) { dc.values == {{dismissedDecision: 1, duplicate: 1}} }
-  assert(message: dmsg) { dc.headline.vettedDismissRaised == {{hit: 0, total: 1, percent: 0}} and dc.headline.vettedDismissAsDecision == {{hit: 1, total: 1, percent: 100}} }
-  assert(message: dmsg) { decided.text.contains("#1 dismissed-decision · b (its issue is vetted dismiss, raised as a decision to record: neutral)") }
-  assert(message: dmsg) { decided.text.contains(reviewerEvalRow("dismissed, raised as decision", {{hit: 1, total: 1, percent: 100}})) and decided.text.contains(reviewerEvalRow("dismissed raised", {{hit: 0, total: 1, percent: 0}})) }
-  assert(message: dmsg) { decided.text.contains("\ndismissed, raised as decision 1/1      100%") and decided.text.contains("\ndismissed raised    0/1        0%") }
+  assert("a dismissed issue raised as a decision is a dismissed-decision, then a duplicate") { dc.judged.map { f => f.value } == ["dismissed-decision", "duplicate"] and dc.judged.map { f => f.match } == ["b", "b"] }
+  assert("a dismissed-decision scores 0 and neither finding is noise") { dc.headline.valueScore == -1 and dc.headline.noise == 0 and dc.headline.speedBumps == 0 }
+  assert("values tally the dismissed-decision") { dc.values == {{dismissedDecision: 1, duplicate: 1}} }
+  assert("a dismissed issue raised as a decision is counted apart from raised") { dc.headline.vettedDismissRaised == {{hit: 0, total: 1, percent: 0}} and dc.headline.vettedDismissAsDecision == {{hit: 1, total: 1, percent: 100}} }
+  assert("the scorecard explains a dismissed-decision as neutral") { decided.text.contains("#1 dismissed-decision · b (its issue is vetted dismiss, raised as a decision to record: neutral)") }
+  assert("the scorecard shows dismissed-as-decision and dismissed-raised rows") { decided.text.contains(reviewerEvalRow("dismissed, raised as decision", {{hit: 1, total: 1, percent: 100}})) and decided.text.contains(reviewerEvalRow("dismissed raised", {{hit: 0, total: 1, percent: 0}})) }
+  assert("the dismissed rows are aligned in the table") { decided.text.contains("\ndismissed, raised as decision 1/1      100%") and decided.text.contains("\ndismissed raised    0/1        0%") }
   # The review's own section heading in the framing counts too; a defect
   # framing, or "decision" alone, does not.
   assert { reviewerEvalRaisedAsDecision("[DECISIONS TO RECORD, 2/3 votes] x") and reviewerEvalRaisedAsDecision("[Decision to record] x") }
@@ -1237,26 +1234,26 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let defect: {{headline: {{valueScore: Int!, speedBumps: Int!, vettedDismissRaised: {{hit: Int!, total: Int!, percent: Int!}}!, vettedDismissAsDecision: {{hit: Int!, total: Int!, percent: Int!}}!}}!}}! = JSON.decode(
     reviewerEvalScorecard(good, "canned", "x", ["[CONCERN] b breaks"], ["{\"judgements\": [" + reviewerEvalVote(1, "b", "guidance", false) + "]}"], reviewerEvalNoMeta).json
   )
-  assert(message: JSON.encode(defect)) { defect.headline.valueScore == -1 and defect.headline.speedBumps == 1 }
-  assert(message: JSON.encode(defect)) { defect.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} and defect.headline.vettedDismissAsDecision == {{hit: 0, total: 1, percent: 0}} }
+  assert("a dismissed issue raised as a defect is a speed bump") { defect.headline.valueScore == -1 and defect.headline.speedBumps == 1 }
+  assert("a dismissed issue raised as a defect counts as raised, not as a decision") { defect.headline.vettedDismissRaised == {{hit: 1, total: 1, percent: 100}} and defect.headline.vettedDismissAsDecision == {{hit: 0, total: 1, percent: 0}} }
   # The judge sees the case without the sound items vetted dismiss.
   let judgeCase: {{title: String!, issues: [{{key: String!}}!]!, sound: [{{key: String!}}!]!}}! = JSON.decode(reviewerEvalJudgeCase(good))
-  assert(message: JSON.encode(judgeCase)) {
+  assert("the judge's case omits sound items vetted dismiss") {
     judgeCase.title == "Synthetic case" and judgeCase.issues.length == 5 and judgeCase.sound == [{{key: "s"}}, {{key: "t"}}]
   }
 
   # Nothing vetted yet: the vetted line says so.
   let unvetted = decodeReviewerEvalCase(reviewerEvalSyntheticCase.replace("\"vetted\": \"real\"", "\"vetted\": null"))
   let quiet = reviewerEvalScorecard(unvetted, "canned", "x", ["one"], [reviewerEvalVote(1, "a", "guardrail", false)], reviewerEvalNoMeta)
-  assert(message: quiet.text) { quiet.text.contains("vetted-real recall  (no issue vetted real yet)") }
+  assert("the vetted-real row says when nothing is vetted real") { quiet.text.contains("vetted-real recall  (no issue vetted real yet)") }
   # With an issue vetted real, its recall leads; without, confirmed does.
-  assert(message: card.text) { (card.text.split("vetted-real recall")[0] ?? "").contains("findings") and !(card.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
-  assert(message: quiet.text) { (quiet.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
+  assert("vetted-real recall leads when an issue is vetted real") { (card.text.split("vetted-real recall")[0] ?? "").contains("findings") and !(card.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
+  assert("confirmed recall leads when nothing is vetted real") { (quiet.text.split("vetted-real recall")[0] ?? "").contains("confirmed recall") }
 
   # Whether each finding carries a fix, by majority; actionable and
   # reasoned count as given. Votes without the field are unjudged.
-  assert(message: msg) { r.headline.fixGiven == {{hit: 0, total: 7, percent: 0}} }
-  assert(message: card.text) { card.text.contains(reviewerEvalRow("fix given", {{hit: 0, total: 7, percent: 0}}) + "   actionable 0 + reasoned 0; vague 0, missing 0") }
+  assert("votes without a fix field give no fix") { r.headline.fixGiven == {{hit: 0, total: 7, percent: 0}} }
+  assert("the scorecard shows an empty fix-given row") { card.text.contains(reviewerEvalRow("fix given", {{hit: 0, total: 7, percent: 0}}) + "   actionable 0 + reasoned 0; vague 0, missing 0") }
   #   1: actionable x3                   -> actionable
   #   2: reasoned reasoned vague         -> reasoned
   #   3: vague x3                        -> vague
@@ -1274,11 +1271,10 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     fixes: {{actionable: Int!, reasoned: Int!, vague: Int!, missing: Int!, disputed: Int!, unjudged: Int!}}!,
     judged: [{{fix: String!, fixVotes: [String!]!}}!]!,
   }}! = JSON.decode(fixCard.json)
-  let fmsg = fixCard.text + "\n" + fixCard.json
-  assert(message: fmsg) { fc.judged.map { f => f.fix } == ["actionable", "reasoned", "vague", "disputed"] }
-  assert(message: fmsg) { fc.headline.fixGiven == {{hit: 2, total: 4, percent: 50}} }
-  assert(message: fmsg) { fc.fixes == {{actionable: 1, reasoned: 1, vague: 1, missing: 0, disputed: 1, unjudged: 0}} }
-  assert(message: fmsg) { fixCard.text.contains("   actionable 1 + reasoned 1; vague 1, missing 0") and fixCard.text.contains("alarmist 0/3; fix reasoned\n") }
+  assert("each finding's fix is judged by majority") { fc.judged.map { f => f.fix } == ["actionable", "reasoned", "vague", "disputed"] }
+  assert("fix given counts actionable and reasoned fixes") { fc.headline.fixGiven == {{hit: 2, total: 4, percent: 50}} }
+  assert("fixes tally each finding's fix verdict") { fc.fixes == {{actionable: 1, reasoned: 1, vague: 1, missing: 0, disputed: 1, unjudged: 0}} }
+  assert("the scorecard shows the fix breakdown and each finding's fix") { fixCard.text.contains("   actionable 1 + reasoned 1; vague 1, missing 0") and fixCard.text.contains("alarmist 0/3; fix reasoned\n") }
   # One finding covering several issues, three samples (match, then also
   # with its cited part):
   #   1: d + a "x.go:1 still lets a break", c "c is risky" (not in the
@@ -1305,20 +1301,19 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
     matched: [String!]!,
     judged: [{{value: String!, match: String!, also: [String!]!}}!]!,
   }}! = JSON.decode(coverCard.json)
-  let cmsg = coverCard.text + "\n" + coverCard.json
-  assert(message: cmsg) { cc.judged.map { f => f.match } == ["d", "a", "d"] and cc.judged.map { f => f.also } == [["a"], [], []] }
-  assert(message: cmsg) { cc.judged.map { f => f.value } == ["quick-fix", "guardrail", "duplicate"] }
-  assert(message: cmsg) { cc.matched == ["a", "d"] and cc.headline.valueScore == 3 and cc.headline.noise == 0 }
-  assert(message: cmsg) { cc.headline.confirmedRecall == {{hit: 2, total: 2, percent: 100}} and cc.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
-  assert(message: cmsg) { coverCard.text.contains("#1 quick-fix · d + also a <- d/quick-fix, d/quick-fix, a/quick-fix;") }
-  assert(message: cmsg) { coverCard.text.contains("#2 guardrail · a <- a/guardrail") }
+  assert("a covering finding keeps only also issues with a majority of valid cites") { cc.judged.map { f => f.match } == ["d", "a", "d"] and cc.judged.map { f => f.also } == [["a"], [], []] }
+  assert("an issue covered only in passing does not make a later finding a duplicate") { cc.judged.map { f => f.value } == ["quick-fix", "guardrail", "duplicate"] }
+  assert("a covering finding is valued once and its also issues are recalled") { cc.matched == ["a", "d"] and cc.headline.valueScore == 3 and cc.headline.noise == 0 }
+  assert("also issues count toward confirmed and vetted-real recall") { cc.headline.confirmedRecall == {{hit: 2, total: 2, percent: 100}} and cc.headline.vettedRealRecall == {{hit: 1, total: 1, percent: 100}} }
+  assert("the scorecard shows a finding's also issues") { coverCard.text.contains("#1 quick-fix · d + also a <- d/quick-fix, d/quick-fix, a/quick-fix;") }
+  assert("the scorecard shows a later finding on a covered issue") { coverCard.text.contains("#2 guardrail · a <- a/guardrail") }
   # Credit in passing alone: an issue only in "also" counts for recall.
   let passing: {{matched: [String!]!, headline: {{valueScore: Int!}}!}}! = JSON.decode(
     reviewerEvalScorecard(good, "canned", "x", [coverText], [1, 2, 3].map { k =>
       "{\"judgements\": [" + reviewerEvalCoverVote(1, "d", "quick-fix", [{{key: "a", cites: "x.go:1 still lets a break"}}]) + "]}"
     }, reviewerEvalNoMeta).json
   )
-  assert(message: JSON.encode(passing)) { passing.matched == ["a", "d"] and passing.headline.valueScore == 1 }
+  assert("an issue only in also counts for recall") { passing.matched == ["a", "d"] and passing.headline.valueScore == 1 }
   # "also" in another shape costs only the "also", not the sample's vote;
   # a sound key or the match itself in "also" is ignored.
   let shapes: {{matched: [String!]!, judged: [{{value: String!, match: String!, also: [String!]!}}!]!}}! = JSON.decode(
@@ -1328,7 +1323,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
       "{\"judgements\": [" + reviewerEvalCoverVote(1, "d", "quick-fix", []) + "]}",
     ], reviewerEvalNoMeta).json
   )
-  assert(message: JSON.encode(shapes)) { shapes.judged.map { f => f.value } == ["quick-fix"] and shapes.judged.map { f => f.also } == [[] :: [String!]!] and shapes.matched == ["d"] }
+  assert("a malformed also, a sound key or the match itself in also is ignored") { shapes.judged.map { f => f.value } == ["quick-fix"] and shapes.judged.map { f => f.also } == [[] :: [String!]!] and shapes.matched == ["d"] }
   assert { reviewerEvalCitesHold("Says “no request” is sent", "says \"no   request\" is SENT") and !reviewerEvalCitesHold("abc", "abc") }
 
   # A judge that answers in prose leaves every finding unjudged.
@@ -1338,7 +1333,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert { prose.headline.valueScore == 0 and prose.headline.noise == 0 and prose.values.unjudged == 2 }
   # No findings at all: nothing found, nothing wasted.
   let empty = reviewerEvalScorecard(good, "canned", "Nothing to fix.", [] :: [String!]!, ["{\"judgements\": []}"], reviewerEvalNoMeta)
-  assert(message: empty.text) { empty.text.contains(reviewerEvalRow("confirmed recall", {{hit: 0, total: 2, percent: 0}})) and empty.text.contains(reviewerEvalNumberRow("findings", "0", "the review is 3 words")) }
+  assert("a review with no findings shows zero recall and zero findings") { empty.text.contains(reviewerEvalRow("confirmed recall", {{hit: 0, total: 2, percent: 0}})) and empty.text.contains(reviewerEvalNumberRow("findings", "0", "the review is 3 words")) }
   # A known-clean case: there is nothing to recall, and what is raised is
   # scored on its value alone; contradicting a vetted-sound item is false.
   let cleanCard: {{headline: {{valueScore: Int!, noise: Int!, confirmedRecall: {{hit: Int!, total: Int!, percent: Int!}}!}}!, soundContradictions: [{{key: String!}}!]!}}! = JSON.decode(
@@ -1346,7 +1341,7 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
       "{\"judgements\": [" + reviewerEvalVote(1, "none", "speed-bump", false) + ", " + reviewerEvalVote(2, "t", "guardrail", true) + "]}",
     ], reviewerEvalNoMeta).json
   )
-  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.valueScore == -4 and cleanCard.headline.noise == 3 and cleanCard.soundContradictions == [{{key: "t"}}] }
-  assert(message: JSON.encode(cleanCard)) { cleanCard.headline.confirmedRecall == {{hit: 0, total: 0, percent: 0}} }
+  assert("a clean case scores findings on value and contradicting vetted sound as false") { cleanCard.headline.valueScore == -4 and cleanCard.headline.noise == 3 and cleanCard.soundContradictions == [{{key: "t"}}] }
+  assert("a clean case has nothing to recall") { cleanCard.headline.confirmedRecall == {{hit: 0, total: 0, percent: 0}} }
   "Reviewer eval scoring checks passed."
 }

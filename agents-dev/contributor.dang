@@ -1,8 +1,7 @@
-# Exercise the public GitHub command without authentication or an API request.
-# gh reads -F files before making a request; the final missing file keeps this
-# offline even if a regression allows the mounted dependency into the toolbox.
-let checkContributorMountsOutsideToolbox: String! {
-  let ws = container
+# A workspace on a one-commit git repository, for gh tool checks that need a
+# checkout but no remote.
+let contributorEmptyRepo: Workspace! {
+  container
     .from("alpine:3.22")
     .withExec(["apk", "add", "--no-cache", "git"])
     .withWorkdir("/repo")
@@ -11,6 +10,13 @@ let checkContributorMountsOutsideToolbox: String! {
     .asGit
     .head
     .asWorkspace
+}
+
+# Exercise the public GitHub command without authentication or an API request.
+# gh reads -F files before making a request; the final missing file keeps this
+# offline even if a regression allows the mounted dependency into the toolbox.
+let checkContributorMountsOutsideToolbox: String! {
+  let ws = contributorEmptyRepo
     .withNewFile("tmp/body.md", "draft\n")
     .withMountedDirectory("mnt/dep", directory.withNewFile("big.txt", "x\n"))
   assert { ws.file("mnt/dep/big.txt").contents == "x\n" }
@@ -20,10 +26,41 @@ let checkContributorMountsOutsideToolbox: String! {
   ) rescue {
     e: Error => e.message
   }
-  assert(message: result) { result.contains("open mnt/dep/big.txt: no such file or directory") }
+  assert("gh cannot read files under the mount") { result.contains("open mnt/dep/big.txt: no such file or directory") }
   assert { !result.contains("open tmp/body.md:") }
   assert { !result.contains("open always-missing:") }
   "mounts are excluded from the toolbox snapshot"
+}
+
+# `gh stack` through the gh tool, offline with a fake token: the extension
+# runs (help needs no authentication), the guards refuse merging and PR URLs
+# from several repositories before gh runs, and a token that cannot install
+# the gh-stack skill still composes the tools, just without the skill.
+let checkContributorStack: String! {
+  let ws = contributorEmptyRepo
+  let fake = contributor(githubToken: setSecret("contributor-stack-test-token", "not-a-real-token"))
+  let help = fake.gh(source: ws, args: ["stack", "link", "--help"])
+  assert("gh stack runs through the gh tool") { help.contains("Create or update a stack on GitHub") }
+  # gh-stack reads only the number from a PR URL, so URLs from two
+  # repositories are refused before gh runs.
+  let mixed = fake.gh(source: ws, args: ["stack", "link", "https://github.com/a/one/pull/1", "https://github.com/b/two/pull/2"]) rescue {
+    e: Error => e.message
+  }
+  assert("refuses linking PRs from different repositories") { mixed.contains("live in different repositories") }
+  # Merging a stack is the user's call, refused before gh runs.
+  let merge = fake.gh(source: ws, args: ["stack", "merge", "42", "--yes"]) rescue {
+    e: Error => e.message
+  }
+  assert("refuses gh stack merge") { merge.contains("gh stack merge is not available") }
+  let hidden = fake.gh(source: ws, args: ["stack", "--remote", "origin", "merge", "42"]) rescue {
+    e: Error => e.message
+  }
+  assert("refuses gh stack merge behind a leading flag") { hidden.contains("gh stack merge is not available") }
+  let composed = fake.agent(llm.withWorkspace(ws))
+  assert("composes the gh tool") { toolNames(composed.tools).contains("gh") }
+  let skills = composed.skills.{{name}}.map { s => s.name }
+  assert("omits the gh-stack skill when it cannot be installed") { !skills.contains("gh-stack") }
+  "gh stack runs through gh, merge and mixed repositories are refused, and a failed skill install leaves the tools composed"
 }
 
 let checkContributorCheckoutRefs: String! {
@@ -138,7 +175,7 @@ let checkContributorCheckoutRefs: String! {
   }
   # A GitRef argument resolves as it is loaded, so an unknown ref fails with
   # the engine's own error before checkout runs.
-  assert(message: missing) { missing.contains("no-such-ref") }
+  assert("checkout of an unknown ref fails while loading the ref") { missing.contains("no-such-ref") }
   let unknownSha = contributor.checkout(
     llm: base,
     source: source,
@@ -147,7 +184,7 @@ let checkContributorCheckoutRefs: String! {
   ).workspace.git.head.commitSHA rescue {
     e: Error => e.message
   }
-  assert(message: unknownSha) { unknownSha.contains("cannot check out") }
+  assert("checkout of an unknown sha is refused") { unknownSha.contains("cannot check out") }
   let noMatch = contributor.checkout(
     llm: base,
     source: source,
@@ -171,7 +208,7 @@ let checkContributorCheckoutRefs: String! {
   let unnamed = contributor.mount(source: source, repo: fixture.branch("feature")).file("marker").contents rescue {
     e: Error => e.message
   }
-  assert(message: unnamed) { unnamed.contains("pass name") }
+  assert("mount of a ref without a remote URL requires a name") { unnamed.contains("pass name") }
   let named = contributor.mount(
     source: source,
     repo: fixture.branch("feature"),
