@@ -255,7 +255,8 @@ type Contributor {
   not available in read-only mode).
 
   Not available here: account, config, secret, key, extension, alias and
-  codespace management; `repo delete/archive/rename/edit`; `api` with a
+  codespace management; `repo delete/archive/rename/edit`; `stack merge`
+  (merging a stack is for the human operator); `api` with a
   DELETE method; `api` on the contents/blobs endpoints (use `mount`, then
   read the files with your file tools); `pr comment`, `issue comment` and
   `pr review` (use `comment`, which marks the comment as agent-authored);
@@ -334,6 +335,12 @@ type Contributor {
     }
     if (cmd == "repo" and ["delete", "archive", "rename", "edit"].contains(sub)) {
       raise `gh repo ${sub} is not available from this tool: repository-level changes are for the human operator to make.`
+    }
+    # Any "merge" token, not just the parsed subcommand: cobra reads an
+    # unknown flag before the subcommand as taking the next token, so
+    # `stack --remote origin merge 42` runs merge.
+    if (cmd == "stack" and args.contains("merge")) {
+      raise "gh stack merge is not available from this tool: merging a stack is for the human operator to do."
     }
     if (cmd == "api" and hasMethod(args, "DELETE")) {
       raise "gh api with a DELETE method is not available from this tool: deleting things on GitHub is for the human operator to do."
@@ -1637,9 +1644,9 @@ type Contributor {
       shows the stack's order and navigation on every PR in it.
     - To change a lower layer, check out its branch, commit and push, then
       rebase each layer above onto the one below it and push it with
-      `expectedRemoteSHA` (a lease). Merge with `gh stack merge <pr> --yes`
-      (it merges that PR and every one below it), and only when asked;
-      `gh pr merge` cannot merge a stack.
+      `expectedRemoteSHA` (a lease). Merging a stack is for the user to do:
+      `gh stack merge` is unavailable here, and `gh pr merge` cannot merge
+      a stack.
 
     `comment` posts on an issue or pull request: pass the target (a number
     or URL) and a body, plus optionally a `path` (and `line`) to anchor it

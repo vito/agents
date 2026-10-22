@@ -48,6 +48,15 @@ let checkContributorStack: String! {
     e: Error => e.message
   }
   assert(message: mixed) { mixed.contains("live in different repositories") }
+  # Merging a stack is the user's call, refused before gh runs.
+  let merge = fake.gh(source: ws, args: ["stack", "merge", "42", "--yes"]) rescue {
+    e: Error => e.message
+  }
+  assert(message: merge) { merge.contains("gh stack merge is not available") }
+  let hidden = fake.gh(source: ws, args: ["stack", "--remote", "origin", "merge", "42"]) rescue {
+    e: Error => e.message
+  }
+  assert(message: hidden) { hidden.contains("gh stack merge is not available") }
   let composed = fake.agent(llm.withWorkspace(ws))
   assert { toolNames(composed.tools).contains("gh") }
   let skills = composed.skills.{{name}}.map { s => s.name }
