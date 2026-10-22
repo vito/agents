@@ -26,6 +26,29 @@ let checkContributorMountsOutsideToolbox: String! {
   "mounts are excluded from the toolbox snapshot"
 }
 
+# The gh-stack extension runs through the gh tool (help needs no
+# authentication), and a token that cannot install the gh-stack skill still
+# composes the tools, just without the skill.
+let checkContributorStack: String! {
+  let ws = container
+    .from("alpine:3.22")
+    .withExec(["apk", "add", "--no-cache", "git"])
+    .withWorkdir("/repo")
+    .withExec(["sh", "-eu", "-c", "git init -b main; git -c user.name=Test -c user.email=test@example.com commit --allow-empty -m base"])
+    .directory("/repo")
+    .asGit
+    .head
+    .asWorkspace
+  let fake = contributor(githubToken: setSecret("contributor-stack-test-token", "not-a-real-token"))
+  let help = fake.gh(source: ws, args: ["stack", "link", "--help"])
+  assert(message: help) { help.contains("Create or update a stack on GitHub") }
+  let composed = fake.agent(llm.withWorkspace(ws))
+  assert { composed.tools.contains("gh") }
+  let skills = composed.skills.{{name}}.map { s => s.name }
+  assert(message: skills.join(", ")) { !skills.contains("gh-stack") }
+  "gh stack runs through gh; a failed skill install leaves the tools composed"
+}
+
 let checkContributorCheckoutRefs: String! {
   let fixtureContainer = container
     .from("alpine:3.22")

@@ -85,6 +85,12 @@ type AgentsDev {
     null
   }
 
+  """Check `gh stack` runs through the gh tool, and a failed gh-stack skill install leaves the tools composed."""
+  contributorStack: Void @check {
+    print(checkContributorStack)
+    null
+  }
+
   """Check the read-only contributor role: exactly the read tools, sticky through recomposition and reload, gh write verbs refused, no agent adoption on checkout."""
   contributorReadonly(source: Workspace!): Void @check {
     print(testContributorReadonly(source: source))
