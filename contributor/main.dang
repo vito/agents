@@ -1032,10 +1032,7 @@ type Contributor {
       # GitHub retires GraphQL fields (Projects classic) faster than they
       # catch up, which breaks `gh pr view` outright.
       .withExec(["sh", "-c", installGhSh])
-      # `gh extension install` is denied to the agent (and needs a token);
-      # the extension is a single release binary, which gh finds as a local
-      # extension under its data dir.
-      .withExec(["sh", "-c", installGhStackSh])
+      .withExec(["gh", "extension", "install", "github/gh-stack", "--pin", ghStackVersion])
   }
 
   # The gh-stack agent skill, installed with `gh skill install` at a pinned
@@ -1140,19 +1137,6 @@ type Contributor {
 
   # The gh-stack extension (`gh stack`) and its skill, pinned together.
   let ghStackVersion: String! = "v0.2.1"
-
-  let installGhStackSh: String! = ```
-    set -eu
-    case "$(uname -m)" in
-      x86_64) arch=amd64 ;;
-      aarch64) arch=arm64 ;;
-      *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
-    esac
-    dir="$HOME/.local/share/gh/extensions/gh-stack"
-    mkdir -p "$dir"
-    wget -qO "$dir/gh-stack" "https://github.com/github/gh-stack/releases/download/${ghStackVersion}/linux-$arch"
-    chmod 0755 "$dir/gh-stack"
-  ```
 
   # The configured remote normalized to "owner/name", or "" when none is
   # configured — the shell side (resolveRepoSh) then falls back to the
