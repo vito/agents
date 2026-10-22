@@ -4,8 +4,9 @@
 # adds the write operation they both lacked: `commit`.
 #
 # A Dagger-native agent has no Bash tool, and the mounted Workspace is a plain
-# snapshot with NO .git, so `git` itself is never an option. Everything here
-# goes through the Dagger-native workspace git API, deliberately layered:
+# snapshot with NO .git, so `git` itself is never an option for the agent.
+# Everything here goes through the Dagger-native workspace git API where it
+# has the verb, deliberately layered:
 #
 #   * Workspace.git.uncommitted is a Changeset of the pending changes: its
 #     .diffStats and .asPatch render the `git status` / `git diff` half.
@@ -15,6 +16,11 @@
 #   * head.asRepository exposes the backing GitRepository directly: ref(name:)
 #     resolves hashes and names; commit(id:) accepts full/short shas, and
 #     GitCommit.tree gives the filesystem at a commit.
+#   * `gitCli` mounts head.tree(discardGitDir: false, depth: 0) — the
+#     checkout with its .git — into a pinned git container for the two verbs
+#     the native API lacks: blame and the content pickaxe (`git log -S`).
+#     Read-only, and only blame and `log(pickaxe:)` pay for the full
+#     materialization it needs.
 #   * Workspace.withCommit(changes:, message:, date:) records selected changes as
 #     a commit and returns a workspace with HEAD advanced. Returning that
 #     Workspace! from the tool IS delivery: the tool layer rebinds the agent's
@@ -1015,7 +1021,9 @@ type Committer {
 
   Use it to learn how this repository writes commit messages (`full: true`
   prints the bodies), or — with `paths` — to find out who last touched a file
-  and why. For one commit's actual patch, use `show`.
+  and why. `pickaxe` hunts by content instead of message: the commits that
+  added or removed an exact string, however long ago. For one commit's actual
+  patch, use `show`.
 
   With `base`, list only commits reachable from our HEAD but not that ref,
   still newest first. Paths, message search, and limits apply within that
@@ -1046,6 +1054,17 @@ type Committer {
     """
     grep: String = null,
     """
+    Only show commits that change the NUMBER of occurrences of this exact
+    string in some file's content — `git log -S`, the pickaxe. A commit that
+    adds or removes the string matches; one that merely moves it within a
+    file does not, which is exactly what makes this the tool for "when did
+    this line land, and why". The string is matched literally, not as a
+    pattern, against content rather than messages, and — unlike `grep` — the
+    search walks ALL history, not a bounded window. Composes with `paths` to
+    scope where the string is looked for; does not combine with `base`.
+    """
+    pickaxe: String = null,
+    """
     Print the full message body of every commit, not just the subject.
     """
     full: Boolean! = false,
@@ -1063,17 +1082,31 @@ type Committer {
     # one more commit than the listing prints. `takeFirst(limit)` below drops it
     # again, so the extra entry is never rendered.
     let scanned = if (grep == null) { limit + 1 } else { searchWindow }
-    # Exclude base in the walk itself, before paths and the scan limit.
-    let walk = head(source).log(
-      limit: scanned,
-      base: base,
-      paths: if (paths.isEmpty) { null } else { paths },
-    ).{{shortSha, authorName, authoredDate, message}} rescue {
-      e: Error => return selection + noHistory(e.message)
+    let walk: [{{shortSha: String!, authorName: String!, authoredDate: String!, message: String!}}!]! = if (pickaxe == null) {
+      # Exclude base in the walk itself, before paths and the scan limit.
+      # The first read of the workspace's git state: a synthetic workspace, a
+      # checkout that is not a git repository at all, or a fresh `git init`
+      # with nothing committed yet all give out here.
+      head(source).log(
+        limit: scanned,
+        base: base,
+        paths: if (paths.isEmpty) { null } else { paths },
+      ).{{shortSha, authorName, authoredDate, message}} rescue {
+        e: Error => return selection + noHistory(e.message)
+      }
+    } else {
+      # The pickaxe runs real git over this checkout alone, which cannot see
+      # a base that lives in another repository.
+      if (base != null) {
+        raise "log: pickaxe does not combine with base; drop one of them"
+      }
+      # The same first-read guard, on a probe: the pickaxe walk runs real
+      # git, whose failures past this point are worth surfacing as errors.
+      head(source).commitSHA rescue {
+        e: Error => return noHistory(e.message)
+      }
+      pickaxeCommits(source, pickaxe ?? "", paths, scanned)
     }
-    # The first read of the workspace's git state: a synthetic workspace, a
-    # checkout that is not a git repository at all, or a fresh `git init`
-    # with nothing committed yet all give out here.
 
     let matched = if (grep == null) {
       walk
@@ -1095,7 +1128,7 @@ type Committer {
         }
         return selection + empty
       }
-      return emptyLog(paths, grep)
+      return emptyLog(paths, grep, pickaxe)
     }
 
     let entries = shown.map { c =>
@@ -1119,10 +1152,13 @@ type Committer {
       let more = matched.length - shown.length
       # `paths` narrows the walk before the pattern is applied, so the window
       # the match count refers to is the recent commits that touched those
-      # paths — not recent history as a whole.
+      # paths — not recent history as a whole. A pickaxe narrows it further
+      # still, to the commits the pickaxe selected.
       let window = if (base != null) {
         `${toString(walk.length)} searched commits in HEAD not in base`
           + (if (paths.isEmpty) { "" } else { " touching the given paths" })
+      } else if (pickaxe != null) {
+        `the last ${toString(searchWindow)} commits the pickaxe selected`
       } else if (paths.isEmpty) {
         `the last ${toString(searchWindow)} commits`
       } else {
@@ -1133,7 +1169,11 @@ type Committer {
     # Only meaningful without a grep: a grep listing walks the whole search
     # window and reports its own leftovers above.
     let moreNote = if (grep == null and matched.length > shown.length) {
-      "(more history below; raise limit to see it)"
+      if (pickaxe == null) {
+        "(more history below; raise limit to see it)"
+      } else {
+        "(more pickaxe matches below; raise limit to see them)"
+      }
     } else {
       ""
     }
@@ -1402,6 +1442,93 @@ type Committer {
     `DIFFERENT trees: ${toString(entries.length)} path(s) differ from ${short(b.sha)} to ${short(a.sha)}.` + "\n" + header + "\n\n" + shown.join("\n") + note
   }
 
+  """
+  Attribute every line of a file to the commit that last touched it — `git
+  blame`, compacted: consecutive lines owned by the same commit collapse into
+  one row with their line range, short hash, date, author, and subject.
+
+  This is the one-call answer to "when did this line land, and why" — follow
+  a row up with `show(commit:)` for the full change, or `fileAt` to read the
+  file as that commit left it. Attribution reads COMMITTED history: pending
+  edits are invisible here (`diff` shows those), so line numbers refer to the
+  file at HEAD.
+
+  A long-lived file can dissolve into hundreds of hunks, so the table is
+  capped; narrow with `startLine`/`endLine` (the footer says where to resume,
+  and `fileAt` numbers lines to steer by).
+  """
+  blame(
+    source: Workspace!,
+    """
+    Path of the file to blame, relative to the repository root.
+    """
+    path: String!,
+    """
+    First line of the range to attribute, 1-based. Empty starts at the top of
+    the file.
+    """
+    startLine: Int = null,
+    """
+    Last line of the range to attribute, inclusive. Empty runs to the end of
+    the file.
+    """
+    endLine: Int = null,
+  ): String! {
+    # The first read of the workspace's git state: a checkout with no readable
+    # history gives out here, with a plain answer instead of an engine error.
+    let headSha = head(source).commitSHA rescue {
+      e: Error => return noHistory(e.message)
+    }
+    if (startLine != null and endLine != null and (endLine ?? 0) < (startLine ?? 0)) {
+      raise "blame: endLine must not be smaller than startLine"
+    }
+    let range = if (startLine == null and endLine == null) {
+      [] :: [String!]!
+    } else {
+      # An empty end spells "to the last line" in git's -L syntax.
+      let to = if (endLine == null) { "" } else { toString(endLine ?? 1) }
+      ["-L", toString(startLine ?? 1) + "," + to]
+    }
+    let ran = runGit(source, ["blame", "--porcelain"] + range + ["HEAD", "--", path])
+    if (ran.exitCode != 0) {
+      if (ran.stderr.contains("no such path")) {
+        raise `${path} does not exist at ${short(headSha)}` +
+          ` — it may have been deleted or renamed; log(paths: ["${path}"]) shows the commits that touched it`
+      }
+      raise `blame failed: ${plainError(ran.stderr)}`
+    }
+    let hunks = blameHunks(ran.stdout)
+    if (hunks.isEmpty) {
+      return `${path} at ${short(headSha)} has no lines to attribute.`
+    }
+
+    let firstLine = hunks.reduce(0) { acc, h => if (acc == 0) { h.start } else { acc } }
+    let lastLine = hunks.reduce(0) { acc, h => if (h.end > acc) { h.end } else { acc } }
+    let capped = hunks.takeFirst(maxHunks)
+    let repo = repository(source)
+    let rows = capped.map { h =>
+      let c = repo.commit(id: h.sha).{{shortSha, authorName, authoredDate, message}}
+      let span = if (h.start == h.end) {
+        toString(h.start)
+      } else {
+        `${toString(h.start)}-${toString(h.end)}`
+      }
+      `${span.padLeft(9)}  ${c.shortSha}  ${when(c.authoredDate)}  ${c.authorName}  ${subject(c.message)}`
+    }
+    # Never let a hunk-per-line file flood the caller's context: cap the
+    # table, and hand back the exact startLine to resume from.
+    let omitted = hunks.length - capped.length
+    let footer = if (omitted > 0) {
+      let shownEnd = capped.reduce(0) { acc, h => h.end }
+      "\n\n" + `... ${toString(omitted)} of ${toString(hunks.length)} hunk(s) not shown. ` +
+        `Continue with startLine: ${toString(shownEnd + 1)}.`
+    } else {
+      ""
+    }
+    `${path} — blame at ${short(headSha)}, lines ${toString(firstLine)}-${toString(lastLine)} ` +
+      `in ${toString(hunks.length)} hunk(s)` + "\n\n" + rows.join("\n") + footer
+  }
+
   # ---------------------------------------------------------------- helpers
 
   # A commit spelled for treeEqual: resolved in `from` when given, else in
@@ -1458,6 +1585,11 @@ type Committer {
   # whole answer.
   let maxFiles: Int! = 40
 
+  # Per-call hunk cap in `blame`. A long-lived file churned line by line can
+  # dissolve into a hunk per line, and the attribution table alone would then
+  # be the whole answer.
+  let maxHunks: Int! = 100
+
   let head(source: Workspace!): Dagger.GitRef! {
     source.git.head
   }
@@ -1491,6 +1623,90 @@ type Committer {
 
   let repository(source: Workspace!): GitRepository! {
     source.git.head.asRepository
+  }
+
+  # Real git over the checkout, for the two verbs the native API lacks: blame
+  # and the content pickaxe. Mounts the tree at HEAD with its .git, a full
+  # materialization that only these two tools pay for. Read-only: nothing run
+  # in here writes back. Commit metadata is still read through `repository`,
+  # so every tool renders it the same way.
+  let gitCli(source: Workspace!): Dagger.Container! {
+    container
+      .from("alpine:3.22")
+      .withExec(["apk", "add", "--no-cache", "git"])
+      # The mount's owner is whatever the engine materialized; never let
+      # git's dubious-ownership check turn that into a failure.
+      .withExec(["git", "config", "--global", "safe.directory", "*"])
+      .withMountedDirectory("/repo", source.git.head.tree(discardGitDir: false, depth: 0))
+      .withWorkdir("/repo")
+  }
+
+  # Run git in `gitCli`, failures included. git exits 128 on a fatal error,
+  # which the engine refuses even with expect: ANY (it only accepts codes
+  # below 128), so every failure is folded into exit 1 and the caller reads
+  # stderr for the reason.
+  let runGit(source: Workspace!, args: [String!]!): {{exitCode: Int!, stdout: String!, stderr: String!}}! {
+    gitCli(source).withExec(
+      ["sh", "-c", "git \"$@\" || exit 1", "git"] + args,
+      expect: ReturnType.ANY,
+    ).{{exitCode, stdout, stderr}}
+  }
+
+  # Commits that change the number of occurrences of `needle`, newest first —
+  # `git log -S` against the checkout. git walks the WHOLE history here, not
+  # a bounded window: the pickaxe exists to find the commit nobody remembers.
+  # Returns the native walk's record shape, with each hit's metadata read
+  # back through the engine, so `log` renders both walks identically.
+  let pickaxeCommits(
+    source: Workspace!,
+    needle: String!,
+    paths: [String!]!,
+    limit: Int!,
+  ): [{{shortSha: String!, authorName: String!, authoredDate: String!, message: String!}}!]! {
+    if (needle == "") {
+      raise "pickaxe: the string must not be empty"
+    }
+    let scope = if (paths.isEmpty) { [] :: [String!]! } else { ["--"] + paths }
+    let ran = runGit(source, ["log", "--format=%H", "-n", toString(limit), "-S" + needle] + scope)
+    if (ran.exitCode != 0) {
+      raise `pickaxe failed: ${plainError(ran.stderr)}`
+    }
+    let repo = repository(source)
+    ran.stdout.split("\n").filter { line => line != "" }.map { sha =>
+      repo.commit(id: sha).{{shortSha, authorName, authoredDate, message}}
+    }
+  }
+
+  # Slice `git blame --porcelain` output into hunks. A group header is
+  # "<sha> <orig> <final> <count>": it opens a run of <count> consecutive
+  # lines attributed to <sha>, starting at final-file line <final>. Nothing
+  # else can match the pattern — headers within a run drop the <count>, and
+  # content lines are tab-prefixed. Adjacent runs from the same commit merge:
+  # the reader cares about which commit owns which lines, not the original
+  # line numbers git happens to group by.
+  let blameHunks(porcelain: String!): [{{sha: String!, start: Int!, end: Int!}}!]! {
+    let groups = porcelain.matchAll(`(?m)^([0-9a-f]{40}) \d+ (\d+) (\d+)$`).map { m =>
+      let start = toInt(m.captures[1] ?? "0")
+      {{
+        sha: m.captures[0] ?? "",
+        start: start,
+        end: start + toInt(m.captures[2] ?? "1") - 1,
+      }}
+    }
+    groups.reduce([] :: [{{sha: String!, start: Int!, end: Int!}}!]!) { acc, g =>
+      let last = acc.takeLast
+      if (last.any { p => p.sha == g.sha and p.end + 1 == g.start }) {
+        acc.dropLast + last.map { p => {{sha: p.sha, start: p.start, end: g.end}} }
+      } else {
+        acc + [g]
+      }
+    }
+  }
+
+  # Digits to Int. There is no direct String→Int cast, but digits are valid
+  # JSON.
+  let toInt(digits: String!): Int! {
+    JSON.decode(digits)
   }
 
   # The engine bounds a replay by the commits on EITHER side of the fork
@@ -1966,9 +2182,17 @@ type Committer {
     `REBASE onto ${rebaseOnto} in progress, stopped at ${short(rebaseStopped)}: resolve the conflict markers, then rebaseContinue (or rebaseSkip / rebaseAbort).` + "\n\n"
   }
 
-  let emptyLog(paths: [String!]!, grep: String): String! {
+  let emptyLog(paths: [String!]!, grep: String, pickaxe: String): String! {
+    let scope = if (paths.isEmpty) { "." } else { " under the given paths." }
+    if (pickaxe != null) {
+      let dug = `No commit changes the number of occurrences of "${pickaxe ?? ""}"`
+      if (grep != null) {
+        return dug + ` with a message matching "${grep ?? ""}"` + scope
+      }
+      return dug + scope
+    }
     if (grep != null) {
-      return `No commit message in the last ${toString(searchWindow)} commits matches "${grep ?? ""}"` + (if (paths.isEmpty) { "." } else { " under the given paths." })
+      return `No commit message in the last ${toString(searchWindow)} commits matches "${grep ?? ""}"` + scope
     }
     if (paths.isEmpty) {
       return "No commit history in this workspace."
@@ -2139,15 +2363,21 @@ type Committer {
       moved) is an error; `expectedRemoteSHA` is the force-with-lease escape
       hatch, for when overwriting the remote is genuinely intended.
     - `log` — commits newest first. Pass `paths` to see who last touched a
-      file and why, `grep` to search commit messages, and `full: true` to
-      print full message bodies. With `base:`, lists commits reachable from
-      our HEAD but not that ref, still newest first; filters and limits apply
-      within that selected history. This is history, not a cherry-pick plan.
+      file and why, `grep` to search commit messages, `pickaxe` to dig up the
+      commits that added or removed an exact string (`git log -S`, over ALL
+      history), and `full: true` to print full message bodies. With `base:`,
+      lists commits reachable from our HEAD but not that ref, still newest
+      first; filters and limits apply within that selected history. This is
+      history, not a cherry-pick plan.
     - `show` — one commit in full: metadata, message, per-file stats and the
       patch. Takes "HEAD", a short hash from `log`, or a tag; `against` turns
       it into a comparison between two commits.
     - `fileAt` — a file's contents as of a commit, for recovering something
       you deleted or seeing what a file looked like before a change.
+    - `blame` — who last touched each line of a file, hunk by hunk: each row
+      is a line range with its commit's short hash, date, author, and
+      subject. Scope big files with startLine/endLine, then follow a row up
+      with `show`.
     - `treeEqual` — whether two commits have byte-identical trees (contents
       and modes, by git tree hash), listing the differing paths otherwise.
       Use it to prove a rewritten history ends at the tree it started from.
