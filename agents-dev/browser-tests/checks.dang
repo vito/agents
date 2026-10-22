@@ -382,8 +382,8 @@ let testBrowserArtifactMounts: Void {
   ) rescue {
     e: Error => e.message
   }
-  assert(message: gh) { gh.contains("open always-missing: no such file or directory") }
-  assert(message: gh) { !gh.contains("open " + dir) }
+  assert("gh fails on the guard file, offline") { gh.contains("open always-missing: no such file or directory") }
+  assert("gh reads the mounted artifact") { !gh.contains("open " + dir) }
 
   let unmounted = state.unmountArtifacts(mounted, run: id)
   assert { browserMountMissing(unmounted, dir + "/screenshot.png") }
@@ -406,15 +406,15 @@ let testBrowserArtifactMounts: Void {
   # Validation, before anything is mounted.
   ["../x", "/abs", "a/../../b", "."].each { invalid =>
     let rejected = state.mountArtifacts(ws, id, at: invalid).file("tmp/body.md").contents rescue { e: Error => e.message }
-    assert(message: rejected) { rejected.contains("relative workspace path") }
+    assert(`mountArtifacts rejects at: ${invalid}`) { rejected.contains("relative workspace path") }
   }
   let badPath = state.mountArtifacts(ws, id, path: "../screenshot.png").file("tmp/body.md").contents rescue { e: Error => e.message }
-  assert(message: badPath) { badPath.contains("artifact path must be relative") }
+  assert("mountArtifacts rejects a path escaping the run") { badPath.contains("artifact path must be relative") }
   let absent = state.mountArtifacts(ws, id, path: "absent.png").file("tmp/body.md").contents rescue { e: Error => e.message }
-  assert(message: absent) { absent.contains("no artifact absent.png") }
+  assert("mountArtifacts rejects a missing artifact") { absent.contains("no artifact absent.png") }
   let unknown = state.mountArtifacts(ws, "missing-run").file("tmp/body.md").contents rescue { e: Error => e.message }
-  assert(message: unknown) { unknown.contains("unknown run") }
+  assert("mountArtifacts rejects an unknown run") { unknown.contains("unknown run") }
   let neither = state.unmountArtifacts(ws).file("tmp/body.md").contents rescue { e: Error => e.message }
-  assert(message: neither) { neither.contains("exactly one of run or at") }
+  assert("unmountArtifacts requires run or at") { neither.contains("exactly one of run or at") }
   null
 }

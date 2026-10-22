@@ -20,7 +20,7 @@ let checkContributorMountsOutsideToolbox: String! {
   ) rescue {
     e: Error => e.message
   }
-  assert(message: result) { result.contains("open mnt/dep/big.txt: no such file or directory") }
+  assert("gh cannot read files under the mount") { result.contains("open mnt/dep/big.txt: no such file or directory") }
   assert { !result.contains("open tmp/body.md:") }
   assert { !result.contains("open always-missing:") }
   "mounts are excluded from the toolbox snapshot"
@@ -176,7 +176,7 @@ let checkContributorCheckoutRefs: String! {
   }
   # A GitRef argument resolves as it is loaded, so an unknown ref fails with
   # the engine's own error before checkout runs.
-  assert(message: missing) { missing.contains("no-such-ref") }
+  assert("checkout of an unknown ref fails while loading the ref") { missing.contains("no-such-ref") }
   let unknownSha = contributor.checkout(
     llm: base,
     source: source,
@@ -185,7 +185,7 @@ let checkContributorCheckoutRefs: String! {
   ).workspace.git.head.commitSHA rescue {
     e: Error => e.message
   }
-  assert(message: unknownSha) { unknownSha.contains("cannot check out") }
+  assert("checkout of an unknown sha is refused") { unknownSha.contains("cannot check out") }
   let noMatch = contributor.checkout(
     llm: base,
     source: source,
@@ -209,7 +209,7 @@ let checkContributorCheckoutRefs: String! {
   let unnamed = contributor.mount(source: source, repo: fixture.branch("feature")).file("marker").contents rescue {
     e: Error => e.message
   }
-  assert(message: unnamed) { unnamed.contains("pass name") }
+  assert("mount of a ref without a remote URL requires a name") { unnamed.contains("pass name") }
   let named = contributor.mount(
     source: source,
     repo: fixture.branch("feature"),

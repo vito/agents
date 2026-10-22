@@ -263,8 +263,8 @@ let testStaffWorker(source: Workspace!): String! {
   let workerLine = `Your staff name is "check-worker"`
   # Default composition picks the chief role, never the worker role.
   let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "staff/**").items.{{ uri }}.map { a => a.uri }
-  assert(message: defaults.join(", ")) { defaults.any { u => u.contains("staff/agent") } }
-  assert(message: defaults.join(", ")) { !defaults.any { u => u.contains("staff/worker") } }
+  assert("staff/agent is a default expertise") { defaults.any { u => u.contains("staff/agent") } }
+  assert("staff/worker is not a default expertise") { !defaults.any { u => u.contains("staff/worker") } }
 
   # A chief composed from this workspace: git tools plus the staff chief role.
   let chief = llm.withWorkspace(source).spawn(
@@ -279,7 +279,7 @@ let testStaffWorker(source: Workspace!): String! {
   let worker = spawnUnder(chief, llm.withWorkspace(source), "check-worker", selected);
   {
     let uris = picked.map { e => e.artifact.uri }
-    assert(message: uris.join(", ")) { uris.length == 2 and (uris[0] ?? "").contains("committer/agent") and (uris[1] ?? "").contains("staff/worker") }
+    assert("the worker inherits committer/agent and adds staff/worker") { uris.length == 2 and (uris[0] ?? "").contains("committer/agent") and (uris[1] ?? "").contains("staff/worker") }
 
     let parent = worker.parent
     # A nullable object field stays a lazy selection in Dang: force a scalar
@@ -411,7 +411,7 @@ let testStaffComposition(source: Workspace!): String! {
   let worker = spawnUnder(chief, llm.withWorkspace(source), "composition-worker", selected);
   {
     let modules = picked.map { e => e.artifact.moduleName }
-    assert(message: modules.join(", ")) { modules == ["probe", "staff"] }
+    assert("the worker inherits the chief's probe entry plus staff") { modules == ["probe", "staff"] }
     let conversation = worker.snapshot.sync
     assert { conversation.tools.contains("originRead") and conversation.tools.contains("askChief") }
     assert { systemTexts(conversation).any { t => t == "origin capabilities" } }
@@ -510,9 +510,9 @@ let testStaffCheckout(source: Workspace!): String! {
     # staff is already recorded (as the worker role), so the target's
     # `staff/agent` is not composed and the worker stays a worker.
     let uris = recordedUris(switched)
-    assert(message: uris.join(", ")) { uris.length == 3 }
-    assert(message: uris.join(", ")) { (uris[0] ?? "").contains("probe/agent") and (uris[1] ?? "").contains("staff/worker") and (uris[2] ?? "").contains("extra/agent") }
-    assert(message: uris.join(", ")) { !uris.any { u => u.contains("staff/agent") } }
+    assert("checkout adds only the new module's entry") { uris.length == 3 }
+    assert("checkout keeps probe and the worker role, then adds extra") { (uris[0] ?? "").contains("probe/agent") and (uris[1] ?? "").contains("staff/worker") and (uris[2] ?? "").contains("extra/agent") }
+    assert("checkout does not compose the target's staff/agent") { !uris.any { u => u.contains("staff/agent") } }
     let tools = switched.tools
     assert { tools.contains("askChief") and tools.contains("pendingOf") }
     assert { !tools.contains("interruptWorker") and !tools.contains("sendTo") }
@@ -586,9 +586,9 @@ let testStaffRoleWithoutStaff(source: Workspace!): String! {
   {
     assert { here.workspace.file("marker").contents == "target\n" }
     let modules = picked.map { e => e.artifact.moduleName }
-    assert(message: modules.join(", ")) { modules == ["committer", "probe", "staff"] }
+    assert("the worker inherits committer and probe plus staff") { modules == ["committer", "probe", "staff"] }
     let uris = picked.map { e => e.artifact.uri }
-    assert(message: uris.join(", ")) { (uris[2] ?? "").contains("staff/worker") }
+    assert("the worker role comes from the chief's staff entry") { (uris[2] ?? "").contains("staff/worker") }
     assert { here.workspace.artifacts.filterUri(uri: "dag://staff/worker").asExpertise.{{ id }}.isEmpty }
 
     let conversation = worker.snapshot.sync
