@@ -57,6 +57,17 @@ enum BlockKind {
   NOTE
 }
 
+"""
+What importBlocks does with an imported Block whose id the Context already
+has: ERROR imports nothing and names the clashing ids, KEEP keeps the
+session's Block, REPLACE takes the imported one.
+"""
+enum ImportConflict {
+  ERROR
+  KEEP
+  REPLACE
+}
+
 # Composition order: definitions land before the things that use them; loose
 # ends (questions, notes) last.
 let kindOrder: [BlockKind!]! = [
@@ -416,19 +427,245 @@ type Context {
     id: String!,
   ): Changeset! {
     let b = mustGet(id)
-    let front = YAML.encode({{
-      kind: kindLabel(b.kind),
-      tags: b.tags,
-      pin: b.pin,
-      supersedes: b.supersedes,
-      status: if (b.superseded) { "superseded" } else { null },
-    }})
     let path = `context/${id}.md`
-    let contents = "---\n" + front + "\n---\n\n" + b.text + "\n"
+    let contents = markdownOf(b, supersederIds(id))
     let base = source.directory("/")
     print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
     base.withNewFile(path, contents).changes(from: base)
+  }
+
+  """
+  Land the WHOLE Context in the workspace at once: every Block, active and
+  superseded, as markdown with front matter under the path — the files
+  exportMarkdown returns, written into your pending changes like promote's.
+  For committing the Context next to the code, or for publishing it: with
+  html, a browsable <path>/index.html lands too (exportHtml), ready for e.g.
+  `gh gist create <path>/*`. Files of Blocks no longer in the Context are
+  left alone.
+  """
+  promoteAll(
+    source: Workspace!,
+    """
+    Directory to write into, relative to the workspace root.
+    """
+    path: String! = "context",
+    """
+    Write every file directly under the path (facts~foo.md for
+    "facts/foo"), as gists require. The id is in each file's front matter
+    either way.
+    """
+    flat: Boolean! = false,
+    """
+    Also write <path>/index.html: the Context rendered as one page.
+    """
+    html: Boolean! = false,
+    """
+    Also write <path>/context.json (exportJson). importBlocks prefers it to
+    the markdown files beside it.
+    """
+    json: Boolean! = false,
+    """
+    The page title, with html.
+    """
+    title: String! = "Context",
+    """
+    GitHub "owner/repo" for bare #123 references in the page, with html.
+    """
+    repo: String! = "",
+  ): Changeset! {
+    if (blocks.isEmpty) {
+      raise "the Context is empty — nothing to promote"
+    }
+    let dest = path.trimRight("/")
+    let into = if (dest == "") { "." } else { dest }
+    let base = source.directory("/")
+    let landed = base.withDirectory(into, exportMarkdown(flat: flat))
+    let withHtml = if (html) { landed.withFile(into + "/index.html", exportHtml(title: title, repo: repo)) } else { landed }
+    let withJson = if (json) { withHtml.withFile(into + "/context.json", exportJson) } else { withHtml }
+    let extras = (if (html) { [into + "/index.html"] } else { [] :: [String!]! }) +
+      (if (json) { [into + "/context.json"] } else { [] :: [String!]! })
+    let also = if (extras.isEmpty) { "" } else { ", plus " + extras.join(" and ") }
+    print(`promoted ${toString(blocks.length)} block(s) to ${into}/${also} — ` +
+      "they are in your pending changes now; review and commit them, or publish them")
+    withJson.changes(from: base)
+  }
+
+  """
+  Export the whole Context as one JSON file, context.json: every Block,
+  active and superseded, with its id, kind, text, tags, pin, status,
+  supersedes, and superseded_by (who replaced it). Nothing lands in your
+  pending changes; importBlocks(json:) reads it back.
+  """
+  exportJson: File! {
+    let doc = {{
+      version: exportVersion,
+      blocks: ordered.map { b =>
+        {{
+          id: b.address,
+          kind: kindLabel(b.kind),
+          text: b.text,
+          tags: b.tags,
+          pin: b.pin,
+          status: statusLabel(b),
+          supersedes: b.supersedes,
+          superseded_by: supersederIds(b.address),
+        }}
+      },
+    }}
+    directory.withNewFile("context.json", JSON.encode(doc) + "\n").file("context.json")
+  }
+
+  """
+  Export the whole Context as a directory of markdown files with front
+  matter, one per Block, active and superseded — the format promote writes,
+  with the id in the front matter. Nothing lands in your pending changes;
+  importBlocks(from:) reads it back.
+  """
+  exportMarkdown(
+    """
+    Write every file at the top level, "facts/foo" as facts~foo.md, as gists
+    require. "~" never occurs in a block id, so the name reverses exactly.
+    """
+    flat: Boolean! = false,
+  ): Directory! {
+    ordered.reduce(directory) { dir, b =>
+      dir.withNewFile(fileNameFor(b.address, flat), markdownOf(b, supersederIds(b.address)))
+    }
+  }
+
+  """
+  Render the whole Context as one self-contained HTML page, context.html:
+  kind legend and counts, pins, kind and tag filters, a kind × tag matrix,
+  every Block as a card with its markdown rendered, block ids, URLs and
+  GitHub refs linked, references and referenced-by inferred from the text,
+  supersession, and the superseded Blocks collapsed at the end. Nothing
+  lands in your pending changes.
+  """
+  exportHtml(
+    """
+    The page title.
+    """
+    title: String! = "Context",
+    """
+    GitHub "owner/repo" that bare #123 references point at; without it they
+    stay text. owner/repo#123 is always linked.
+    """
+    repo: String! = "",
+  ): File! {
+    directory.withNewFile("context.html", contextHtml(ordered, title, repo)).file("context.html")
+  }
+
+  """
+  Export the whole Context as a flat directory ready to become a gist:
+  index.html (exportHtml) and context.json (exportJson), plus the flat
+  markdown files with markdown. Push its files to a gist by whatever means
+  you have, then view the page at https://gistpreview.github.io/?<gist-id>
+  (it renders index.html) and load the Context back in a later session with
+  importBlocks(from: "https://gist.github.com/<gist-id>.git").
+  """
+  exportGist(
+    """
+    The page title.
+    """
+    title: String! = "Context",
+    """
+    GitHub "owner/repo" for bare #123 references in the page.
+    """
+    repo: String! = "",
+    """
+    Also include every Block as a flat markdown file (facts~foo.md), for
+    reading the gist on GitHub. context.json alone round-trips.
+    """
+    markdown: Boolean! = false,
+  ): Directory! {
+    let base = if (markdown) { exportMarkdown(flat: true) } else { directory }
+    base
+      .withFile("index.html", exportHtml(title: title, repo: repo))
+      .withFile("context.json", exportJson)
+  }
+
+  """
+  Load Blocks into the Context: from a directory of promoted markdown (a
+  repo's committed context/, an exportMarkdown or promoteAll result, flat or
+  nested), from a JSON export, or from a gist made with exportGist. Every
+  file is validated before anything is imported. Blocks arrive exactly as
+  recorded — superseded ones stay superseded.
+
+  A directory with context.json at its top level is read from that file;
+  otherwise every **/*.md with front matter is a Block, its id taken from
+  the front matter (else from the path, with ~ read as /). Files without
+  front matter are skipped and named.
+  """
+  importBlocks(
+    source: Workspace!,
+    """
+    Where to read in the workspace: a directory, or a .json export file.
+    Ignored when from or json is given.
+    """
+    path: String! = "context",
+    """
+    A directory to read instead of the workspace, by address — e.g. a gist,
+    "https://gist.github.com/<gist-id>.git", or a repo's directory,
+    "https://github.com/org/repo#main:context".
+    """
+    from: Directory = null,
+    """
+    An exportJson file to read instead of the workspace.
+    """
+    json: File = null,
+    """
+    What to do with imported ids the Context already has: ERROR (the
+    default) imports nothing and names them; KEEP keeps the session's Block;
+    REPLACE takes the imported one.
+    """
+    onConflict: ImportConflict! = ImportConflict.ERROR,
+  ): Context! {
+    if (from != null and json != null) {
+      raise "pass from or json, not both"
+    }
+    let read = if (json != null) {
+      {{blocks: parseJsonBlocks(json.name, json.contents), skipped: [] :: [String!]!}}
+    } else if (from != null) {
+      readBlocksDir("", from)
+    } else if (path.hasSuffix(".json")) {
+      {{blocks: parseJsonBlocks(path, source.file(path).contents), skipped: [] :: [String!]!}}
+    } else {
+      readBlocksDir(path.trimRight("/"), source.directory(path))
+    }
+    let incoming = read.blocks
+    let ids = incoming.map { b => b.address }
+    let dupes = ids.filter { id => ids.filter { x => x == id }.length > 1 }.uniq
+    if (!dupes.isEmpty) {
+      raise `the import holds more than one block for ${dupes.join(", ")} — nothing imported`
+    }
+    let clashes = ids.filter { id => blocks.has(id) }
+    if (!clashes.isEmpty and onConflict == ImportConflict.ERROR) {
+      raise `already in the Context: ${clashes.join(", ")} — nothing imported; ` +
+        "pass onConflict: KEEP to keep the session's blocks, or REPLACE to take the imported ones"
+    }
+    let taken = if (onConflict == ImportConflict.KEEP) {
+      incoming.reject { b => clashes.contains(b.address) }
+    } else {
+      incoming
+    }
+    self.blocks = taken.reduce(blocks) { acc, b => acc.with(b.address, b) }
+
+    let notes: [String!]! = []
+    let gone = taken.filter { b => b.superseded }.length
+    if (gone > 0) {
+      notes += [`${toString(gone)} superseded`]
+    }
+    if (!clashes.isEmpty) {
+      let verb = if (onConflict == ImportConflict.KEEP) { "kept the session's" } else { "replaced" }
+      notes += [`${verb} ${clashes.join(", ")}`]
+    }
+    if (!read.skipped.isEmpty) {
+      notes += ["skipped files without front matter: " + read.skipped.join(", ")]
+    }
+    let detail = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
+    print(`imported ${toString(taken.length)} block(s)${detail}` + "\n\n" + blockIndex)
+    self
   }
 
   # ---- helpers ------------------------------------------------------------
@@ -452,10 +689,15 @@ type Context {
   # Who replaced a Block — scanned rather than stored, so pruning a
   # superseder can never leave a dangling pointer.
   let supersederOf(id: String!): String! {
+    supersederIds(id).join(", ")
+  }
+
+  # The ids of the Blocks that list this one in their supersedes — exported
+  # as superseded_by.
+  let supersederIds(id: String!): [String!]! {
     blocks.values
       .filter { b => b.supersedes.contains(id) }
       .map { b => b.address }
-      .join(", ")
   }
 
   # One compact line of metadata: the only metadata that ever reaches the

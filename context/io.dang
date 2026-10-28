@@ -1,0 +1,168 @@
+# Import/export formats for a Context: front-matter markdown (what promote
+# writes), one JSON document, and the flat layout gists need. Plain-data
+# helpers only; the tools live on Context in main.dang.
+
+# Version of the JSON export. importBlocks refuses anything newer.
+let exportVersion: Int! = 1
+
+# Gists are flat — one level of files, no "/" in names — so the flat layout
+# writes "facts/foo" as "facts~foo.md". "~" never occurs in a block id
+# (idShape), so the mapping reverses exactly.
+let flatSeparator: String! = "~"
+
+let fileNameFor(id: String!, flat: Boolean!): String! {
+  if (flat) { id.replace("/", flatSeparator) + ".md" } else { id + ".md" }
+}
+
+let idForFile(path: String!): String! {
+  path.trimSuffix(".md").replace(flatSeparator, "/")
+}
+
+let statusLabel(b: Block!): String {
+  if (b.superseded) { "superseded" } else { null }
+}
+
+# The front matter of a promoted or exported Block. superseded_by is derived
+# (see Context.supersederIds), written for readers and ignored on import.
+let frontMatter(b: Block!, supersededBy: [String!]!): String! {
+  YAML.encode({{
+    id: b.address,
+    kind: kindLabel(b.kind),
+    tags: b.tags,
+    pin: b.pin,
+    supersedes: b.supersedes,
+    superseded_by: supersededBy,
+    status: statusLabel(b),
+  }})
+}
+
+let markdownOf(b: Block!, supersededBy: [String!]!): String! {
+  "---\n" + frontMatter(b, supersededBy) + "\n---\n\n" + b.text + "\n"
+}
+
+# Build a Block from imported fields, validated like blockWrite validates —
+# except that supersedes targets may be absent (pruned, or not imported).
+let importedBlock(
+  origin: String!,
+  id: String!,
+  kind: String!,
+  text: String!,
+  tags: [String!]!,
+  pin: Boolean!,
+  supersedes: [String!]!,
+  status: String!,
+): Block! {
+  if (!id.containsMatch(idShape)) {
+    raise `${origin}: block id "${id}" is not an address — ids are lowercase and path-shaped, like "facts/engine-caches-by-id"`
+  }
+  let label = kind.trimSpace.toLower
+  let k = kindOrder.find { candidate => kindLabel(candidate) == label }
+  if (k == null) {
+    raise `${origin}: unknown kind "${kind}" — one of ${kindOrder.map { candidate => kindLabel(candidate) }.join(", ")}`
+  }
+  if (text.trimSpace == "") {
+    raise `${origin}: block "${id}" has no text payload`
+  }
+  if (supersedes.contains(id)) {
+    raise `${origin}: block "${id}" cannot supersede itself`
+  }
+  let st = status.trimSpace.toLower
+  if (st != "" and st != "superseded" and st != "active") {
+    raise `${origin}: unknown status "${status}" — "superseded", or null for an active block`
+  }
+  Block(
+    address: id,
+    kind: k,
+    text: text,
+    tags: tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq,
+    pin: pin,
+    superseded: st == "superseded",
+    supersedes: supersedes,
+  )
+}
+
+# Parse one promoted markdown file. Null when it has no front matter (a
+# README beside the blocks, say): the caller reports it as skipped. The id
+# comes from the front matter when present, else from the file's path.
+let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
+  let s = raw.replace("\r\n", "\n")
+  if (!s.hasPrefix("---\n")) {
+    return null
+  }
+  # Prefix the newline back so empty front matter ("---\n---\n") splits too.
+  let parts = ("\n" + s.trimPrefix("---\n")).split("\n---\n", limit: 2)
+  if (parts.length < 2) {
+    raise `${origin}: front matter is not closed by a "---" line`
+  }
+  let front = parts[0] ?? ""
+  let body = (parts[1] ?? "").trimPrefix("\n").trimSuffix("\n")
+  let meta: {{id: String, kind: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String}} = YAML.decode(front) rescue {
+    e: Error => raise `${origin}: front matter is not valid YAML: ${e.message}`
+  }
+  if (meta == null) {
+    raise `${origin}: front matter is empty — it needs at least a kind`
+  }
+  let kind = meta.kind
+  if (kind == null) {
+    raise `${origin}: front matter has no kind`
+  }
+  importedBlock(
+    origin,
+    meta.id ?? idForFile(path),
+    kind,
+    body,
+    meta.tags ?? [],
+    meta.pin ?? false,
+    meta.supersedes ?? [],
+    meta.status ?? "",
+  )
+}
+
+# Parse an exportJson document.
+let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
+  let doc: {{version: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String}}!]}}! = JSON.decode(raw) rescue {
+    e: Error => raise `${origin}: not a Context export (exportJson): ${e.message}`
+  }
+  let version = doc.version ?? exportVersion
+  if (version > exportVersion) {
+    raise `${origin}: export version ${toString(version)} is newer than this module reads (${toString(exportVersion)})`
+  }
+  let entries = doc.blocks
+  if (entries == null) {
+    raise `${origin}: not a Context export (exportJson): no "blocks" list`
+  }
+  entries.map { e, i =>
+    let at = `${origin} (blocks[${toString(i)}])`
+    let id = e.id
+    if (id == null) {
+      raise `${at}: missing id`
+    }
+    let kind = e.kind
+    if (kind == null) {
+      raise `${at}: missing kind`
+    }
+    importedBlock(at, id, kind, e.text ?? "", e.tags ?? [], e.pin ?? false, e.supersedes ?? [], e.status ?? "")
+  }
+}
+
+# Read the blocks a directory holds: context.json at its root wins when
+# present (the lossless form, and what exportGist writes); otherwise every
+# **/*.md file with front matter. Files without front matter are skipped.
+let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!}}! {
+  let prefix = if (origin == "") { "" } else { origin + "/" }
+  if (dir.glob("context.json").contains("context.json")) {
+    let file = prefix + "context.json"
+    return {{blocks: parseJsonBlocks(file, dir.file("context.json").contents), skipped: [] :: [String!]!}}
+  }
+  let blocks: [Block!]! = []
+  let skipped: [String!]! = []
+  dir.glob("**/*.md").each { path =>
+    let b = parseMarkdownBlock(prefix + path, path, dir.file(path).contents)
+    if (b == null) {
+      skipped += [prefix + path]
+    } else {
+      blocks += [b]
+    }
+  }
+  {{blocks: blocks, skipped: skipped}}
+}
