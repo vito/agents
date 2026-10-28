@@ -109,6 +109,12 @@ type AgentsDev {
     null
   }
 
+  """Check blockPrune drops by default (kept, out of composition, exported, rendered and imported as dropped, revived by blockWrite) and deletes only with forget."""
+  contextDrop(source: Workspace!): Void @check {
+    print(testContextDrop(source: source))
+    null
+  }
+
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: Void @check {
     print(checkContributorMountsOutsideToolbox)

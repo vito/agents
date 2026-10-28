@@ -109,8 +109,14 @@ let blockLines(b: Block!): Int! {
   b.text.split("\n").length
 }
 
+# Active Blocks are the ones composed: neither superseded nor dropped.
+let isActive(b: Block!): Boolean! {
+  !b.superseded and !b.dropped
+}
+
 # Fork of a Block marked superseded. Kept, never deleted: the reasoning
-# outlives the conclusion.
+# outlives the conclusion. A Block has one status, so a dropped Block that
+# something later replaces is superseded, no longer dropped.
 let asSuperseded(b: Block!): Block! {
   Block(
     address: b.address,
@@ -121,6 +127,22 @@ let asSuperseded(b: Block!): Block! {
     superseded: true,
     supersedes: b.supersedes,
     number: b.number,
+    dropped: false,
+  )
+}
+
+# Fork of a Block marked dropped: kept for the record, never composed.
+let asDropped(b: Block!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: b.number,
+    dropped: true,
   )
 }
 
@@ -134,6 +156,7 @@ let withNumber(b: Block!, n: Int!): Block! {
     superseded: b.superseded,
     supersedes: b.supersedes,
     number: n,
+    dropped: b.dropped,
   )
 }
 
@@ -195,6 +218,13 @@ type Block {
   Null for every other Block.
   """
   number: Int = null
+
+  """
+  Dropped Blocks stopped mattering without anything replacing them — a
+  moot question, a result that served its purpose. Kept for the record
+  and exported, but never composed.
+  """
+  dropped: Boolean! = false
 }
 
 """
@@ -322,8 +352,8 @@ type Context {
 
   """
   Read one Block in full: its header line and complete text. Works on
-  superseded Blocks too — the reasoning is kept — with a pointer to what
-  replaced them.
+  superseded and dropped Blocks too — the reasoning is kept — with a
+  pointer to what replaced them.
   """
   blockRead(
     """
@@ -339,6 +369,8 @@ type Context {
       } else {
         "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
       }
+    } else if (b.dropped) {
+      "\n\n(dropped — kept for the record, excluded from composition; blockWrite at this id revives it)"
     } else {
       ""
     }
@@ -355,41 +387,65 @@ type Context {
       return "The Context is empty — no Blocks yet. blockWrite records the first."
     }
     let all = ordered
-    let active = all.filter { b => !b.superseded }
+    let active = all.filter { b => isActive(b) }
     let pinned = active.filter { b => b.pin }
     let total = active.reduce(0) { acc, b => acc + blockLines(b) }
+    let superseded = all.filter { b => b.superseded }.length
+    let dropped = all.filter { b => b.dropped }.length
+    let droppedNote = if (dropped == 0) { "" } else { `, ${toString(dropped)} dropped` }
     let headline = `${toString(all.length)} block(s) — ${toString(active.length)} active ` +
       `(${toString(total)} text line(s), ${toString(pinned.length)} pinned), ` +
-      `${toString(all.length - active.length)} superseded`
+      `${toString(superseded)} superseded${droppedNote}`
     headline + "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
   }
 
   """
-  Take Blocks out of the Context — the operation a log cannot perform on
-  itself. For Blocks that stopped mattering: noise, settled questions,
-  results that served their purpose.
+  Take Blocks out of composition when they stopped mattering and nothing
+  replaces them: a moot question, a result that served its purpose. They
+  are DROPPED, not deleted — kept for the record, listed by blockIndex,
+  exported and published as dropped, so a committed or published copy
+  never brings them back — and blockWrite at the same id revives one.
 
-  Pruning forgets entirely. A Block that was CONTRADICTED should be
-  superseded instead (blockWrite with supersedes:), which keeps the
-  reasoning readable.
+  Do not prune what something replaces: supersede a CONTRADICTED Block
+  (blockWrite with supersedes:), and answer a QUESTION with the DECISION
+  that supersedes it, so the reasoning stays linked.
+
+  forget: true deletes outright. Only for mistakes and misadventures whose
+  mere presence would confuse future agents — a block written at the wrong
+  id, junk, a dead end with nothing to learn from.
   """
   blockPrune(
     """
-    Ids of the Blocks to remove, as listed by blockIndex (or Q-numbers).
+    Ids of the Blocks to drop, as listed by blockIndex (or Q-numbers).
     """
     ids: [String!]!,
+    """
+    Delete the Blocks outright instead of dropping them: no record is left,
+    and exports no longer carry them (a file promoted earlier stays where it
+    is — delete it yourself). Only for mistakes and misadventures.
+    """
+    forget: Boolean! = false,
   ): Context! {
     if (ids.isEmpty) {
       raise "name at least one block id to prune"
     }
     let addrs = ids.map { id => resolveId(id) }.uniq
     addrs.each { id =>
-      if (!blocks.has(id)) {
-        raise `no block "${id}" in the Context — blockIndex lists what is there`
+      let b = mustGet(id)
+      if (!forget and !isActive(b)) {
+        let state = if (b.superseded) { "superseded" } else { "dropped" }
+        raise `"${id}" is already ${state}, so it is out of composition — pass forget: true only if its record would confuse future agents`
       }
     }
-    self.blocks = addrs.reduce(blocks) { acc, id => acc.without(id) }
-    print(`pruned ${addrs.join(", ")}` + "\n\n" + blockIndex)
+    if (forget) {
+      self.blocks = addrs.reduce(blocks) { acc, id => acc.without(id) }
+      print(`forgot ${addrs.join(", ")}` + "\n\n" + blockIndex)
+    } else {
+      self.blocks = blocks.map { bid, b =>
+        if (addrs.contains(bid)) { asDropped(b) } else { b }
+      }
+      print(`dropped ${addrs.join(", ")} — kept for the record, out of composition` + "\n\n" + blockIndex)
+    }
     self
   }
 
@@ -401,7 +457,8 @@ type Context {
 
   With no selectors this composes every active Block. Selectors union: a
   Block is included when its id, its kind, or any of its tags matches.
-  Pinned Blocks are always included; superseded Blocks never are.
+  Pinned Blocks are always included; superseded and dropped Blocks never
+  are.
 
   Call it whenever you are unsure what you know — and ALWAYS as your first
   move after your conversation has been compacted: the Context lives in
@@ -441,7 +498,7 @@ type Context {
 
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
-    let active = all.filter { b => !b.superseded }
+    let active = all.filter { b => isActive(b) }
     let selected = active.filter { b =>
       b.pin or wantAll or
         wanted.contains(b.address) or
@@ -475,7 +532,7 @@ type Context {
       notes += [`${toString(filtered)} active block(s) outside this selection`]
     }
     if (all.length > active.length) {
-      notes += [`${toString(all.length - active.length)} superseded block(s) held out`]
+      notes += [`${toString(all.length - active.length)} superseded or dropped block(s) held out`]
     }
     if (!notes.isEmpty) {
       manifest += ["  (" + notes.join("; ") + " — blockIndex lists everything)"]
@@ -522,14 +579,15 @@ type Context {
   }
 
   """
-  Land the WHOLE Context in the workspace at once: every Block, active and
-  superseded, as markdown with front matter under the path — the files
-  exportMarkdown returns, written into your pending changes like promote's.
-  For committing the Context next to the code, or for publishing it: with
-  html, a browsable <path>/index.html lands too (exportHtml). To publish a
-  gist, land it flat in a directory of its own — e.g. path: "gist", flat,
-  html and json — then `gh gist create gist/*`; gists hold no
-  subdirectories. Files of Blocks no longer in the Context are left alone.
+  Land the WHOLE Context in the workspace at once: every Block, active,
+  superseded and dropped, as markdown with front matter under the path —
+  the files exportMarkdown returns, written into your pending changes like
+  promote's. For committing the Context next to the code, or for
+  publishing it: with html, a browsable <path>/index.html lands too
+  (exportHtml). To publish a gist, land it flat in a directory of its own
+  — e.g. path: "gist", flat, html and json — then `gh gist create
+  gist/*`; gists hold no subdirectories. Files of forgotten Blocks
+  (blockPrune with forget) are left alone.
   """
   promoteAll(
     source: Workspace!,
@@ -636,8 +694,8 @@ type Context {
   then pinned. Then kind legend and counts, pins, kind and tag filters, a
   kind × tag matrix, every Block as a card with its markdown rendered, block
   ids, URLs and GitHub refs linked, references and referenced-by inferred
-  from the text, supersession, and the superseded Blocks collapsed at the
-  end. Nothing lands in your pending changes.
+  from the text, supersession, and the superseded and dropped Blocks
+  collapsed at the end. Nothing lands in your pending changes.
 
   To curate the page, write the curated content as Blocks — a status table,
   a ship checklist, a code snippet with its permalink — and name them in
@@ -655,8 +713,8 @@ type Context {
     repo: String! = "",
     """
     Ids (or Q-numbers) of active Blocks to feature first, under "At a
-    glance", in this order. An unknown or superseded id is an error, so
-    typos surface.
+    glance", in this order. An unknown, superseded or dropped id is an
+    error, so typos surface.
     """
     lead: [String!]! = [],
   ): File! {
@@ -665,6 +723,9 @@ type Context {
       let b = mustGet(id)
       if (b.superseded) {
         raise `cannot lead with "${id}": it is superseded — lead with what replaced it (${supersederOf(id)})`
+      }
+      if (b.dropped) {
+        raise `cannot lead with "${id}": it is dropped`
       }
     }
     directory.withNewFile("context.html", contextHtml(ordered, title, repo, featured)).file("context.html")
@@ -708,16 +769,16 @@ type Context {
   repo's committed context/, an exportMarkdown or promoteAll result, flat or
   nested), from a JSON export, or from a gist made with exportGist. Every
   file is validated before anything is imported. Blocks arrive exactly as
-  recorded — superseded ones stay superseded, active ones stay active even
-  when another names them in supersedes (as after a revive) — and an
+  recorded — superseded and dropped ones stay so, active ones stay active
+  even when another names them in supersedes (as after a revive) — and an
   imported Block's supersedes marks the session's Blocks it names
   superseded, as blockWrite does.
 
   In a directory, every **/*.md with front matter is a Block, its id taken
   from the front matter (else from the path, with ~ read as /), plus any
   Block only a top-level context.json holds; markdown wins on a shared id.
-  Files without front matter are skipped and named. Stale files come back
-  too: promoteAll never deletes the file of a pruned Block.
+  Files without front matter are skipped and named. A forgotten Block's
+  file, if it was ever promoted, comes back too: delete it.
   """
   importBlocks(
     source: Workspace!,
@@ -821,6 +882,10 @@ type Context {
     if (gone > 0) {
       notes += [`${toString(gone)} superseded`]
     }
+    let dropped = taken.filter { b => b.dropped }.length
+    if (dropped > 0) {
+      notes += [`${toString(dropped)} dropped`]
+    }
     if (!clashes.isEmpty) {
       let verb = if (onConflict == ImportConflict.KEEP) { "kept the session's" } else { "replaced" }
       notes += [`${verb} ${clashes.join(", ")}`]
@@ -900,6 +965,8 @@ type Context {
     let superseded = if (b.superseded) {
       let by = supersederOf(b.address)
       if (by == "") { "  superseded" } else { `  superseded by ${by}` }
+    } else if (b.dropped) {
+      "  dropped"
     } else {
       ""
     }
@@ -944,12 +1011,14 @@ type Context {
     a compaction. blockIndex is the cheap one-line-per-block overview;
     blockRead fetches one Block in full.
 
-    CURATE. A set can have things taken out — its whole advantage over a
-    log. blockPrune drops Blocks that stopped mattering. When a new truth
-    contradicts an old one, do not prune: blockWrite the new Block with
-    supersedes: naming the old — superseded Blocks are kept out of
-    composition but preserved, because the reasoning outlives the
-    conclusion.
+    CURATE. A set can have things taken out of composition — its whole
+    advantage over a log. When a new truth contradicts an old one,
+    blockWrite the new Block with supersedes: naming the old. When a Block
+    stopped mattering and nothing replaces it, blockPrune drops it. Either
+    way it is kept out of composition but preserved, because the reasoning
+    outlives the conclusion. blockPrune with forget: true deletes outright —
+    only for mistakes and misadventures that would just confuse a future
+    reader.
 
     QUESTIONS get a stable short id, Q-<n>, shown in blockIndex and
     accepted wherever an id is: cite open questions by it. Answer one by

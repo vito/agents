@@ -19,7 +19,7 @@ let idForFile(path: String!): String! {
 }
 
 let statusLabel(b: Block!): String {
-  if (b.superseded) { "superseded" } else { null }
+  if (b.superseded) { "superseded" } else if (b.dropped) { "dropped" } else { null }
 }
 
 # The front matter of a promoted or exported Block. superseded_by is derived
@@ -74,8 +74,8 @@ let importedBlock(
     raise `${origin}: block "${id}" cannot supersede itself`
   }
   let st = status.trimSpace.toLower
-  if (st != "" and st != "superseded" and st != "active") {
-    raise `${origin}: unknown status "${status}" — "superseded", or null for an active block`
+  if (st != "" and st != "superseded" and st != "dropped" and st != "active") {
+    raise `${origin}: unknown status "${status}" — "superseded", "dropped", or null for an active block`
   }
   Block(
     address: id,
@@ -86,6 +86,7 @@ let importedBlock(
     superseded: st == "superseded",
     supersedes: supersedes,
     number: number,
+    dropped: st == "dropped",
   )
 }
 

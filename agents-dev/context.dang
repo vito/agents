@@ -82,7 +82,7 @@ let contextIoFixture: Context! {
       "We **chose** facts/current over `facts/old`; see vito/agents#12 and #34.\n\n- one\n- two\n  continued\n\n| a | b |\n|---|---|\n| <script>alert(1)</script> | https://example.com/?a=1&b=2 |",
       tags: ["io", "colon: inside", "line\nbreak"], pin: true,
       supersedes: ["decisions/pruned"])
-    .blockPrune(["decisions/pruned"])
+    .blockPrune(["decisions/pruned"], forget: true)
     .blockWrite("facts/current", ContextBlockKind.FACT, "current\n\n```\ncode ~~here~~\n```\n", tags: ["io"])
     .blockWrite("facts/old", ContextBlockKind.FACT, "old")
     .blockWrite("facts/z", ContextBlockKind.FACT, "z", supersedes: ["facts/old"])
@@ -294,10 +294,10 @@ let testContextShortIds(source: Workspace!): String! {
   assert { ctx.blockRead("Q-2").contains("── questions/two · question · Q-2 ──") }
   assert { ctx.compose(ids: ["Q-1"]).contains("first?") }
 
-  # Rewrites keep the number; pruning the newest never frees it.
+  # Rewrites keep the number; forgetting the newest never frees it.
   let rewritten = ctx.blockWrite("questions/one", ContextBlockKind.QUESTION, "first, reworded?")
   assert { rewritten.blockIndex.contains("questions/one  question  Q-1") }
-  let pruned = rewritten.blockPrune(["Q-2"]).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
+  let pruned = rewritten.blockPrune(["Q-2"], forget: true).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
   assert { pruned.blockIndex.contains("questions/three  question  Q-3") }
 
   # Answering supersedes the question by its number; the number stays.
@@ -334,6 +334,53 @@ let testContextShortIds(source: Workspace!): String! {
   assert { html.contains(`<a class="chip k-question gone" href="#b-questions/one" title="questions/one">Q-1</a>`) }
   assert { html.contains(`<a class="bid" href="#b-questions/three">`) }
   "Context short id checks passed."
+}
+
+# blockPrune drops by default: kept, out of composition, exported and
+# rendered as dropped, revived by blockWrite. forget deletes outright.
+let testContextDrop(source: Workspace!): String! {
+  let ctx = context
+    .blockWrite("facts/keep", ContextBlockKind.FACT, "still true")
+    .blockWrite("results/served", ContextBlockKind.RESULT, "served its purpose")
+    .blockWrite("questions/moot", ContextBlockKind.QUESTION, "moot now? see results/served", tags: ["blocker"])
+  let dropped = ctx.blockPrune(["results/served", "Q-1"])
+  let index = dropped.blockIndex
+  assert { index.contains("3 block(s) — 1 active (1 text line(s), 0 pinned), 0 superseded, 2 dropped") }
+  assert { index.contains("results/served  result  1 line(s)  dropped") }
+  assert { index.contains("questions/moot  question  Q-1  1 line(s)  #blocker  dropped") }
+  assert { !dropped.compose.contains("served its purpose") }
+  assert { dropped.compose.contains("2 superseded or dropped block(s) held out") }
+  assert { dropped.blockRead("results/served").contains("(dropped — kept for the record") }
+
+  # Dropping twice is refused; forget is the explicit way out.
+  let again = dropped.blockPrune(["results/served"]).blockIndex rescue { e: Error => e.message }
+  assert { again.contains("already dropped") and again.contains("forget: true") }
+  let forgotten = dropped.blockPrune(["results/served"], forget: true)
+  assert { !forgotten.blockIndex.contains("results/served") }
+
+  # Exports say dropped, and importing them keeps it so.
+  let md = dropped.exportMarkdown.file("results/served.md").contents
+  assert { md.contains("status: dropped") }
+  let back = context.importBlocks(source: source, json: dropped.exportJson)
+  assert { back.blockIndex == dropped.blockIndex }
+  assert { context.importBlocks(source: source, from: dropped.exportMarkdown).blockIndex == dropped.blockIndex }
+
+  # The page lists them apart, never as open questions or in the matrix.
+  let html = dropped.exportHtml.contents
+  assert { html.contains(`<h2 id="dropped">Dropped</h2>`) and html.contains("2 dropped") }
+  assert { !html.contains(`<h2 id="questions">`) and !html.contains("BLOCKER</span>") }
+  assert { html.contains(`<a class="chip k-result gone" href="#b-results/served"`) }
+  assert { html.contains("Dropped: stopped mattering") }
+  let led = dropped.exportHtml(lead: ["results/served"]).contents rescue { e: Error => e.message }
+  assert { led.contains("it is dropped") }
+
+  # blockWrite revives; superseding a dropped Block makes it superseded only.
+  let revived = dropped.blockWrite("results/served", ContextBlockKind.RESULT, "useful again")
+  assert { revived.blockIndex.contains("results/served  result  1 line(s)\n") }
+  let replaced = dropped.blockWrite("decisions/settled", ContextBlockKind.DECISION, "answered after all", supersedes: ["Q-1"])
+  assert { replaced.blockIndex.contains("questions/moot  question  Q-1  1 line(s)  #blocker  superseded by decisions/settled") }
+  assert { replaced.blockIndex.contains("1 superseded, 1 dropped") }
+  "Context drop checks passed."
 }
 
 let testContextTools: String! {

@@ -2,9 +2,9 @@
 # legend and counts, pins, tags, kind/tag filters, a kind × tag matrix, block
 # cards with their markdown rendered, linkified URLs, GitHub refs and block
 # ids, references / referenced-by inferred from block text, supersession, and
-# a collapsed superseded section. Deterministic (no timestamps), so it caches
-# like every other tool. No external assets: it works from a file, a gist
-# preview, or anywhere else a lone HTML file can be served.
+# collapsed superseded and dropped sections. Deterministic (no timestamps),
+# so it caches like every other tool. No external assets: it works from a
+# file, a gist preview, or anywhere else a lone HTML file can be served.
 #
 # Above the fold sit two curated sections made of Blocks, never of separate
 # content: "At a glance" features the Blocks the caller names (lead), and
@@ -84,7 +84,7 @@ let chipHtml(id: String!, known: Map[Block!]!): String! {
   if (b == null) {
     return "<code>" + escLit(id) + "</code>"
   }
-  let gone = if (b.superseded) { " gone" } else { "" }
+  let gone = if (!isActive(b)) { " gone" } else { "" }
   `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${kindLabel(b.kind).toUpper}">${escLit(id)}</a>`
 }
 
@@ -98,7 +98,7 @@ let shortChipHtml(n: String!, known: Map[Block!]!): String {
   if (b == null) {
     return null
   }
-  let gone = if (b.superseded) { " gone" } else { "" }
+  let gone = if (!isActive(b)) { " gone" } else { "" }
   `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${escLit(id)}">Q-${n}</a>`
 }
 
@@ -339,8 +339,9 @@ let contextJs: String! = """
 # feature above the fold, in the caller's order; the caller validates it.
 let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!): String! {
   let known: Map[Block!]! = all.reduce(([:] :: Map[Block!]!)) { acc, b => acc.with(b.address, b) }
-  let active = all.filter { b => !b.superseded }
+  let active = all.filter { b => isActive(b) }
   let gone = all.filter { b => b.superseded }
+  let dropped = all.filter { b => b.dropped }
   let pinned = active.filter { b => b.pin }
   let refs: Map[[String!]!]! = all.reduce(([:] :: Map[[String!]!]!)) { acc, b => acc.with(b.address, refsOf(b, known)) }
 
@@ -388,7 +389,7 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     } else {
       `<span class="bid">${escLit(b.address)}</span>`
     }
-    let blocker = if (b.kind == BlockKind.QUESTION and !b.superseded and b.tags.contains(blockerTag)) {
+    let blocker = if (b.kind == BlockKind.QUESTION and isActive(b) and b.tags.contains(blockerTag)) {
       `<span class="badge">BLOCKER</span>`
     } else {
       ""
@@ -410,6 +411,8 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
       links += ["<div>Superseded by " + by.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
     } else if (b.superseded) {
       links += ["<div>Superseded</div>"]
+    } else if (b.dropped) {
+      links += ["<div>Dropped: stopped mattering, with nothing replacing it</div>"]
     }
     if (!b.supersedes.isEmpty) {
       links += ["<div>Supersedes " + b.supersedes.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
@@ -428,7 +431,8 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
 
   let page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)}</title><style>` +
     contextCss + "</style></head><body><main>\n"
-  page += `<h1>${escHtml(title)}</h1><div class="sub">${toString(active.length)} active block(s), ${toString(pinned.length)} pinned, ${toString(gone.length)} superseded.</div>` + "\n"
+  let droppedCount = if (dropped.isEmpty) { "" } else { `, ${toString(dropped.length)} dropped` }
+  page += `<h1>${escHtml(title)}</h1><div class="sub">${toString(active.length)} active block(s), ${toString(pinned.length)} pinned, ${toString(gone.length)} superseded${droppedCount}.</div>` + "\n"
 
   page += `<div class="legend">` + kinds.map { k =>
     `<span><span class="kind k-${kindLabel(k)}">${kindLabel(k).toUpper}</span> ×${toString(kindCount(k))}</span>`
@@ -447,9 +451,10 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     asked.filter { b => !b.pin and !b.tags.contains(blockerTag) }
 
   let goneNav = if (gone.isEmpty) { "" } else { `<a href="#superseded">Superseded</a>` }
+  let droppedNav = if (dropped.isEmpty) { "" } else { `<a href="#dropped">Dropped</a>` }
   let leadNav = if (leading.isEmpty) { "" } else { `<a href="#glance">At a glance</a>` }
   let askedNav = if (questions.isEmpty) { "" } else { `<a href="#questions">Open questions</a>` }
-  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}<a href="#about">About</a></nav>` + "\n"
+  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}${droppedNav}<a href="#about">About</a></nav>` + "\n"
 
   if (!leading.isEmpty) {
     page += `<h2 id="glance">At a glance</h2>` + "\n" + leading.map { b => card(b, true) }.join("")
@@ -492,6 +497,11 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     page += `<h2 id="superseded">Superseded</h2><div class="sub">Kept for the reasoning; never composed.</div>` +
       `<details class="sup"><summary>${toString(gone.length)} superseded block(s)</summary>` + "\n" +
       gone.map { b => card(b, false) }.join("") + "</details>\n"
+  }
+  if (!dropped.isEmpty) {
+    page += `<h2 id="dropped">Dropped</h2><div class="sub">Stopped mattering with nothing replacing them; kept for the record, never composed.</div>` +
+      `<details class="sup"><summary>${toString(dropped.length)} dropped block(s)</summary>` + "\n" +
+      dropped.map { b => card(b, false) }.join("") + "</details>\n"
   }
 
   page += `<h2 id="about">About</h2><ul>` +
