@@ -1,4 +1,41 @@
-let testContextPromotionMetadata(source: Workspace!): String! {
+# Helpers: exportContext returns a Changeset against a workspace, so the
+# checks export into scratch directories and import back from them.
+
+let scratch: Workspace! {
+  directory.asWorkspace
+}
+
+# Export into a scratch directory's out/ and return out/.
+let exportedDir(ctx: Context!, formats: [ContextExportFormat!]!, flat: Boolean! = false): Directory! {
+  directory.withChanges(ctx.exportContext(source: scratch, path: "out", formats: formats, flat: flat)).directory("out")
+}
+
+let jsonOf(ctx: Context!): File! {
+  exportedDir(ctx, [ContextExportFormat.JSON]).file("context.json")
+}
+
+let markdownOf(ctx: Context!, flat: Boolean! = false): Directory! {
+  exportedDir(ctx, [ContextExportFormat.MARKDOWN], flat: flat)
+}
+
+let htmlOf(ctx: Context!, title: String! = "Context", repo: String! = "", lead: [String!]! = []): String! {
+  directory.withChanges(ctx.exportContext(source: scratch, path: "out",
+    formats: [ContextExportFormat.HTML], title: title, repo: repo, lead: lead)).file("out/index.html").contents
+}
+
+let importDir(ctx: Context!, dir: Directory!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
+  ctx.importContext(source: directory.withDirectory("in", dir).asWorkspace, from: "in", onConflict: onConflict)
+}
+
+let importJson(ctx: Context!, json: File!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
+  ctx.importContext(source: directory.withFile("in.json", json).asWorkspace, from: "in.json", onConflict: onConflict)
+}
+
+let readBlock(ctx: Context!, id: String!): String! {
+  ctx.compose(ids: [id])
+}
+
+let testContextExportMetadata(source: Workspace!): String! {
   let tags = [
     "comma,inside", "colon: inside", "double\"quote", "single'quote",
     "line\nbreak", "true", "null", "123", "[brackets]", "# comment",
@@ -11,9 +48,7 @@ let testContextPromotionMetadata(source: Workspace!): String! {
       pin: true, supersedes: ["facts/old"])
   [fixture, fixture.blockWrite("facts/new", ContextBlockKind.FACT, "new",
     supersedes: ["facts/current"])].each { state, i =>
-    let changes = state.promote(source, "facts/current")
-    let contents = source.directory("/").withChanges(changes)
-      .file("context/facts/current.md").contents
+    let contents = markdownOf(state).file("facts/current.md").contents
     assert { contents.hasPrefix("---\n") }
     let parts = contents.trimPrefix("---\n").split("\n---\n\n", limit: 2)
     assert { parts.length == 2 }
@@ -32,14 +67,13 @@ let testContextPromotionMetadata(source: Workspace!): String! {
     let roundtrip: {{id: String!, kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, superseded_by: [String!]!, status: String}}! = YAML.decode(YAML.encode(metadata))
     assert { roundtrip == metadata }
   }
-  "Promotion metadata and payload checks passed."
+  "Export metadata and payload checks passed."
 }
 
-let testContextPromotionDefaults(source: Workspace!): String! {
+let testContextExportDefaults(source: Workspace!): String! {
   let fixture = context.blockWrite("notes/defaults", ContextBlockKind.NOTE, "plain payload")
-  let changes = fixture.promote(source, "notes/defaults")
-  let contents = source.directory("/").withChanges(changes)
-    .file("context/notes/defaults.md").contents
+  let changes = fixture.exportContext(source: scratch)
+  let contents = directory.withChanges(changes).file("context/notes/defaults.md").contents
   let parts = contents.trimPrefix("---\n").split("\n---\n\n", limit: 2)
   assert { contents.hasPrefix("---\n") and parts.length == 2 }
   let front = parts[0] ?? ""
@@ -51,30 +85,31 @@ let testContextPromotionDefaults(source: Workspace!): String! {
   assert { front.contains("superseded_by: []") and front.contains("id: notes/defaults") }
   assert { front.contains("pin: false") and front.contains("status: null") }
   assert { parts[1] == "plain payload\n" }
-  "Promotion default checks passed."
+  "Export default checks passed."
 }
 
-# promote facts/old, supersede it, promote facts/new: the committed files
-# must import with facts/old superseded. A target never promoted stays out.
-let testContextPromoteSupersedes(source: Workspace!): String! {
+# Export facts/old, supersede it, export only facts/new: the file already
+# exported is refreshed, so the committed files import with facts/old
+# superseded. A Block never exported stays out.
+let testContextExportRefresh(source: Workspace!): String! {
   let first = context.blockWrite("facts/old", ContextBlockKind.FACT, "old truth")
-  let ws1 = source.directory("/").withChanges(first.promote(source, "facts/old"))
+  let d1 = directory.withChanges(first.exportContext(source: scratch, ids: ["facts/old"]))
   let second = first
-    .blockWrite("facts/never", ContextBlockKind.FACT, "never promoted")
+    .blockWrite("facts/never", ContextBlockKind.FACT, "never exported")
     .blockWrite("facts/new", ContextBlockKind.FACT, "new truth", supersedes: ["facts/old", "facts/never"])
-  let ws2 = ws1.withChanges(second.promote(ws1.asWorkspace, "facts/new"))
-  assert { ws2.file("context/facts/old.md").contents.contains("status: superseded") }
-  assert { !ws2.glob("context/facts/*.md").contains("context/facts/never.md") }
-  let loaded = context.importBlocks(source: ws2.asWorkspace)
+  let d2 = d1.withChanges(second.exportContext(source: d1.asWorkspace, ids: ["facts/new"]))
+  assert { d2.file("context/facts/old.md").contents.contains("status: superseded") }
+  assert { d2.glob("context/facts/*.md") == ["context/facts/new.md", "context/facts/old.md"] }
+  let loaded = context.importContext(source: d2.asWorkspace)
   assert { loaded.blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/new") }
   assert { !loaded.compose.contains("old truth") }
-  "Promote supersession checks passed."
+  "Export refresh checks passed."
 }
 
 # A Context exercising every field: kinds, special-character tags, pins, a
-# supersession chain, a dangling supersedes (its target pruned), markdown.
-# Ids are written in alphabetical order so map order matches a nested
-# directory's (glob) order.
+# supersession chain, a dangling supersedes (its target forgotten),
+# markdown. Ids are written in alphabetical order so map order matches a
+# nested directory's (glob) order.
 let contextIoFixture: Context! {
   context
     .blockWrite("decisions/pruned", ContextBlockKind.NOTE, "gone soon")
@@ -82,7 +117,7 @@ let contextIoFixture: Context! {
       "We **chose** facts/current over `facts/old`; see vito/agents#12 and #34.\n\n- one\n- two\n  continued\n\n| a | b |\n|---|---|\n| <script>alert(1)</script> | https://example.com/?a=1&b=2 |",
       tags: ["io", "colon: inside", "line\nbreak"], pin: true,
       supersedes: ["decisions/pruned"])
-    .blockPrune(["decisions/pruned"], forget: true)
+    .blockDrop(["decisions/pruned"], forget: true)
     .blockWrite("facts/current", ContextBlockKind.FACT, "current\n\n```\ncode ~~here~~\n```\n", tags: ["io"])
     .blockWrite("facts/old", ContextBlockKind.FACT, "old")
     .blockWrite("facts/z", ContextBlockKind.FACT, "z", supersedes: ["facts/old"])
@@ -91,13 +126,13 @@ let contextIoFixture: Context! {
 
 let sameContext(a: Context!, b: Context!): Boolean! {
   a.blockIndex == b.blockIndex and a.compose == b.compose and
-    a.blockRead("facts/old") == b.blockRead("facts/old") and
-    a.exportJson.contents == b.exportJson.contents
+    readBlock(a, "facts/old") == readBlock(b, "facts/old") and
+    jsonOf(a).contents == jsonOf(b).contents
 }
 
 let testContextExportRoundTrip(source: Workspace!): String! {
   let fixture = contextIoFixture
-  let json = fixture.exportJson
+  let json = jsonOf(fixture)
   let doc: {{version: Int!, blocks: [{{id: String!, status: String, superseded_by: [String!]!, supersedes: [String!]!}}!]!}}! = JSON.decode(json.contents)
   assert { doc.version == 1 and doc.blocks.length == 5 }
   let byId(id: String!): [{{id: String!, status: String, superseded_by: [String!]!, supersedes: [String!]!}}!]! {
@@ -108,17 +143,16 @@ let testContextExportRoundTrip(source: Workspace!): String! {
   assert { byId("decisions/x").map { b => b.supersedes } == [["decisions/pruned"]] }
   assert { byId("decisions/x").map { b => b.superseded_by.isEmpty } == [true] }
 
-  let fromJson = context.importBlocks(source: source, json: json)
-  assert { sameContext(fromJson, fixture) }
+  assert { sameContext(importJson(context, json), fixture) }
 
-  let nested = fixture.exportMarkdown
+  let nested = markdownOf(fixture)
   assert { nested.glob("**/*.md").contains("facts/old.md") }
-  assert { sameContext(context.importBlocks(source: source, from: nested), fixture) }
+  assert { sameContext(importDir(context, nested), fixture) }
 
   # Flat files carry their ids in front matter; names are only a fallback.
-  let flat = fixture.exportMarkdown(flat: true)
+  let flat = markdownOf(fixture, flat: true)
   assert { flat.entries.contains("facts~old.md") and !flat.entries.contains("facts/") }
-  assert { sameContext(context.importBlocks(source: source, from: flat), fixture) }
+  assert { sameContext(importDir(context, flat), fixture) }
 
   # Renamed files still import by their front-matter id; a file without an
   # id falls back to its name (~ read as /); stray files are skipped.
@@ -126,65 +160,90 @@ let testContextExportRoundTrip(source: Workspace!): String! {
     .withFile("one.md", flat.file("facts~old.md"))
     .withNewFile("notes~no-id.md", "---\nkind: note\n---\n\nfrom the name\n")
     .withNewFile("README.md", "# not a block\n")
-  let loose = context.importBlocks(source: source, from: renamed)
-  assert { loose.blockRead("facts/old").contains("old") }
-  assert { loose.blockRead("notes/no-id").contains("from the name") }
+  let loose = importDir(context, renamed)
+  assert { readBlock(loose, "facts/old").contains("old") }
+  assert { readBlock(loose, "notes/no-id").contains("from the name") }
 
-  # The workspace path: a promoted context/, and a committed .json export.
-  let ws = directory.withDirectory("context", nested).withFile("ctx.json", json).asWorkspace
-  assert { sameContext(context.importBlocks(source: ws), fixture) }
-  assert { sameContext(context.importBlocks(source: ws, path: "ctx.json"), fixture) }
+  # The default path: a committed context/.
+  let committed = directory.withChanges(fixture.exportContext(source: scratch))
+  assert { sameContext(context.importContext(source: committed.asWorkspace), fixture) }
 
-  # The gist bundle: flat, index.html as the entry point, context.json wins.
-  let gist = fixture.exportGist(markdown: true)
+  # A gist's layout: flat markdown, context.json and index.html side by side.
+  let gist = exportedDir(fixture, [ContextExportFormat.MARKDOWN, ContextExportFormat.JSON, ContextExportFormat.HTML], flat: true)
   assert { gist.entries.contains("index.html") and gist.entries.contains("context.json") }
   assert { gist.entries.contains("facts~old.md") }
   assert { gist.entries.all { e => !e.hasSuffix("/") } }
-  assert { sameContext(context.importBlocks(source: source, from: gist), fixture) }
-  assert { sameContext(context.importBlocks(source: source, from: fixture.exportGist), fixture) }
+  assert { sameContext(importDir(context, gist), fixture) }
+  let bundle = exportedDir(fixture, [ContextExportFormat.JSON, ContextExportFormat.HTML])
+  assert { bundle.entries == ["context.json", "index.html"] }
+  assert { sameContext(importDir(context, bundle), fixture) }
   "Context export/import round-trip checks passed."
 }
 
+# Selection narrows what is written; the formats and from: are validated.
+let testContextExportSelection(source: Workspace!): String! {
+  let fixture = contextIoFixture
+  let facts = markdownOf(fixture.blockWrite("notes/n", ContextBlockKind.NOTE, "n"))
+  assert { facts.glob("**/*.md").length == 6 }
+  let onlyZ = directory.withChanges(fixture.exportContext(source: scratch, ids: ["facts/z"])).glob("**/*.md")
+  assert { onlyZ == ["context/facts/z.md"] }
+  let tagged = directory.withChanges(fixture.exportContext(source: scratch, tags: ["io"])).glob("**/*.md")
+  assert { tagged == ["context/decisions/x.md", "context/facts/current.md", "context/glossary.md"] }
+  let glossary = directory.withChanges(fixture.exportContext(source: scratch, kinds: [ContextBlockKind.GLOSSARY])).glob("**/*.md")
+  assert { glossary == ["context/glossary.md"] }
+
+  let none = directory.withChanges(fixture.exportContext(source: scratch, tags: ["nope"])).entries rescue { e: Error => [e.message] }
+  assert { none.any { m => m.contains("nothing matched the selection") } }
+  let noFormat = directory.withChanges(fixture.exportContext(source: scratch, formats: [])).entries rescue { e: Error => [e.message] }
+  assert { noFormat.any { m => m.contains("name at least one format") } }
+  let leadOut = directory.withChanges(fixture.exportContext(source: scratch, formats: [ContextExportFormat.HTML],
+    ids: ["facts/z"], lead: ["glossary"])).entries rescue { e: Error => [e.message] }
+  assert { leadOut.any { m => m.contains("not in the selection") } }
+
+  # from: a missing workspace path is an error naming it.
+  let missing = context.importContext(source: scratch, from: "nowhere").blockIndex rescue { e: Error => e.message }
+  assert { missing.contains("nowhere") }
+  "Context export selection checks passed."
+}
+
 let testContextImportConflicts(source: Workspace!): String! {
-  let json = contextIoFixture.exportJson
+  let json = jsonOf(contextIoFixture)
   let session = context.blockWrite("facts/current", ContextBlockKind.FACT, "session truth")
-  let refused = session.importBlocks(source: source, json: json).blockIndex rescue {
+  let refused = importJson(session, json).blockIndex rescue {
     e: Error => e.message
   }
   assert { refused.contains("already in the Context: facts/current") }
   assert { session.blockIndex.contains("1 block(s)") }
-  let kept = session.importBlocks(source: source, json: json, onConflict: ContextImportConflict.KEEP)
-  assert { kept.blockRead("facts/current").contains("session truth") }
+  let kept = importJson(session, json, onConflict: ContextImportConflict.KEEP)
+  assert { readBlock(kept, "facts/current").contains("session truth") }
   assert { kept.blockIndex.contains("decisions/x") }
-  let replaced = session.importBlocks(source: source, json: json, onConflict: ContextImportConflict.REPLACE)
-  assert { !replaced.blockRead("facts/current").contains("session truth") }
+  let replaced = importJson(session, json, onConflict: ContextImportConflict.REPLACE)
+  assert { !readBlock(replaced, "facts/current").contains("session truth") }
 
   # An imported supersedes retires the session's Block it names, even one
   # KEEP holds on to: facts/z supersedes facts/old in the export.
   let stale = context.blockWrite("facts/old", ContextBlockKind.FACT, "session old")
-  let merged = stale.importBlocks(source: source, json: json, onConflict: ContextImportConflict.KEEP)
-  assert { merged.blockRead("facts/old").contains("session old") }
+  let merged = importJson(stale, json, onConflict: ContextImportConflict.KEEP)
+  assert { readBlock(merged, "facts/old").contains("session old") }
   assert { merged.blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/z") }
   assert { !merged.compose.contains("session old") }
 
   # A context.json beside markdown fills in only what the markdown lacks;
-  # markdown promote rewrote later wins.
-  let older = context
+  # markdown exported later wins.
+  let older = jsonOf(context
     .blockWrite("facts/a", ContextBlockKind.FACT, "a1")
-    .blockWrite("facts/c", ContextBlockKind.FACT, "only in json")
-    .exportJson
-  let mixed = context
+    .blockWrite("facts/c", ContextBlockKind.FACT, "only in json"))
+  let mixed = markdownOf(context
     .blockWrite("facts/a", ContextBlockKind.FACT, "a2")
-    .blockWrite("facts/b", ContextBlockKind.FACT, "promoted later")
-    .exportMarkdown
+    .blockWrite("facts/b", ContextBlockKind.FACT, "exported later"))
     .withFile("context.json", older)
-  let fromMixed = context.importBlocks(source: source, from: mixed)
-  assert { fromMixed.blockRead("facts/a").contains("a2") }
-  assert { fromMixed.blockRead("facts/b").contains("promoted later") }
-  assert { fromMixed.blockRead("facts/c").contains("only in json") }
+  let fromMixed = importDir(context, mixed)
+  assert { readBlock(fromMixed, "facts/a").contains("a2") }
+  assert { readBlock(fromMixed, "facts/b").contains("exported later") }
+  assert { readBlock(fromMixed, "facts/c").contains("only in json") }
 
   let bad = directory.withNewFile("facts/bad.md", "---\nkind: rumor\n---\n\nx\n")
-  let rejected = context.importBlocks(source: source, from: bad).blockIndex rescue {
+  let rejected = importDir(context, bad).blockIndex rescue {
     e: Error => e.message
   }
   assert { rejected.contains("facts/bad.md") and rejected.contains("unknown kind") }
@@ -193,7 +252,7 @@ let testContextImportConflicts(source: Workspace!): String! {
 
 let testContextHtml(source: Workspace!): String! {
   let fixture = contextIoFixture
-  let html = fixture.exportHtml(title: "Ctx <&>", repo: "vito/agents").contents
+  let html = htmlOf(fixture, title: "Ctx <&>", repo: "vito/agents")
   assert { html.hasPrefix("<!doctype html>") and html.contains("<title>Ctx &lt;&amp;&gt;</title>") }
   assert { html.contains(`id="b-decisions/x"`) and html.contains(`data-kind="decision"`) }
   assert { html.contains(`<a class="chip k-fact" href="#b-facts/current"`) }
@@ -208,7 +267,7 @@ let testContextHtml(source: Workspace!): String! {
   assert { html.contains("References → ") and html.contains("Referenced by ← ") }
   assert { html.contains("Superseded by ") and html.contains(`<code>decisions/pruned</code>`) }
   assert { html.contains("📌 pinned") and html.contains("1 superseded") }
-  assert { fixture.exportHtml(title: "Ctx <&>", repo: "vito/agents").contents == html }
+  assert { htmlOf(fixture, title: "Ctx <&>", repo: "vito/agents") == html }
 
   # A Block revived by blockWrite after being superseded is active: no
   # superseded_by in its exports, no "Superseded by" on its card.
@@ -216,23 +275,17 @@ let testContextHtml(source: Workspace!): String! {
     .blockWrite("facts/y", ContextBlockKind.FACT, "y")
     .blockWrite("facts/x", ContextBlockKind.FACT, "x", supersedes: ["facts/y"])
     .blockWrite("facts/y", ContextBlockKind.FACT, "y again")
-  let revivedDoc: {{blocks: [{{id: String!, status: String, superseded_by: [String!]!}}!]!}}! = JSON.decode(revived.exportJson.contents)
+  let revivedDoc: {{blocks: [{{id: String!, status: String, superseded_by: [String!]!}}!]!}}! = JSON.decode(jsonOf(revived).contents)
   assert { revivedDoc.blocks.filter { b => b.id == "facts/y" }.map { b => b.superseded_by.isEmpty and b.status == null } == [true] }
-  assert { revived.exportMarkdown.file("facts/y.md").contents.contains("superseded_by: []") }
-  assert { !revived.exportHtml.contents.contains("Superseded by") }
-
-  let changes = fixture.promoteAll(source, path: "out", flat: true, html: true, json: true)
-  let landed = source.directory("/").withChanges(changes)
-  assert { landed.file("out/facts~old.md").contents == fixture.exportMarkdown(flat: true).file("facts~old.md").contents }
-  assert { landed.file("out/index.html").contents.hasPrefix("<!doctype html>") }
-  assert { landed.file("out/context.json").contents == fixture.exportJson.contents }
-  "Context HTML and promoteAll checks passed."
+  assert { markdownOf(revived).file("facts/y.md").contents.contains("superseded_by: []") }
+  assert { !htmlOf(revived).contains("Superseded by") }
+  "Context HTML checks passed."
 }
 
 # The curated sections: lead Blocks under "At a glance" in the caller's
 # order, then every active QUESTION, #blocker first, then pinned.
 let testContextHtmlCurated(source: Workspace!): String! {
-  let plain = contextIoFixture.exportHtml.contents
+  let plain = htmlOf(contextIoFixture)
   assert { !plain.contains(`id="glance"`) and !plain.contains(`id="questions"`) }
 
   let fixture = contextIoFixture
@@ -243,7 +296,7 @@ let testContextHtmlCurated(source: Workspace!): String! {
     .blockWrite("questions/d-led", ContextBlockKind.QUESTION, "led question")
     .blockWrite("questions/e-old", ContextBlockKind.QUESTION, "old question")
     .blockWrite("questions/f-new", ContextBlockKind.QUESTION, "new question", supersedes: ["questions/e-old"])
-  let html = fixture.exportHtml(lead: ["results/status", "questions/d-led", "glossary"]).contents
+  let html = htmlOf(fixture, lead: ["results/status", "questions/d-led", "glossary"])
 
   let afterGlance = html.split(`<h2 id="glance">`)[1] ?? ""
   let glance = afterGlance.split(`<h2 id="questions">`)[0] ?? ""
@@ -267,21 +320,19 @@ let testContextHtmlCurated(source: Workspace!): String! {
   # The Blocks list stays complete: every active Block has its one card.
   assert { html.split(`id="b-questions/d-led"`).length == 2 }
 
-  let unknown = fixture.exportHtml(lead: ["facts/nope"]).contents rescue { e: Error => e.message }
+  let unknown = htmlOf(fixture, lead: ["facts/nope"]) rescue { e: Error => e.message }
   assert { unknown.contains(`no block "facts/nope"`) }
-  let stale = fixture.exportHtml(lead: ["questions/e-old"]).contents rescue { e: Error => e.message }
+  let stale = htmlOf(fixture, lead: ["questions/e-old"]) rescue { e: Error => e.message }
   assert { stale.contains("it is superseded") and stale.contains("questions/f-new") }
-  let noHtml = source.directory("/").withChanges(fixture.promoteAll(source, lead: ["glossary"])).entries rescue {
+  let noHtml = directory.withChanges(fixture.exportContext(source: scratch, lead: ["glossary"])).entries rescue {
     e: Error => [e.message]
   }
-  assert { noHtml.any { m => m.contains("pass html: true") } }
-  let gist = fixture.exportGist(lead: ["results/status"]).file("index.html").contents
-  assert { gist.contains(`<h2 id="glance">`) }
+  assert { noHtml.any { m => m.contains("add HTML to formats") } }
   "Context curated HTML checks passed."
 }
 
 # Questions get Q-numbers: assigned in order, kept across rewrites and
-# supersession, never reused after a prune, accepted as ids, exported and
+# supersession, never reused after forget, accepted as ids, exported and
 # imported, renumbered only on a clash.
 let testContextShortIds(source: Workspace!): String! {
   let ctx = context
@@ -291,44 +342,42 @@ let testContextShortIds(source: Workspace!): String! {
   assert { ctx.blockIndex.contains("questions/one  question  Q-1  1 line(s)") }
   assert { ctx.blockIndex.contains("questions/two  question  Q-2  1 line(s)") }
   assert { ctx.blockIndex.contains("facts/a  fact  1 line(s)") }
-  assert { ctx.blockRead("Q-2").contains("── questions/two · question · Q-2 ──") }
+  assert { readBlock(ctx, "Q-2").contains("── questions/two · question · Q-2 ──") }
   assert { ctx.compose(ids: ["Q-1"]).contains("first?") }
 
   # Rewrites keep the number; forgetting the newest never frees it.
   let rewritten = ctx.blockWrite("questions/one", ContextBlockKind.QUESTION, "first, reworded?")
   assert { rewritten.blockIndex.contains("questions/one  question  Q-1") }
-  let pruned = rewritten.blockPrune(["Q-2"], forget: true).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
+  let pruned = rewritten.blockDrop(["Q-2"], forget: true).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
   assert { pruned.blockIndex.contains("questions/three  question  Q-3") }
 
   # Answering supersedes the question by its number; the number stays.
   let answered = pruned.blockWrite("decisions/one", ContextBlockKind.DECISION, "answered", supersedes: ["Q-1"])
   assert { answered.blockIndex.contains("questions/one  question  Q-1  1 line(s)  superseded by decisions/one") }
-  assert { answered.blockRead("Q-1").contains("superseded by decisions/one") }
-  let unknown = answered.blockRead("Q-9") rescue { e: Error => e.message }
+  assert { readBlock(answered, "Q-1").contains("superseded by decisions/one") }
+  let unknown = readBlock(answered, "Q-9") rescue { e: Error => e.message }
   assert { unknown.contains("no question Q-9") }
 
   # Exports carry the number; a fresh session keeps it.
-  let md = answered.exportMarkdown.file("questions/three.md").contents
+  let md = markdownOf(answered).file("questions/three.md").contents
   assert { md.contains("number: 3") }
-  assert { answered.exportMarkdown.file("facts/a.md").contents.contains("number: null") }
-  let fresh = context.importBlocks(source: source, json: answered.exportJson)
-  assert { fresh.blockRead("Q-3").contains("third?") }
+  assert { markdownOf(answered).file("facts/a.md").contents.contains("number: null") }
+  let fresh = importJson(context, jsonOf(answered))
+  assert { readBlock(fresh, "Q-3").contains("third?") }
   assert { fresh.blockWrite("questions/four", ContextBlockKind.QUESTION, "fourth?").blockIndex.contains("questions/four  question  Q-4") }
 
   # A clash with the session's own numbers renumbers the import; a
   # question recorded without a number (an older export) gets one.
   let other = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?")
   let legacy = directory.withNewFile("questions/old.md", "---\nkind: question\n---\n\nolder export\n")
-  let merged = other
-    .importBlocks(source: source, json: answered.exportJson)
-    .importBlocks(source: source, from: legacy)
-  assert { merged.blockRead("Q-1").contains("mine?") }
+  let merged = importDir(importJson(other, jsonOf(answered)), legacy)
+  assert { readBlock(merged, "Q-1").contains("mine?") }
   assert { merged.blockIndex.contains("questions/one  question  Q-4") }
   assert { merged.blockIndex.contains("questions/three  question  Q-3") }
   assert { merged.blockIndex.contains("questions/old  question  Q-5") }
 
   # The page labels questions and links Q-numbers in text.
-  let html = answered.blockWrite("notes/n", ContextBlockKind.NOTE, "open: Q-3 and `Q-1`").exportHtml(lead: ["Q-3"]).contents
+  let html = htmlOf(answered.blockWrite("notes/n", ContextBlockKind.NOTE, "open: Q-3 and `Q-1`"), lead: ["Q-3"])
   assert { html.contains(`<span class="qn">Q-3</span>`) }
   assert { html.contains(`<a class="chip k-question" href="#b-questions/three" title="questions/three">Q-3</a>`) }
   assert { html.contains(`<a class="chip k-question gone" href="#b-questions/one" title="questions/one">Q-1</a>`) }
@@ -336,79 +385,76 @@ let testContextShortIds(source: Workspace!): String! {
 
   # blockWrite takes an existing question's Q-number as its id.
   let reworded = answered.blockWrite("Q-3", ContextBlockKind.QUESTION, "third, reworded?")
-  assert { reworded.blockRead("questions/three").contains("third, reworded?") }
+  assert { readBlock(reworded, "questions/three").contains("third, reworded?") }
 
-  # A forgotten number stays retired across an exportJson round trip, and
+  # A forgotten number stays retired across a context.json round trip, and
   # within the session that forgot it.
   let forgetting = context
     .blockWrite("questions/x", ContextBlockKind.QUESTION, "x?")
     .blockWrite("questions/y", ContextBlockKind.QUESTION, "y?")
-    .blockPrune(["Q-2"], forget: true)
-  let reborn = context.importBlocks(source: source, json: forgetting.exportJson)
+    .blockDrop(["Q-2"], forget: true)
+  let reborn = importJson(context, jsonOf(forgetting))
     .blockWrite("questions/z", ContextBlockKind.QUESTION, "z?")
   assert { reborn.blockIndex.contains("questions/z  question  Q-3") }
-  let stranger = context.blockWrite("questions/other", ContextBlockKind.QUESTION, "other?")
-    .blockWrite("questions/second", ContextBlockKind.QUESTION, "second?")
-    .exportJson
-  let into = forgetting.importBlocks(source: source, json: stranger)
+  let stranger = jsonOf(context.blockWrite("questions/other", ContextBlockKind.QUESTION, "other?")
+    .blockWrite("questions/second", ContextBlockKind.QUESTION, "second?"))
+  let into = importJson(forgetting, stranger)
   assert { into.blockIndex.contains("questions/other  question  Q-3") }
   assert { into.blockIndex.contains("questions/second  question  Q-4") }
 
   # Renumbering carries the imported text's citations along.
-  let theirs = context
+  let theirs = jsonOf(context
     .blockWrite("notes/m", ContextBlockKind.NOTE, "blocked on Q-1, not Q-7")
-    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?")
-    .exportJson
-  let mine = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?")
-    .importBlocks(source: source, json: theirs)
+    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?"))
+  let mine = importJson(context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?"), theirs)
   assert { mine.blockIndex.contains("questions/theirs  question  Q-2") }
-  assert { mine.blockRead("notes/m").contains("blocked on Q-2, not Q-7") }
-  assert { mine.blockRead("Q-1").contains("mine?") }
+  assert { readBlock(mine, "notes/m").contains("blocked on Q-2, not Q-7") }
+  assert { readBlock(mine, "Q-1").contains("mine?") }
 
   # Re-importing a legacy file with REPLACE keeps the number it got.
-  let once = context.importBlocks(source: source, from: legacy)
-  let twice = once.importBlocks(source: source, from: legacy, onConflict: ContextImportConflict.REPLACE)
+  let once = importDir(context, legacy)
+  let twice = importDir(once, legacy, onConflict: ContextImportConflict.REPLACE)
   assert { twice.blockIndex == once.blockIndex }
   assert { twice.blockIndex.contains("questions/old  question  Q-1") }
   "Context short id checks passed."
 }
 
-# blockPrune drops by default: kept, out of composition, exported and
-# rendered as dropped, revived by blockWrite. forget deletes outright.
+# blockDrop drops by default: kept, out of composition, readable by id,
+# exported and rendered as dropped, revived by blockWrite. forget deletes.
 let testContextDrop(source: Workspace!): String! {
   let ctx = context
     .blockWrite("facts/keep", ContextBlockKind.FACT, "still true")
     .blockWrite("results/served", ContextBlockKind.RESULT, "served its purpose")
     .blockWrite("questions/moot", ContextBlockKind.QUESTION, "moot now? see results/served", tags: ["blocker"])
-  let dropped = ctx.blockPrune(["results/served", "Q-1"])
+  let dropped = ctx.blockDrop(["results/served", "Q-1"])
   let index = dropped.blockIndex
   assert { index.contains("3 block(s) — 1 active (1 text line(s), 0 pinned), 0 superseded, 2 dropped") }
   assert { index.contains("results/served  result  1 line(s)  dropped") }
   assert { index.contains("questions/moot  question  Q-1  1 line(s)  #blocker  dropped") }
   assert { !dropped.compose.contains("served its purpose") }
   assert { dropped.compose.contains("2 superseded or dropped block(s) held out") }
-  assert { dropped.blockRead("results/served").contains("(dropped — kept for the record") }
+  let named = readBlock(dropped, "results/served")
+  assert { named.contains("served its purpose") and named.contains("(dropped — kept for the record") }
+  assert { named.contains("composed 1 of 3 block(s)") }
 
   # Dropping twice is refused; forget is the explicit way out.
-  let again = dropped.blockPrune(["results/served"]).blockIndex rescue { e: Error => e.message }
+  let again = dropped.blockDrop(["results/served"]).blockIndex rescue { e: Error => e.message }
   assert { again.contains("already dropped") and again.contains("forget: true") }
-  let forgotten = dropped.blockPrune(["results/served"], forget: true)
+  let forgotten = dropped.blockDrop(["results/served"], forget: true)
   assert { !forgotten.blockIndex.contains("results/served") }
 
   # Exports say dropped, and importing them keeps it so.
-  let md = dropped.exportMarkdown.file("results/served.md").contents
-  assert { md.contains("status: dropped") }
-  let back = context.importBlocks(source: source, json: dropped.exportJson)
-  assert { back.blockIndex == dropped.blockIndex }
-  assert { context.importBlocks(source: source, from: dropped.exportMarkdown).blockIndex == dropped.blockIndex }
+  assert { markdownOf(dropped).file("results/served.md").contents.contains("status: dropped") }
+  assert { importJson(context, jsonOf(dropped)).blockIndex == dropped.blockIndex }
+  assert { importDir(context, markdownOf(dropped)).blockIndex == dropped.blockIndex }
 
   # The page lists them apart, never as open questions or in the matrix.
-  let html = dropped.exportHtml.contents
+  let html = htmlOf(dropped)
   assert { html.contains(`<h2 id="dropped">Dropped</h2>`) and html.contains("2 dropped") }
   assert { !html.contains(`<h2 id="questions">`) and !html.contains("BLOCKER</span>") }
   assert { html.contains(`<a class="chip k-result gone" href="#b-results/served"`) }
   assert { html.contains("Dropped: stopped mattering") }
-  let led = dropped.exportHtml(lead: ["results/served"]).contents rescue { e: Error => e.message }
+  let led = htmlOf(dropped, lead: ["results/served"]) rescue { e: Error => e.message }
   assert { led.contains("it is dropped") }
 
   # blockWrite revives; superseding a dropped Block makes it superseded only.
@@ -422,26 +468,27 @@ let testContextDrop(source: Workspace!): String! {
   let chain = context
     .blockWrite("results/r1", ContextBlockKind.RESULT, "first")
     .blockWrite("results/r2", ContextBlockKind.RESULT, "second", supersedes: ["results/r1"])
-    .blockPrune(["results/r2"])
-  let read = chain.blockRead("results/r1")
+    .blockDrop(["results/r2"])
+  let read = readBlock(chain, "results/r1")
   assert { read.contains("superseded by results/r2 (dropped)") and read.contains("nothing active replaces it now") }
 
   # Leading with a superseded Block whose replacement was forgotten names
   # no empty pointer.
-  let orphan = chain.blockPrune(["results/r2"], forget: true).exportHtml(lead: ["results/r1"]).contents rescue {
+  let orphan = htmlOf(chain.blockDrop(["results/r2"], forget: true), lead: ["results/r1"]) rescue {
     e: Error => e.message
   }
   assert { orphan.contains(`cannot lead with "results/r1": it is superseded`) and !orphan.contains("()") }
   "Context drop checks passed."
 }
 
+# The agent sees six tools: curate, query, move.
 let testContextTools: String! {
   let tools = context.agent(llm).tools
-  assert { tools.contains("promote") and tools.contains("blockWrite") }
-  assert { tools.contains("promoteAll") and tools.contains("importBlocks") }
-  assert { tools.contains("exportJson") and tools.contains("exportMarkdown") }
-  assert { tools.contains("exportHtml") and tools.contains("exportGist") }
-  assert { !tools.contains("checkPromotionMetadata") }
-  assert { !tools.contains("checkPromotionDefaults") and !tools.contains("checkTools") }
+  ["blockWrite", "blockDrop", "blockIndex", "compose", "exportContext", "importContext"].each { t =>
+    assert(message: t) { tools.contains(t) }
+  }
+  ["blockRead", "blockPrune", "promote", "importBlocks", "exportJson", "exportMarkdown", "exportHtml", "exportGist"].each { t =>
+    assert(message: t) { !tools.contains(t) }
+  }
   "Context tool visibility checks passed."
 }

@@ -22,30 +22,28 @@
 #     squashes the transcript, one compose call re-materializes everything
 #     worth knowing.
 #   * The reflex. The @agent system prompt (which survives compaction along
-#     with the tools) teaches the discipline — write on resolution, prune on
+#     with the tools) teaches the discipline — write on resolution, drop on
 #     irrelevance, compose on doubt — and every mutation prints the updated
 #     index, so the tail of the transcript always carries the set's shape.
 #
 # Scope: the SESSION half of the Context/Blocks design
 # (https://gist.github.com/vito/6c12ba8aff1e3576f9ce2b9d446540f0). The
 # durable half — markdown + front matter under context/, verification
-# (anchors/asserts/drift) and its CI checks — is not here; `promote` is the
-# bridge, landing a Block in the workspace changeset for review. resolve()
-# is not here either, because it is composition: hand the noisy legwork to
-# a staff worker, then blockWrite only the distilled answer.
+# (anchors/asserts/drift) and its CI checks — is not here; exportContext is
+# the bridge, landing Blocks in the workspace changeset for review.
+# resolve() is not here either, because it is composition: hand the noisy
+# legwork to a staff worker, then blockWrite only the distilled answer.
 #
-# Moving a whole Context (io.dang, html.dang): the export* tools return
-# plain Files and Directories — JSON, front-matter markdown (nested, or flat
-# for gists), a self-contained HTML page, and a gist bundle of the page plus
-# the JSON — and importBlocks reads the JSON and markdown back (the HTML is
-# for reading only), from the workspace or from a Directory/File address
-# such as a gist's git URL. Transport is the caller's: nothing here knows
-# GitHub. promoteAll lands exports in the workspace changeset, for
-# committing or for `gh gist create`.
+# The tools follow a Context's lifecycle: curate (blockWrite, blockDrop),
+# query (blockIndex, compose), and move — exportContext writes markdown,
+# JSON or a self-contained HTML page (io.dang, html.dang) into the pending
+# changes, and importContext reads them back from the workspace, a git URL
+# or a gist. Transport is the caller's: nothing here knows GitHub; a gist
+# is published from the exported files with whatever tools the agent has.
 #
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
-#     fresh module instances, so promote anything that must outlive those.
+#     fresh module instances, so export anything that must outlive those.
 #   * No @cache(Never) anywhere, deliberately: every tool is a pure function
 #     of (state, args), so a cache replay is indistinguishable from a re-run
 #     — contrast staff/sandbox, whose tools carry real side effects.
@@ -67,7 +65,7 @@ enum BlockKind {
 }
 
 """
-What importBlocks does with an imported Block whose id the Context already
+What importContext does with an imported Block whose id the Context already
 has: ERROR imports nothing and names the clashing ids, KEEP keeps the
 session's Block, REPLACE takes the imported one.
 """
@@ -75,6 +73,17 @@ enum ImportConflict {
   ERROR
   KEEP
   REPLACE
+}
+
+"""
+What exportContext writes: MARKDOWN, one front-matter file per Block (what
+a repo commits); JSON, context.json, lossless; HTML, index.html, the
+Context as one self-contained page.
+"""
+enum ExportFormat {
+  MARKDOWN
+  JSON
+  HTML
 }
 
 # Composition order: definitions land before the things that use them; loose
@@ -215,8 +224,8 @@ type Block {
   A QUESTION's stable short number, cited as Q-<number> wherever an id is
   accepted. Assigned when the question is first written, kept for good
   (also once it is superseded or rewritten as another kind), never reused
-  in a session — nor in one that imports its exportJson, which carries the
-  high-water mark. Null for every other Block.
+  in a session — nor in one that imports its context.json, which carries
+  the high-water mark. Null for every other Block.
   """
   number: Int = null
 
@@ -354,35 +363,6 @@ type Context {
   }
 
   """
-  Read one Block in full: its header line and complete text. Works on
-  superseded and dropped Blocks too — the reasoning is kept — with a
-  pointer to what replaced them.
-  """
-  blockRead(
-    """
-    The Block's id, as listed by blockIndex, or a question's Q-number.
-    """
-    id: String!,
-  ): String! {
-    let b = mustGet(id)
-    let note = if (b.superseded) {
-      let by = supersederOf(b.address)
-      if (by == "") {
-        "\n\n(superseded — kept for the reasoning, excluded from composition)"
-      } else if (hasLiveSuperseder(b.address)) {
-        "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
-      } else {
-        "\n\n" + `(superseded by ${by} — kept for the reasoning; nothing active replaces it now)`
-      }
-    } else if (b.dropped) {
-      "\n\n(dropped — kept for the record, excluded from composition; blockWrite at this id revives it)"
-    } else {
-      ""
-    }
-    renderBlock(b) + note
-  }
-
-  """
   The Context at a glance: one compact line per Block — id, kind, size,
   tags, flags — under a totals headline. This is the cheap overview; compose
   renders the actual text.
@@ -408,12 +388,11 @@ type Context {
   Take Blocks out of composition when they stopped mattering and nothing
   replaces them: a moot question, a result that served its purpose. They
   are DROPPED, not deleted — kept for the record, listed by blockIndex,
-  and exported as dropped — and blockWrite at the same id revives one. A
-  file promoted while the Block was active still says active: promote it
-  again (or promoteAll) to record the drop, or the next import brings it
-  back.
+  readable with compose(ids:), and exported as dropped — and blockWrite at
+  the same id revives one. Files you exported before still say active
+  until you export again.
 
-  Do not prune what something replaces: supersede a CONTRADICTED Block
+  Do not drop what something replaces: supersede a CONTRADICTED Block
   (blockWrite with supersedes:), and answer a QUESTION with the DECISION
   that supersedes it, so the reasoning stays linked.
 
@@ -421,20 +400,20 @@ type Context {
   mere presence would confuse future agents — a block written at the wrong
   id, junk, a dead end with nothing to learn from.
   """
-  blockPrune(
+  blockDrop(
     """
     Ids of the Blocks to drop, as listed by blockIndex (or Q-numbers).
     """
     ids: [String!]!,
     """
     Delete the Blocks outright instead of dropping them: no record is left,
-    and exports no longer carry them (a file promoted earlier stays where it
-    is — delete it yourself). Only for mistakes and misadventures.
+    and exports no longer carry them (a file exported earlier stays where
+    it is — delete it yourself). Only for mistakes and misadventures.
     """
     forget: Boolean! = false,
   ): Context! {
     if (ids.isEmpty) {
-      raise "name at least one block id to prune"
+      raise "name at least one block id to drop"
     }
     let addrs = ids.map { id => resolveId(id) }.uniq
     addrs.each { id =>
@@ -452,7 +431,7 @@ type Context {
         if (addrs.contains(bid)) { asDropped(b) } else { b }
       }
       print(`dropped ${addrs.join(", ")} — kept for the record, out of composition; ` +
-        "if you promoted them before, promote them again to record the drop" + "\n\n" + blockIndex)
+        "files you exported before still say active until you exportContext again" + "\n\n" + blockIndex)
     }
     self
   }
@@ -465,8 +444,9 @@ type Context {
 
   With no selectors this composes every active Block. Selectors union: a
   Block is included when its id, its kind, or any of its tags matches.
-  Pinned Blocks are always included; superseded and dropped Blocks never
-  are.
+  Pinned Blocks are always included; superseded and dropped Blocks only
+  when named in ids — that is how to read one, with a note on what
+  replaced it.
 
   Call it whenever you are unsure what you know — and ALWAYS as your first
   move after your conversation has been compacted: the Context lives in
@@ -475,8 +455,8 @@ type Context {
   """
   compose(
     """
-    Ids (or Q-numbers) to include. An unknown id is an error, so typos
-    surface.
+    Ids (or Q-numbers) to include, whatever their status. An unknown id is
+    an error, so typos surface.
     """
     ids: [String!]! = [],
     """
@@ -507,11 +487,12 @@ type Context {
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
     let active = all.filter { b => isActive(b) }
-    let selected = active.filter { b =>
-      b.pin or wantAll or
-        wanted.contains(b.address) or
-        kinds.contains(b.kind) or
-        b.tags.any { t => tags.contains(t) }
+    let selected = all.filter { b =>
+      wanted.contains(b.address) or isActive(b) and (
+        b.pin or wantAll or
+          kinds.contains(b.kind) or
+          b.tags.any { t => tags.contains(t) }
+      )
     }
 
     let included: [Block!]! = []
@@ -531,16 +512,17 @@ type Context {
     manifest += [`CONTEXT — composed ${toString(included.length)} of ${toString(all.length)} block(s), ${toString(used)} text line(s)`]
     included.each { b => manifest += ["  " + indexLine(b)] }
     if (!overBudget.isEmpty) {
-      manifest += ["over budget — blockRead these, or raise the budget:"]
+      manifest += ["over budget — compose these by id, or raise the budget:"]
       overBudget.each { b => manifest += ["  " + indexLine(b)] }
     }
     let notes: [String!]! = []
-    let filtered = active.length - selected.length
+    let filtered = active.filter { b => !selected.contains(b) }.length
     if (filtered > 0) {
       notes += [`${toString(filtered)} active block(s) outside this selection`]
     }
-    if (all.length > active.length) {
-      notes += [`${toString(all.length - active.length)} superseded or dropped block(s) held out`]
+    let heldOut = all.filter { b => !isActive(b) and !selected.contains(b) }.length
+    if (heldOut > 0) {
+      notes += [`${toString(heldOut)} superseded or dropped block(s) held out`]
     }
     if (!notes.isEmpty) {
       manifest += ["  (" + notes.join("; ") + " — blockIndex lists everything)"]
@@ -549,189 +531,96 @@ type Context {
     if (included.isEmpty) {
       return manifest.join("\n") + "\n\n(nothing matched the selection)"
     }
-    manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) }.join("\n\n")
+    manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) + statusNote(b) }.join("\n\n")
   }
 
   """
-  Land a Block in the workspace as a markdown file with front matter under
-  context/, so it can outlive this session: the write shows up in your
-  pending changes, to be reviewed and committed alongside the code that
-  motivated it. The Block also stays in the session's Context. Promoted
-  files of the Blocks it supersedes are refreshed too, so the committed
-  context/ never shows a replaced Block as active.
-  """
-  promote(
-    source: Workspace!,
-    """
-    The Block's id, as listed by blockIndex, or a question's Q-number. Its
-    file lands at "context/<id>.md".
-    """
-    id: String!,
-  ): Changeset! {
-    let b = mustGet(id)
-    let path = `context/${b.address}.md`
-    let base = source.directory("/")
-    # Only files already promoted: promoting a Block never lands others.
-    let refreshed = b.supersedes.filter { t =>
-      let tp = `context/${t}.md`
-      blocks.has(t) and base.glob(tp).contains(tp)
-    }
-    let landed = refreshed.reduce(base.withNewFile(path, markdownOf(b, supersededBy(b)))) { dir, t =>
-      let target = mustGet(t)
-      dir.withNewFile(`context/${t}.md`, markdownOf(target, supersededBy(target)))
-    }
-    let also = if (refreshed.isEmpty) { "" } else { ` (refreshing ${refreshed.join(", ")}, which it supersedes)` }
-    print(`promoted ${b.address} to ${path}${also} — it is in your pending changes now; ` +
-      "review and commit it alongside the change that motivated it")
-    landed.changes(from: base)
-  }
+  Export the Context into your pending changes, under path: to commit it
+  beside the code it explains, or to publish it (as a gist, say) with
+  whatever tools you have. Formats:
 
+  - MARKDOWN: one <id>.md per Block, front matter then text. Reviewable
+    and diffable; what a repo commits under context/.
+  - JSON: <path>/context.json, every field plus the Q-number high-water
+    mark. The lossless form.
+  - HTML: <path>/index.html, the Context as one self-contained page —
+    "At a glance" (the lead Blocks), open questions, kind and tag filters,
+    every Block as a card.
+
+  Every Block of every status is exported unless ids, tags or kinds narrow
+  it, e.g. to the decisions a pull request motivated. Markdown files of the
+  Context's Blocks already under path are rewritten either way, so a
+  committed copy never keeps a stale status.
+
+  For a gist: a path of its own, flat, formats HTML and JSON; gistpreview
+  renders its index.html, and importContext(from: "<gist id>") reads it
+  back. To curate the page, write the curated content as Blocks (a status
+  table, a checklist) and name them in lead.
   """
-  Land the WHOLE Context in the workspace at once: every Block, active,
-  superseded and dropped, as markdown with front matter under the path —
-  the files exportMarkdown returns, written into your pending changes like
-  promote's. For committing the Context next to the code, or for
-  publishing it: with html, a browsable <path>/index.html lands too
-  (exportHtml). To publish a gist, land it flat in a directory of its own
-  — e.g. path: "gist", flat, html and json — then `gh gist create
-  gist/*`; gists hold no subdirectories. Files of forgotten Blocks
-  (blockPrune with forget) are left alone.
-  """
-  promoteAll(
+  exportContext(
     source: Workspace!,
     """
     Directory to write into, relative to the workspace root.
     """
     path: String! = "context",
     """
-    Write every file directly under the path (facts~foo.md for
-    "facts/foo"), as gists require. The id is in each file's front matter
-    either way.
+    What to write: MARKDOWN, JSON, HTML, or several.
+    """
+    formats: [ExportFormat!]! = [ExportFormat.MARKDOWN],
+    """
+    Write markdown files directly under path, "facts/foo" as facts~foo.md,
+    as gists require. "~" never occurs in an id, so the name reverses.
     """
     flat: Boolean! = false,
     """
-    Also write <path>/index.html: the Context rendered as one page.
+    Ids (or Q-numbers) to export. Selectors union, as in compose; none
+    exports everything.
     """
-    html: Boolean! = false,
+    ids: [String!]! = [],
     """
-    Also write <path>/context.json (exportJson). On import, markdown files
-    beside it win on a shared id, since promote may have rewritten them.
+    Tags to export: any Block carrying any of these.
     """
-    json: Boolean! = false,
+    tags: [String!]! = [],
     """
-    The page title, with html.
+    Kinds to export.
+    """
+    kinds: [BlockKind!]! = [],
+    """
+    The page title, with HTML.
     """
     title: String! = "Context",
     """
-    GitHub "owner/repo" for bare #123 references in the page, with html.
+    GitHub "owner/repo" that bare #123 references point at, with HTML.
+    owner/repo#123 is always linked.
     """
     repo: String! = "",
     """
-    Ids of Blocks to feature first in the page, with html (see exportHtml).
+    Ids (or Q-numbers) of active, exported Blocks to feature first in the
+    page, in this order, with HTML.
     """
     lead: [String!]! = [],
   ): Changeset! {
     if (blocks.isEmpty) {
-      raise "the Context is empty — nothing to promote"
+      raise "the Context is empty — nothing to export"
     }
-    if (!lead.isEmpty and !html) {
-      raise "lead features Blocks in the HTML page — pass html: true too"
+    if (formats.isEmpty) {
+      raise "name at least one format: MARKDOWN, JSON or HTML"
     }
-    let dest = path.trimRight("/")
-    let into = if (dest == "") { "." } else { dest }
-    let base = source.directory("/")
-    let landed = base.withDirectory(into, exportMarkdown(flat: flat))
-    let withHtml = if (html) { landed.withFile(into + "/index.html", exportHtml(title: title, repo: repo, lead: lead)) } else { landed }
-    let withJson = if (json) { withHtml.withFile(into + "/context.json", exportJson) } else { withHtml }
-    let extras = (if (html) { [into + "/index.html"] } else { [] :: [String!]! }) +
-      (if (json) { [into + "/context.json"] } else { [] :: [String!]! })
-    let also = if (extras.isEmpty) { "" } else { ", plus " + extras.join(" and ") }
-    print(`promoted ${toString(blocks.length)} block(s) to ${into}/${also} — ` +
-      "they are in your pending changes now; review and commit them, or publish them")
-    withJson.changes(from: base)
-  }
-
-  """
-  Export the whole Context as one JSON file, context.json: every Block,
-  active, superseded and dropped, with its id, kind, text, tags, pin,
-  status, supersedes, superseded_by (who replaced it) and number (a
-  question's Q-number), plus question_count, the highest Q-number ever
-  assigned, so a new session never reuses a forgotten one. Nothing lands
-  in your pending changes; importBlocks(json:) reads it back.
-  """
-  exportJson: File! {
-    # Computed outside the record: inside it, `blocks` is the sibling field.
-    let high = maxNumber(blocks.values, questionCount)
-    let doc = {{
-      version: exportVersion,
-      question_count: high,
-      blocks: ordered.map { b =>
-        {{
-          id: b.address,
-          kind: kindLabel(b.kind),
-          text: b.text,
-          tags: b.tags,
-          pin: b.pin,
-          status: statusLabel(b),
-          supersedes: b.supersedes,
-          superseded_by: supersededBy(b),
-          number: b.number,
-        }}
-      },
-    }}
-    directory.withNewFile("context.json", JSON.encode(doc) + "\n").file("context.json")
-  }
-
-  """
-  Export the whole Context as a directory of markdown files with front
-  matter, one per Block, active, superseded and dropped — the format
-  promote writes, with the id in the front matter. Nothing lands in your
-  pending changes; importBlocks(from:) reads it back. Unlike exportJson it
-  does not carry the Q-number high-water mark.
-  """
-  exportMarkdown(
-    """
-    Write every file at the top level, "facts/foo" as facts~foo.md, as gists
-    require. "~" never occurs in a block id, so the name reverses exactly.
-    """
-    flat: Boolean! = false,
-  ): Directory! {
-    ordered.reduce(directory) { dir, b =>
-      dir.withNewFile(fileNameFor(b.address, flat), markdownOf(b, supersededBy(b)))
+    let wantHtml = formats.contains(ExportFormat.HTML)
+    if (!lead.isEmpty and !wantHtml) {
+      raise "lead features Blocks in the HTML page — add HTML to formats"
     }
-  }
-
-  """
-  Render the whole Context as one self-contained HTML page, context.html.
-  Above the fold: "At a glance", the Blocks named in lead, and "Open
-  questions", every active QUESTION Block — tagged #blocker first, badged,
-  then pinned. Then kind legend and counts, pins, kind and tag filters, a
-  kind × tag matrix, every Block as a card with its markdown rendered, block
-  ids, URLs and GitHub refs linked, references and referenced-by inferred
-  from the text, supersession, and the superseded and dropped Blocks
-  collapsed at the end. Nothing lands in your pending changes.
-
-  To curate the page, write the curated content as Blocks — a status table,
-  a ship checklist, a code snippet with its permalink — and name them in
-  lead, rather than keeping it anywhere else.
-  """
-  exportHtml(
-    """
-    The page title.
-    """
-    title: String! = "Context",
-    """
-    GitHub "owner/repo" that bare #123 references point at; without it they
-    stay text. owner/repo#123 is always linked.
-    """
-    repo: String! = "",
-    """
-    Ids (or Q-numbers) of active Blocks to feature first, under "At a
-    glance", in this order. An unknown, superseded or dropped id is an
-    error, so typos surface.
-    """
-    lead: [String!]! = [],
-  ): File! {
+    ids.each { id => mustGet(id) }
+    let wanted = ids.map { id => resolveId(id) }
+    let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
+    let selected = ordered.filter { b =>
+      wantAll or wanted.contains(b.address) or kinds.contains(b.kind) or
+        b.tags.any { t => tags.contains(t) }
+    }
+    if (selected.isEmpty) {
+      raise "nothing matched the selection — blockIndex lists what is there"
+    }
+    let chosen = selected.map { b => b.address }
     let featured = lead.map { id => resolveId(id) }.uniq
     featured.each { id =>
       let b = mustGet(id)
@@ -743,77 +632,74 @@ type Context {
       if (b.dropped) {
         raise `cannot lead with "${id}": it is dropped`
       }
+      if (!chosen.contains(id)) {
+        raise `cannot lead with "${id}": it is not in the selection being exported`
+      }
     }
-    directory.withNewFile("context.html", contextHtml(ordered, title, repo, featured)).file("context.html")
+
+    let dest = path.trimRight("/")
+    let into = if (dest == "") { "." } else { dest }
+    let prefix = if (into == ".") { "" } else { into + "/" }
+    let base = source.directory("/")
+    let out = base
+    let written: [String!]! = []
+    let refreshed: [String!]! = []
+    if (formats.contains(ExportFormat.MARKDOWN)) {
+      selected.each { b =>
+        out = out.withNewFile(prefix + fileNameFor(b.address, flat), markdownOf(b, supersededBy(b)))
+      }
+      # Files of Blocks already exported here under another name, nested or
+      # flat, or of Blocks outside the selection: their status may have
+      # changed since.
+      let fresh = selected.map { b => prefix + fileNameFor(b.address, flat) }
+      base.glob(prefix + "**/*.md").each { f =>
+        let id = idForFile(f.trimPrefix(prefix))
+        let b = blocks[id]
+        if (b != null and !fresh.contains(f)) {
+          out = out.withNewFile(f, markdownOf(b, supersededBy(b)))
+          refreshed += [id]
+        }
+      }
+      written += [`${toString(selected.length)} markdown file(s)`]
+    }
+    if (formats.contains(ExportFormat.JSON)) {
+      out = out.withNewFile(prefix + "context.json", jsonOf(selected))
+      written += ["context.json"]
+    }
+    if (wantHtml) {
+      out = out.withNewFile(prefix + "index.html", contextHtml(selected, title, repo, featured))
+      written += ["index.html"]
+    }
+    let also = if (refreshed.isEmpty) { "" } else { `, refreshing ${refreshed.join(", ")}` }
+    print(`exported ${toString(selected.length)} block(s) to ${into}/ as ${written.join(", ")}${also} — ` +
+      "they are in your pending changes now; review and commit them, or publish them")
+    out.changes(from: base)
   }
 
   """
-  Export the whole Context as a flat directory ready to become a gist:
-  index.html (exportHtml) and context.json (exportJson), plus the flat
-  markdown files with markdown. Push its files to a gist by whatever means
-  you have, then view the page at https://gistpreview.github.io/?<gist-id>
-  (it renders index.html) and load the Context back in a later session with
-  importBlocks(from: "https://gist.github.com/<gist-id>.git").
-  """
-  exportGist(
-    """
-    The page title.
-    """
-    title: String! = "Context",
-    """
-    GitHub "owner/repo" for bare #123 references in the page.
-    """
-    repo: String! = "",
-    """
-    Also include every Block as a flat markdown file (facts~foo.md), for
-    reading the gist on GitHub. context.json alone round-trips.
-    """
-    markdown: Boolean! = false,
-    """
-    Ids of Blocks to feature first in the page (see exportHtml).
-    """
-    lead: [String!]! = [],
-  ): Directory! {
-    let base = if (markdown) { exportMarkdown(flat: true) } else { directory }
-    base
-      .withFile("index.html", exportHtml(title: title, repo: repo, lead: lead))
-      .withFile("context.json", exportJson)
-  }
-
-  """
-  Load Blocks into the Context: from a directory of promoted markdown (a
-  repo's committed context/, an exportMarkdown or promoteAll result, flat or
-  nested), from a JSON export, or from a gist made with exportGist. Every
-  file is validated before anything is imported. Blocks arrive exactly as
-  recorded — superseded and dropped ones stay so, active ones stay active
-  even when another names them in supersedes (as after a revive) — and an
-  imported Block's supersedes marks the session's Blocks it names
-  superseded, as blockWrite does.
+  Load Blocks into the Context from an export: a directory of markdown (a
+  repo's committed context/, flat or nested), a context.json, or a gist.
+  Every file is validated before anything is imported. Blocks arrive
+  exactly as recorded — superseded and dropped ones stay so, active ones
+  stay active even when another names them in supersedes (as after a
+  revive) — and an imported Block's supersedes marks the session's Blocks
+  it names superseded, as blockWrite does.
 
   In a directory, every **/*.md with front matter is a Block, its id taken
   from the front matter (else from the path, with ~ read as /), plus any
   Block only a top-level context.json holds; markdown wins on a shared id.
   Files without front matter are skipped and named. A forgotten Block's
-  file, if it was ever promoted, comes back too: delete it.
+  file, if it was ever exported, comes back too: delete it.
   """
-  importBlocks(
+  importContext(
     source: Workspace!,
     """
-    Where to read in the workspace: a directory, or a .json export file.
-    Ignored when from or json is given.
+    Where to read: a workspace path (a directory, or a .json file); a git
+    URL, optionally with #<ref> and :<path>
+    ("https://github.com/org/repo#main:context"); or a gist, by id or URL
+    ("https://gist.github.com/<id>").
     """
-    path: String! = "context",
-    """
-    A directory to read instead of the workspace, by address — e.g. a gist,
-    "https://gist.github.com/<gist-id>.git", or a repo's directory,
-    "https://github.com/org/repo#main:context".
-    """
-    from: Directory = null,
-    """
-    An exportJson file to read instead of the workspace, by address — e.g.
-    from a gist, "https://gist.github.com/<gist-id>.git#main:context.json".
-    """
-    json: File = null,
+    from: String! = "context",
     """
     What to do with imported ids the Context already has: ERROR (the
     default) imports nothing and names them; KEEP keeps the session's Block;
@@ -821,20 +707,7 @@ type Context {
     """
     onConflict: ImportConflict! = ImportConflict.ERROR,
   ): Context! {
-    if (from != null and json != null) {
-      raise "pass from or json, not both"
-    }
-    let read = if (json != null) {
-      let doc = parseJsonBlocks(json.name, json.contents)
-      {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
-    } else if (from != null) {
-      readBlocksDir("", from)
-    } else if (path.hasSuffix(".json")) {
-      let doc = parseJsonBlocks(path, source.file(path).contents)
-      {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
-    } else {
-      readBlocksDir(path.trimRight("/"), source.directory(path))
-    }
+    let read = readFrom(source, from)
     let incoming = read.blocks
     let ids = incoming.map { b => b.address }
     let dupes = ids.filter { id => ids.filter { x => x == id }.length > 1 }.uniq
@@ -1036,6 +909,50 @@ type Context {
     headerOf(b) + "\n" + b.text
   }
 
+  # What compose appends to a superseded or dropped Block named by id.
+  let statusNote(b: Block!): String! {
+    if (b.superseded) {
+      let by = supersederOf(b.address)
+      if (by == "") {
+        "\n\n(superseded — kept for the reasoning, excluded from composition)"
+      } else if (hasLiveSuperseder(b.address)) {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
+      } else {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; nothing active replaces it now)`
+      }
+    } else if (b.dropped) {
+      "\n\n(dropped — kept for the record, excluded from composition; blockWrite at this id revives it)"
+    } else {
+      ""
+    }
+  }
+
+  # context.json for these Blocks: every field, plus question_count, the
+  # highest Q-number this Context ever assigned, so a session importing it
+  # never reuses a forgotten one.
+  let jsonOf(bs: [Block!]!): String! {
+    # Computed outside the record: inside it, `blocks` is the sibling field.
+    let high = maxNumber(blocks.values, questionCount)
+    let doc = {{
+      version: exportVersion,
+      question_count: high,
+      blocks: bs.map { b =>
+        {{
+          id: b.address,
+          kind: kindLabel(b.kind),
+          text: b.text,
+          tags: b.tags,
+          pin: b.pin,
+          status: statusLabel(b),
+          supersedes: b.supersedes,
+          superseded_by: supersededBy(b),
+          number: b.number,
+        }}
+      },
+    }}
+    JSON.encode(doc) + "\n"
+  }
+
   # Instructions for the agent holding these tools.
   let systemPrompt: String! = """
     You carry a CONTEXT: a set of Blocks — distilled, addressable truths —
@@ -1058,14 +975,15 @@ type Context {
     left out, and why), then the Blocks, definitions first. Call it
     whenever you are unsure what you know — ALWAYS as your first move after
     a compaction. blockIndex is the cheap one-line-per-block overview;
-    blockRead fetches one Block in full.
+    compose(ids: [...]) reads particular Blocks, superseded and dropped
+    ones included.
 
     CURATE. A set can have things taken out of composition — its whole
     advantage over a log. When a new truth contradicts an old one,
     blockWrite the new Block with supersedes: naming the old. When a Block
-    stopped mattering and nothing replaces it, blockPrune drops it. Either
+    stopped mattering and nothing replaces it, blockDrop drops it. Either
     way it is kept out of composition but preserved, because the reasoning
-    outlives the conclusion. blockPrune with forget: true deletes outright —
+    outlives the conclusion. blockDrop with forget: true deletes outright —
     only for mistakes and misadventures that would just confuse a future
     reader.
 
@@ -1074,13 +992,12 @@ type Context {
     writing the DECISION or FACT that settles it with supersedes: naming
     the question.
 
-    PROMOTE what should outlive this session: promote lands a Block as
-    markdown under context/ in your pending changes, to be reviewed and
-    committed alongside the code that motivated it. The in-session set does
-    NOT survive recomposition (install/reload), so promote before those.
-    promoteAll lands the whole set at once (with html, a browsable
-    index.html to publish); importBlocks loads a committed context/, an
-    export, or a gist back into a fresh session.
+    EXPORT what should outlive this session: exportContext writes the
+    Context into your pending changes — markdown under context/ to commit
+    beside the code that motivated it, or an HTML page and context.json to
+    publish. The in-session set does NOT survive recomposition
+    (install/reload), so export before those. importContext loads an
+    export back: a committed context/, a git URL, or a gist.
 
     If you have a delegation tool, pair them: farm noisy legwork out to a
     sub-agent, then blockWrite only the distilled answer. The exploration

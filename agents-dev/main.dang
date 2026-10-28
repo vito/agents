@@ -55,49 +55,55 @@ type AgentsDev {
     null
   }
 
-  """Check promotion preserves special-character metadata and the Markdown payload."""
-  contextPromotionMetadata(source: Workspace!): Void @check {
-    print(testContextPromotionMetadata(source: source))
+  """Check exported markdown preserves special-character metadata and the payload."""
+  contextExportMetadata(source: Workspace!): Void @check {
+    print(testContextExportMetadata(source: source))
     null
   }
 
-  """Check promotion emits empty lists, false pin, and null active status explicitly."""
-  contextPromotionDefaults(source: Workspace!): Void @check {
-    print(testContextPromotionDefaults(source: source))
+  """Check exported markdown emits empty lists, false pin, and null active status explicitly."""
+  contextExportDefaults(source: Workspace!): Void @check {
+    print(testContextExportDefaults(source: source))
     null
   }
 
-  """Check promote refreshes already-promoted files of the blocks it supersedes, so committed context/ imports consistently."""
-  contextPromoteSupersedes(source: Workspace!): Void @check {
-    print(testContextPromoteSupersedes(source: source))
+  """Check a selective export refreshes files already exported, so a committed context/ imports consistently."""
+  contextExportRefresh(source: Workspace!): Void @check {
+    print(testContextExportRefresh(source: source))
     null
   }
 
-  """Check regression methods are not exposed as context agent tools."""
+  """Check the context agent sees exactly its six tools."""
   contextTools: Void @check {
     print(testContextTools)
     null
   }
 
-  """Check exportJson, exportMarkdown (nested and flat), exportGist and the workspace path all round-trip through importBlocks."""
+  """Check every export format and layout round-trips through importContext: JSON, nested and flat markdown, a gist's layout, the default context/."""
   contextExportRoundTrip(source: Workspace!): Void @check {
     print(testContextExportRoundTrip(source: source))
     null
   }
 
-  """Check importBlocks' onConflict modes, imported supersession of session blocks, context.json beside markdown, and that invalid files import nothing."""
+  """Check exportContext's ids/tags/kinds selection and its validation, and importContext's error for a missing path."""
+  contextExportSelection(source: Workspace!): Void @check {
+    print(testContextExportSelection(source: source))
+    null
+  }
+
+  """Check importContext's onConflict modes, imported supersession of session blocks, context.json beside markdown, and that invalid files import nothing."""
   contextImportConflicts(source: Workspace!): Void @check {
     print(testContextImportConflicts(source: source))
     null
   }
 
-  """Check exportHtml's rendering, escaping and links, and what promoteAll lands."""
+  """Check the exported HTML's rendering, escaping and links."""
   contextHtml(source: Workspace!): Void @check {
     print(testContextHtml(source: source))
     null
   }
 
-  """Check exportHtml's curated sections: lead order, open questions (blockers, then pinned), anchorless featured copies, and lead validation."""
+  """Check the exported HTML's curated sections: lead order, open questions (blockers, then pinned), anchorless featured copies, and lead validation."""
   contextHtmlCurated(source: Workspace!): Void @check {
     print(testContextHtmlCurated(source: source))
     null
@@ -109,7 +115,7 @@ type AgentsDev {
     null
   }
 
-  """Check blockPrune drops by default (kept, out of composition, exported, rendered and imported as dropped, revived by blockWrite) and deletes only with forget."""
+  """Check blockDrop drops by default (kept, out of composition, readable by id, exported, rendered and imported as dropped, revived by blockWrite) and deletes only with forget."""
   contextDrop(source: Workspace!): Void @check {
     print(testContextDrop(source: source))
     null

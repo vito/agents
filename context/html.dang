@@ -1,4 +1,4 @@
-# exportHtml: a Context rendered as one self-contained HTML page — kind
+# exportContext's HTML: a Context rendered as one self-contained page — kind
 # legend and counts, pins, tags, kind/tag filters, a kind × tag matrix, block
 # cards with their markdown rendered, linkified URLs, GitHub refs and block
 # ids, references / referenced-by inferred from block text, supersession, and
@@ -505,7 +505,7 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
   }
 
   page += `<h2 id="about">About</h2><ul>` +
-    "<li>Rendered by the context module's <code>exportHtml</code> from the session's Context: a set of Blocks held beside the conversation.</li>" +
+    "<li>Rendered by the context module's <code>exportContext</code> from a session's Context: a set of Blocks held beside the conversation.</li>" +
     "<li>Links between blocks are inferred from block ids mentioned in block text (references → and referenced by ←), plus each block's <code>supersedes</code> list.</li>" +
     "</ul>\n"
   page + "</main><script>" + contextJs + "</script></body></html>\n"

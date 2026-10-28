@@ -1,8 +1,9 @@
-# Import/export formats for a Context: front-matter markdown (what promote
-# writes), one JSON document, and the flat layout gists need. Plain-data
-# helpers only; the tools live on Context in main.dang.
+# Import/export formats for a Context: front-matter markdown, one JSON
+# document, and the flat layout gists need, plus reading them back from the
+# workspace, a git URL or a gist. Plain-data helpers only; the tools live on
+# Context in main.dang.
 
-# Version of the JSON export. importBlocks refuses anything newer.
+# Version of the JSON export. importContext refuses anything newer.
 let exportVersion: Int! = 1
 
 # Gists are flat — one level of files, no "/" in names — so the flat layout
@@ -22,7 +23,7 @@ let statusLabel(b: Block!): String {
   if (b.superseded) { "superseded" } else if (b.dropped) { "dropped" } else { null }
 }
 
-# The front matter of a promoted or exported Block. superseded_by is derived
+# The front matter of an exported Block. superseded_by is derived
 # (see Context.supersededBy), written for readers and ignored on import.
 let frontMatter(b: Block!, supersededBy: [String!]!): String! {
   YAML.encode({{
@@ -90,7 +91,7 @@ let importedBlock(
   )
 }
 
-# Parse one promoted markdown file. Null when it has no front matter (a
+# Parse one exported markdown file. Null when it has no front matter (a
 # README beside the blocks, say): the caller reports it as skipped. The id
 # comes from the front matter when present, else from the file's path.
 let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
@@ -133,7 +134,7 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
 # question held stay retired in the importing session.
 let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
   let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}}!]}}! = JSON.decode(raw) rescue {
-    e: Error => raise `${origin}: not a Context export (exportJson): ${e.message}`
+    e: Error => raise `${origin}: not a Context export (context.json): ${e.message}`
   }
   let version = doc.version ?? exportVersion
   if (version > exportVersion) {
@@ -141,7 +142,7 @@ let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questio
   }
   let entries = doc.blocks
   if (entries == null) {
-    raise `${origin}: not a Context export (exportJson): no "blocks" list`
+    raise `${origin}: not a Context export (context.json): no "blocks" list`
   }
   let parsed = entries.map { e, i =>
     let at = `${origin} (blocks[${toString(i)}])`
@@ -160,8 +161,8 @@ let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questio
 
 # Read the blocks a directory holds: every **/*.md file with front matter,
 # plus the blocks of a context.json at its root that no markdown file
-# carries. Markdown wins on a shared id: it is what promote rewrites one
-# Block at a time, so a context.json beside it may be older (a gist bundle's
+# carries. Markdown wins on a shared id: a selective exportContext rewrites
+# only some files, so a context.json beside them may be older (a gist's
 # two forms agree, so either would do). Files without front matter are
 # skipped. Only a context.json carries the question high-water mark.
 let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!, questions: Int!}}! {
@@ -187,6 +188,59 @@ let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skippe
     skipped: skipped,
     questions: fromJson.questions,
   }}
+}
+
+# A gist's id: hex, as in https://gist.github.com/<id>.
+let gistIdShape: Regexp! = `^[0-9a-f]{20,}$`
+
+# Read the Blocks importContext's `from` names:
+#   * a gist id, or a gist URL (https://gist.github.com/[<owner>/]<id>[.git])
+#     — its git repository, at its default branch;
+#   * a git URL (https:// ssh:// git@), optionally #<ref> and :<path>, as
+#     in "https://github.com/org/repo#main:context";
+#   * otherwise a workspace path.
+# A path ending in .json is read as a context.json document, anything else
+# as a directory (readBlocksDir).
+let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [String!]!, questions: Int!}}! {
+  let spec = from.trimSpace
+  if (spec == "") {
+    raise "name where to import from: a workspace path, a git URL, or a gist"
+  }
+  let gist = if (spec.containsMatch(gistIdShape)) {
+    spec
+  } else if (spec.hasPrefix("https://gist.github.com/")) {
+    let parts = spec.split("#", limit: 2)
+    let tail = (parts[0] ?? "").trimRight("/").trimSuffix(".git").split("/")
+    let id = tail[tail.length - 1] ?? ""
+    let frag = if (parts.length > 1) { "#" + (parts[1] ?? "") } else { "" }
+    `https://gist.github.com/${id}.git${frag}`
+  } else {
+    null
+  }
+  let target = if (gist == null) { spec } else if (gist.containsMatch(gistIdShape)) { `https://gist.github.com/${gist}.git` } else { gist }
+  let remote = target.hasPrefix("https://") or target.hasPrefix("http://") or
+    target.hasPrefix("ssh://") or target.hasPrefix("git@")
+  if (!remote) {
+    if (target.hasSuffix(".json")) {
+      let doc = parseJsonBlocks(target, source.file(target).contents)
+      return {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
+    }
+    return readBlocksDir(target.trimRight("/"), source.directory(target))
+  }
+  let parts = target.split("#", limit: 2)
+  let url = parts[0] ?? ""
+  let frag = parts[1] ?? ""
+  let refAndPath = frag.split(":", limit: 2)
+  let ref = refAndPath[0] ?? ""
+  let sub = (refAndPath[1] ?? "").trimPrefix("/").trimRight("/")
+  let tree = if (ref == "") { git(url).head.tree } else { git(url).ref(ref).tree }
+  let origin = if (sub == "") { url } else { url + ":" + sub }
+  if (sub.hasSuffix(".json")) {
+    let doc = parseJsonBlocks(origin, tree.file(sub).contents)
+    return {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
+  }
+  let dir = if (sub == "") { tree } else { tree.directory(sub) }
+  readBlocksDir(origin, dir)
 }
 
 # Rewrite Q-number citations in a Block's text after an import renumbered
