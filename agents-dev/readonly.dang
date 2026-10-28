@@ -28,7 +28,7 @@ let ghResult(c: Contributor!, ws: Workspace!, args: [String!]!): String! {
 
 let testContributorReadonly(source: Workspace!): String! {
   let readOnlyTools = ["gh", "reviewComments", "mount", "unmount", "checkout"]
-  let writeTools = ["comment", "updateComment", "pushBranch"]
+  let writeTools = ["comment", "updateComment", "pushBranch", "gistSync"]
 
   # Default composition picks the full agent, never the read-only role.
   let defaults = source.artifacts.filterTypes(types: ["Expertise"]).filterPathPattern(pattern: "contributor/**").items.{{ uri }}.map { a => a.uri }
@@ -166,6 +166,8 @@ let testContributorReadonly(source: Workspace!): String! {
   assert("read-only updateComment is refused") { readOnlyRefused(updated) }
   let pushed = reader.pushBranch(source: ws, repo: "o/r", branch: "x") rescue { e: Error => e.message }
   assert("read-only pushBranch is refused") { readOnlyRefused(pushed) }
+  let synced = reader.gistSync(source: ws, path: ".") rescue { e: Error => e.message }
+  assert("read-only gistSync is refused") { readOnlyRefused(synced) }
 
   # checkout in read-only mode never adopts the target's agents.
   let tree = directory

@@ -44,6 +44,14 @@
 #   commit → pushBranch(repo: "you/fork", branch: "fix-x") →
 #   `gh pr create --head you:fix-x`.
 #
+# - `gistSync` publishes a workspace directory as a gist, or brings an
+#   existing gist in line with it in one PATCH (deleting files no longer in
+#   the directory), so a published page keeps its URL across updates.
+#   `gh gist create` takes files, and `gh gist edit` changes one file per
+#   call and never deletes, so syncing a directory through gh is a loop the
+#   agent would rebuild every time. Used to publish an exported Context
+#   (context module) for gistpreview.github.io to render.
+#
 # - `mount` attaches ANOTHER repository's checkout to the workspace under
 #   mnt/<name> (Workspace.withMountedDirectory): the agent's file tools
 #   work on it, while the mount stays outside the pending changeset — never
@@ -142,7 +150,7 @@ type Contributor {
   # Never tools: the read-only role and the self-call it binds through.
   let plumbing = ["readonly", "asReadOnly"]
   # Tools with effects outside the workspace, hidden from the read-only role.
-  let writeTools = ["comment", "updateComment", "pushBranch"]
+  let writeTools = ["comment", "updateComment", "pushBranch", "gistSync"]
 
   new(
     """
@@ -204,10 +212,10 @@ type Contributor {
 
   """
   The read-only role: compose the contributor tools minus everything with an
-  effect on GitHub or another remote. `comment`, `updateComment` and
-  `pushBranch` are not tools; `gh` runs read verbs only (view/list/diff/
-  checks/status, search, and `api` GET requests); `checkout` switches the
-  workspace but never adopts the target's agents.
+  effect on GitHub or another remote. `comment`, `updateComment`,
+  `pushBranch` and `gistSync` are not tools; `gh` runs read verbs only
+  (view/list/diff/checks/status, search, and `api` GET requests);
+  `checkout` switches the workspace but never adopts the target's agents.
 
   Not @agent, so default composition never selects it. A role that must not
   publish anything (e.g. a reviewer's finders and editor) composes it by
@@ -785,6 +793,131 @@ type Contributor {
   }
 
   """
+  Publish a workspace directory as a GitHub gist, or bring an existing
+  gist in line with it: create one (no `gist`), or update `gist` in place
+  — its URL stays the same — so it holds exactly the directory's files:
+  changed ones rewritten, new ones added, and files no longer in the
+  directory deleted from the gist. One API call either way.
+
+  Gists are flat: the directory must hold only files, no subdirectories,
+  and none of them empty. When it has an index.html, the result also names
+  its gistpreview.github.io URL, which renders that page. Secret by
+  default: a secret gist is unlisted, not private — anyone with the link
+  can read it.
+  """
+  gistSync(
+    source: Workspace!,
+    """
+    The directory to publish, relative to the workspace root, e.g. "gist".
+    Pending files count: the workspace as it is now is published.
+    """
+    path: String!,
+    """
+    The gist to update, by id or URL ("https://gist.github.com/<id>").
+    Empty creates a new gist; reuse the id it reports to update that one.
+    """
+    gist: String! = "",
+    """
+    Create the gist public (listed on the owner's profile and in search).
+    Only applies when creating: GitHub cannot change a gist's visibility.
+    """
+    public: Boolean! = false,
+    """
+    The gist's description. Empty leaves an existing gist's as it is.
+    """
+    description: String! = "",
+  ): String! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): creating or updating a gist is an effect on GitHub; a
+    # later identical call must publish again, not replay the first result.
+    if (readOnlyMode) {
+      raise readOnlyError("gistSync")
+    }
+    let tok = token
+    if (tok == null) {
+      raise noTokenError
+    }
+    let id = if (gist.trimSpace == "") { "" } else { gistId(gist) }
+    let dir = source.directory(path)
+    let entries = dir.entries rescue {
+      e: Error => raise `gistSync: no directory ${JSON.encode(path)} in the workspace: ${plainError(e.message)}`
+    }
+    let nested = entries.filter { e => e.hasSuffix("/") }
+    if (!nested.isEmpty) {
+      raise `gistSync: gists are flat, but ${path} holds directories (${nested.join(", ")}): publish a directory of files only`
+    }
+    if (entries.isEmpty) {
+      raise `gistSync: ${path} holds no files; a gist needs at least one`
+    }
+    let empty = entries.filter { e => dir.file(e).size == 0 }
+    if (!empty.isEmpty) {
+      raise `gistSync: GitHub rejects empty gist files: ${empty.join(", ")}`
+    }
+
+    # The payload is built with jq from the mounted files (--rawfile keeps
+    # contents out of the program and the shell). On update, every file the
+    # gist has that the directory lacks is set to null, which deletes it.
+    let script = """
+      set -eu
+      GH_TOKEN="$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')"
+      export GH_TOKEN
+      cd /gist
+      printf '{"files":{}}' >/tmp/payload.json
+      for f in * .[!.]*; do
+        [ -f "$f" ] || continue
+        jq --arg n "$f" --rawfile c "$f" '.files[$n] = {content: $c}' /tmp/payload.json >/tmp/next.json
+        mv /tmp/next.json /tmp/payload.json
+      done
+      if [ -z "$GIST_ID" ]; then
+        jq --arg d "$DESCRIPTION" --argjson pub "$PUBLIC" '.description = $d | .public = $pub' \
+          /tmp/payload.json >/tmp/request.json
+        gh api --method POST gists --input /tmp/request.json --jq '{id, url: .html_url, deleted: []}'
+      else
+        gh api "gists/$GIST_ID" --jq '.files | keys[]' >/tmp/remote.txt
+        jq --rawfile remote /tmp/remote.txt --arg d "$DESCRIPTION" '
+          . as $p
+          | ($remote | split("\n") | map(. as $k | select($k != "" and ($p.files | has($k) | not)))) as $gone
+          | .files += ($gone | map({key: ., value: null}) | from_entries)
+          | if $d != "" then .description = $d else . end
+        ' /tmp/payload.json >/tmp/request.json
+        gh api --method PATCH "gists/$GIST_ID" --input /tmp/request.json --jq '{id, url: .html_url}' >/tmp/out.json
+        jq -c --slurpfile out /tmp/out.json \
+          '$out[0] + {deleted: [.files | to_entries[] | select(.value == null) | .key]}' /tmp/request.json
+      fi
+    """
+    let ran = ghImage
+      .withMountedDirectory("/gist", dir)
+      .withEnvVariable("GIST_ID", id)
+      .withEnvVariable("PUBLIC", if (public) { "true" } else { "false" })
+      .withEnvVariable("DESCRIPTION", description)
+      .withEnvVariable("GH_PROMPT_DISABLED", "1")
+      .withEnvVariable("GH_NO_UPDATE_NOTIFIER", "1")
+      # publishing must actually happen every time, not be served from the
+      # exec cache
+      .withEnvVariable("CONTRIBUTOR_NONCE", Random.string)
+      .withSecretVariable("GH_TOKEN", tok)
+      .withExec(["sh", "-c", script], expect: ReturnType.ANY).{{exitCode, stdout, combinedOutput}}
+    if (ran.exitCode != 0) {
+      let what = if (id == "") { "creating a gist" } else { `updating gist ${id}` }
+      raise `${what} from ${path} failed (exit ${toString(ran.exitCode)}):` + "\n\n" + tail(ran.combinedOutput)
+    }
+    let out: {{id: String!, url: String!, deleted: [String!]!}}! = JSON.decode(ran.stdout.trimSpace)
+    let verb = if (id == "") {
+      let visibility = if (public) { "public" } else { "secret" }
+      `Created ${visibility} gist ${out.url}`
+    } else {
+      `Updated gist ${out.url}`
+    }
+    let gone = if (out.deleted.isEmpty) { "" } else { "; deleted " + out.deleted.join(", ") }
+    let lines = [`${verb} with ${toString(entries.length)} file(s) from ${path}${gone}.`, `Gist id: ${out.id}`]
+    let preview = if (entries.contains("index.html")) {
+      [`Rendered page: https://gistpreview.github.io/?${out.id}`]
+    } else {
+      [] :: [String!]!
+    }
+    (lines + preview).join("\n")
+  }
+
+  """
   Mount another git repository's checkout into the workspace to use it with
   your regular file tools.
 
@@ -1189,6 +1322,17 @@ type Contributor {
     }
   }
 
+  # A gist's id from an id or a gist URL — https://gist.github.com/[<owner>/]
+  # <id>[.git], with any #file-… anchor GitHub links one file with.
+  let gistId(ref: String!): String! {
+    let bare = (ref.trimSpace.split("#", limit: 2)[0] ?? "")
+    let m = bare.match(`(?:^|/)([0-9a-f]{20,})(?:\.git)?/?$`)
+    if (m == null) {
+      raise `not a gist: ${JSON.encode(ref)} — pass a gist id or a URL like https://gist.github.com/<id>`
+    }
+    m.captures[0] ?? ""
+  }
+
   # An issue or pull request reference — a bare number (resolved against
   # the configured remote; "" leaves it to resolveRepoSh and the checkout's
   # origin) or a github.com issue/PR URL — as repo + number.
@@ -1565,7 +1709,8 @@ type Contributor {
     `updateComment` post and edit agent-marked comments; `reviewComments`
     reads a pull request's review threads; `mount` attaches another
     repository's checkout to your workspace; `pushBranch` pushes
-    to a fork; `checkout` switches this conversation to another repository.
+    to a fork; `gistSync` publishes a directory as a gist; `checkout`
+    switches this conversation to another repository.
 
     Work on the primary product in its own checkout, not a `mount` —
     this includes reviewing PRs and addressing review feedback, even when
@@ -1678,6 +1823,14 @@ type Contributor {
     checkout upstream → edit → commit → pushBranch(repo: "you/fork",
     branch: "fix-x") → `gh pr create --head you:fix-x`. Pending changes
     are not pushed: commit first.
+
+    `gistSync` publishes a workspace directory of files as a gist: without
+    `gist` it creates one (secret unless `public`), and with a gist id or
+    URL it updates that gist in place to hold exactly the directory's
+    files, deleting the ones no longer there, so its links stay stable.
+    When the directory has an index.html, it also reports the
+    gistpreview.github.io URL that renders it. Pending files are
+    published as they are; nothing needs committing.
 
     `checkout` replaces this conversation's workspace with a fresh checkout
     of a git repository — the writable starting point for development,

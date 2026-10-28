@@ -283,7 +283,7 @@ let checkReviewerComposition(source: Workspace!): String! {
     ["gh", "reviewComments", "checkout", "commit", "cherryPick", "diff"].each { n =>
       assert(`the finder has ${n}`) { names.any { t => t == n or t.hasSuffix("_" + n) } }
     }
-    ["push", "comment", "updateComment", "pushBranch", "review", "spawn", "sendTo", "askChief"].each { n =>
+    ["push", "comment", "updateComment", "pushBranch", "gistSync", "review", "spawn", "sendTo", "askChief"].each { n =>
       assert(`the finder lacks ${n}`) { !names.any { t => t == n or t.hasSuffix("_" + n) } }
     }
     let prompts = systemTexts(conversation)

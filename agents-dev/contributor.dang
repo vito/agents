@@ -63,6 +63,27 @@ let checkContributorStack: String! {
   "gh stack runs through gh, merge and mixed repositories are refused, and a failed skill install leaves the tools composed"
 }
 
+# gistSync's checks before it reaches GitHub, offline with a fake token: a
+# gist is flat and has no empty files, and `gist` must name one.
+let checkContributorGistSync: String! {
+  let fake = contributor(githubToken: setSecret("contributor-gist-test-token", "not-a-real-token"))
+  let ws = directory
+    .withNewFile("flat/index.html", "<p>hi</p>\n")
+    .withNewFile("nested/a.md", "a\n")
+    .withNewFile("nested/sub/b.md", "b\n")
+    .withNewFile("blank/empty.md", "")
+    .asWorkspace
+  let nested = fake.gistSync(source: ws, path: "nested") rescue { e: Error => e.message }
+  assert("refuses subdirectories") { nested.contains("gists are flat") and nested.contains("sub/") }
+  let blank = fake.gistSync(source: ws, path: "blank") rescue { e: Error => e.message }
+  assert("refuses empty files") { blank.contains("empty gist files: empty.md") }
+  let missing = fake.gistSync(source: ws, path: "nowhere") rescue { e: Error => e.message }
+  assert("names a missing directory") { missing.contains(`no directory "nowhere"`) }
+  let notGist = fake.gistSync(source: ws, path: "flat", gist: "https://github.com/o/r") rescue { e: Error => e.message }
+  assert("refuses a non-gist") { notGist.contains("not a gist") }
+  "gistSync refuses nested and empty files, missing directories and non-gists"
+}
+
 let checkContributorCheckoutRefs: String! {
   let fixtureContainer = container
     .from("alpine:3.22")
