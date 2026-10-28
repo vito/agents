@@ -214,8 +214,9 @@ type Block {
   """
   A QUESTION's stable short number, cited as Q-<number> wherever an id is
   accepted. Assigned when the question is first written, kept for good
-  (also once it is superseded or rewritten as another kind), never reused.
-  Null for every other Block.
+  (also once it is superseded or rewritten as another kind), never reused
+  in a session — nor in one that imports its exportJson, which carries the
+  high-water mark. Null for every other Block.
   """
   number: Int = null
 
@@ -265,7 +266,8 @@ type Context {
     """
     Address for the Block, path-shaped: e.g. "facts/engine-caches-by-id",
     "decisions/no-git-store". Writing an existing id replaces that Block
-    (and revives it, if it was superseded).
+    (and revives it, if it was superseded or dropped); an existing
+    question's Q-number names it too.
     """
     id: String!,
     """
@@ -290,23 +292,24 @@ type Context {
     pin: Boolean! = false,
     """
     Ids of Blocks this one replaces (a question's Q-number works too). They
-    are kept but marked superseded and dropped from composition — supersede
+    are kept but marked superseded and left out of composition — supersede
     a contradicted Block rather than pruning it, so the reasoning stays
     readable. Answer a QUESTION by writing the DECISION or FACT that settles
     it, superseding the question.
     """
     supersedes: [String!]! = [],
   ): Context! {
-    if (!id.containsMatch(idShape)) {
+    let addr = resolveId(id)
+    if (!addr.containsMatch(idShape)) {
       raise `block id "${id}" is not an address — use lowercase path-shaped ids like "facts/engine-caches-by-id"`
     }
     if (text.trimSpace == "") {
-      raise `block "${id}" needs a text payload — a Block is text plus metadata, not metadata alone`
+      raise `block "${addr}" needs a text payload — a Block is text plus metadata, not metadata alone`
     }
     let targets = supersedes.map { target => resolveId(target) }.uniq
     targets.each { target =>
-      if (target == id) {
-        raise `block "${id}" cannot supersede itself`
+      if (target == addr) {
+        raise `block "${addr}" cannot supersede itself`
       }
       if (!blocks.has(target)) {
         raise `cannot supersede "${target}": no such block — blockIndex lists what is there`
@@ -315,7 +318,7 @@ type Context {
 
     # A Block keeps its number across rewrites; a new QUESTION takes the
     # next one.
-    let prior = blocks[id]
+    let prior = blocks[addr]
     let kept = if (prior == null) { null } else { prior.number }
     let next = maxNumber(blocks.values, questionCount) + 1
     let number = if (kept != null) {
@@ -334,8 +337,8 @@ type Context {
       .map { bid, b =>
         if (targets.contains(bid)) { asSuperseded(b) } else { b }
       }
-      .with(id, Block(
-        address: id,
+      .with(addr, Block(
+        address: addr,
         kind: kind,
         text: text,
         tags: cleaned,
@@ -346,7 +349,7 @@ type Context {
       ))
     let short = if (number == null) { "" } else { ` (Q-${toString(number)})` }
     let note = if (targets.isEmpty) { "" } else { `, superseding ${targets.join(", ")}` }
-    print(`wrote ${id}${short}${note}` + "\n\n" + blockIndex)
+    print(`wrote ${addr}${short}${note}` + "\n\n" + blockIndex)
     self
   }
 
@@ -366,8 +369,10 @@ type Context {
       let by = supersederOf(b.address)
       if (by == "") {
         "\n\n(superseded — kept for the reasoning, excluded from composition)"
-      } else {
+      } else if (hasLiveSuperseder(b.address)) {
         "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
+      } else {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; nothing active replaces it now)`
       }
     } else if (b.dropped) {
       "\n\n(dropped — kept for the record, excluded from composition; blockWrite at this id revives it)"
@@ -403,8 +408,10 @@ type Context {
   Take Blocks out of composition when they stopped mattering and nothing
   replaces them: a moot question, a result that served its purpose. They
   are DROPPED, not deleted — kept for the record, listed by blockIndex,
-  exported and published as dropped, so a committed or published copy
-  never brings them back — and blockWrite at the same id revives one.
+  and exported as dropped — and blockWrite at the same id revives one. A
+  file promoted while the Block was active still says active: promote it
+  again (or promoteAll) to record the drop, or the next import brings it
+  back.
 
   Do not prune what something replaces: supersede a CONTRADICTED Block
   (blockWrite with supersedes:), and answer a QUESTION with the DECISION
@@ -444,7 +451,8 @@ type Context {
       self.blocks = blocks.map { bid, b =>
         if (addrs.contains(bid)) { asDropped(b) } else { b }
       }
-      print(`dropped ${addrs.join(", ")} — kept for the record, out of composition` + "\n\n" + blockIndex)
+      print(`dropped ${addrs.join(", ")} — kept for the record, out of composition; ` +
+        "if you promoted them before, promote them again to record the drop" + "\n\n" + blockIndex)
     }
     self
   }
@@ -645,13 +653,18 @@ type Context {
 
   """
   Export the whole Context as one JSON file, context.json: every Block,
-  active and superseded, with its id, kind, text, tags, pin, status,
-  supersedes, and superseded_by (who replaced it). Nothing lands in your
-  pending changes; importBlocks(json:) reads it back.
+  active, superseded and dropped, with its id, kind, text, tags, pin,
+  status, supersedes, superseded_by (who replaced it) and number (a
+  question's Q-number), plus question_count, the highest Q-number ever
+  assigned, so a new session never reuses a forgotten one. Nothing lands
+  in your pending changes; importBlocks(json:) reads it back.
   """
   exportJson: File! {
+    # Computed outside the record: inside it, `blocks` is the sibling field.
+    let high = maxNumber(blocks.values, questionCount)
     let doc = {{
       version: exportVersion,
+      question_count: high,
       blocks: ordered.map { b =>
         {{
           id: b.address,
@@ -671,9 +684,10 @@ type Context {
 
   """
   Export the whole Context as a directory of markdown files with front
-  matter, one per Block, active and superseded — the format promote writes,
-  with the id in the front matter. Nothing lands in your pending changes;
-  importBlocks(from:) reads it back.
+  matter, one per Block, active, superseded and dropped — the format
+  promote writes, with the id in the front matter. Nothing lands in your
+  pending changes; importBlocks(from:) reads it back. Unlike exportJson it
+  does not carry the Q-number high-water mark.
   """
   exportMarkdown(
     """
@@ -722,7 +736,9 @@ type Context {
     featured.each { id =>
       let b = mustGet(id)
       if (b.superseded) {
-        raise `cannot lead with "${id}": it is superseded — lead with what replaced it (${supersederOf(id)})`
+        let by = supersederOf(id)
+        let pointer = if (by == "") { "" } else { ` — lead with what replaced it (${by})` }
+        raise `cannot lead with "${id}": it is superseded${pointer}`
       }
       if (b.dropped) {
         raise `cannot lead with "${id}": it is dropped`
@@ -809,11 +825,13 @@ type Context {
       raise "pass from or json, not both"
     }
     let read = if (json != null) {
-      {{blocks: parseJsonBlocks(json.name, json.contents), skipped: [] :: [String!]!}}
+      let doc = parseJsonBlocks(json.name, json.contents)
+      {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
     } else if (from != null) {
       readBlocksDir("", from)
     } else if (path.hasSuffix(".json")) {
-      {{blocks: parseJsonBlocks(path, source.file(path).contents), skipped: [] :: [String!]!}}
+      let doc = parseJsonBlocks(path, source.file(path).contents)
+      {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
     } else {
       readBlocksDir(path.trimRight("/"), source.directory(path))
     }
@@ -846,36 +864,54 @@ type Context {
       if (retired.contains(bid)) { asSuperseded(b) } else { b }
     }
 
-    # Imported questions keep their numbers, unless one already belongs to
-    # another of the session's Blocks (session numbers are what this
-    # session has been citing) or two imported Blocks share one; those, and
-    # questions recorded without a number, take the next free one.
-    let staying = marked.values.reject { b => takenIds.contains(b.address) }
-    let used: [Int!]! = staying.reduce(([] :: [Int!]!)) { acc, b =>
-      let n = b.number
-      if (n == null) { acc } else { acc + [n] }
-    }
-    let high = maxNumber(taken, maxNumber(marked.values, questionCount))
+    # Question numbers. The session's numbers are what it has been citing,
+    # so they win: a Block replacing one of the session's keeps that
+    # Block's number, and an imported number at or below the session's
+    # high-water mark (held by another Block, or retired by forget) is
+    # renumbered, as is a number two imported Blocks share. A question
+    # recorded without one (an older export) gets the next free number.
+    # New numbers start above everything either side ever assigned, and
+    # citations of a renumbered question in the imported text follow it.
+    let sessionHigh = maxNumber(blocks.values, questionCount)
+    let high = maxNumber(taken, if (read.questions > sessionHigh) { read.questions } else { sessionHigh })
+    let used: [Int!]! = []
     let numbered: [Block!]! = []
+    let renames: [{{was: String!, now: String!}}!]! = []
     let renumbered: [String!]! = []
     taken.each { b =>
       let n = b.number
-      let free = if (n == null) { false } else { !used.contains(n) }
-      if (n != null and free) {
-        numbered += [b]
-        used += [n]
+      let prev = blocks[b.address]
+      let pn = if (prev == null) { null } else { prev.number }
+      let keepable = if (n == null) { false } else { n > sessionHigh and !used.contains(n) }
+      let final = if (pn != null) {
+        pn
+      } else if (n != null and keepable) {
+        n
       } else if (n == null and b.kind != BlockKind.QUESTION) {
-        numbered += [b]
+        null
       } else {
         high += 1
-        numbered += [withNumber(b, high)]
-        used += [high]
+        high
+      }
+      if (final != null) {
+        used += [final]
+      }
+      numbered += [if (final == null) { b } else { withNumber(b, final) }]
+      # A legacy file replacing a numbered session Block just keeps its
+      # number: nothing changed that is worth reporting.
+      let quiet = n == null and pn != null
+      if (final != null and final != n and !quiet) {
         let was = if (n == null) { "" } else { ` (was Q-${toString(n)})` }
-        renumbered += [`${b.address} Q-${toString(high)}${was}`]
+        renumbered += [`${b.address} Q-${toString(final)}${was}`]
+        if (n != null) {
+          renames += [{{was: toString(n), now: toString(final)}}]
+        }
       }
     }
+    let cited = numbered.map { b => renumberCitations(b, renames) }
+    let rewritten = cited.filter { b => !numbered.contains(b) }.map { b => b.address }
     self.questionCount = high
-    self.blocks = numbered.reduce(marked) { acc, b => acc.with(b.address, b) }
+    self.blocks = cited.reduce(marked) { acc, b => acc.with(b.address, b) }
 
     let notes: [String!]! = []
     let gone = taken.filter { b => b.superseded }.length
@@ -895,6 +931,9 @@ type Context {
     }
     if (!renumbered.isEmpty) {
       notes += ["numbered " + renumbered.join(", ")]
+    }
+    if (!rewritten.isEmpty) {
+      notes += ["updated Q-number citations in " + rewritten.join(", ")]
     }
     if (!read.skipped.isEmpty) {
       notes += ["skipped files without front matter: " + read.skipped.join(", ")]
@@ -938,9 +977,19 @@ type Context {
   }
 
   # Who replaced a Block — scanned rather than stored, so pruning a
-  # superseder can never leave a dangling pointer.
+  # superseder can never leave a dangling pointer. A superseder dropped
+  # since is marked, since it no longer holds the current truth.
   let supersederOf(id: String!): String! {
-    supersederIds(id).join(", ")
+    supersederIds(id).map { s =>
+      let b = blocks[s]
+      let gone = if (b == null) { false } else { b.dropped }
+      if (gone) { s + " (dropped)" } else { s }
+    }.join(", ")
+  }
+
+  # Whether any Block that replaced this one is still composed.
+  let hasLiveSuperseder(id: String!): Boolean! {
+    blocks.values.any { b => b.supersedes.contains(id) and isActive(b) }
   }
 
   # The ids of the Blocks that list this one in their supersedes — exported

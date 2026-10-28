@@ -333,6 +333,43 @@ let testContextShortIds(source: Workspace!): String! {
   assert { html.contains(`<a class="chip k-question" href="#b-questions/three" title="questions/three">Q-3</a>`) }
   assert { html.contains(`<a class="chip k-question gone" href="#b-questions/one" title="questions/one">Q-1</a>`) }
   assert { html.contains(`<a class="bid" href="#b-questions/three">`) }
+
+  # blockWrite takes an existing question's Q-number as its id.
+  let reworded = answered.blockWrite("Q-3", ContextBlockKind.QUESTION, "third, reworded?")
+  assert { reworded.blockRead("questions/three").contains("third, reworded?") }
+
+  # A forgotten number stays retired across an exportJson round trip, and
+  # within the session that forgot it.
+  let forgetting = context
+    .blockWrite("questions/x", ContextBlockKind.QUESTION, "x?")
+    .blockWrite("questions/y", ContextBlockKind.QUESTION, "y?")
+    .blockPrune(["Q-2"], forget: true)
+  let reborn = context.importBlocks(source: source, json: forgetting.exportJson)
+    .blockWrite("questions/z", ContextBlockKind.QUESTION, "z?")
+  assert { reborn.blockIndex.contains("questions/z  question  Q-3") }
+  let stranger = context.blockWrite("questions/other", ContextBlockKind.QUESTION, "other?")
+    .blockWrite("questions/second", ContextBlockKind.QUESTION, "second?")
+    .exportJson
+  let into = forgetting.importBlocks(source: source, json: stranger)
+  assert { into.blockIndex.contains("questions/other  question  Q-3") }
+  assert { into.blockIndex.contains("questions/second  question  Q-4") }
+
+  # Renumbering carries the imported text's citations along.
+  let theirs = context
+    .blockWrite("notes/m", ContextBlockKind.NOTE, "blocked on Q-1, not Q-7")
+    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?")
+    .exportJson
+  let mine = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?")
+    .importBlocks(source: source, json: theirs)
+  assert { mine.blockIndex.contains("questions/theirs  question  Q-2") }
+  assert { mine.blockRead("notes/m").contains("blocked on Q-2, not Q-7") }
+  assert { mine.blockRead("Q-1").contains("mine?") }
+
+  # Re-importing a legacy file with REPLACE keeps the number it got.
+  let once = context.importBlocks(source: source, from: legacy)
+  let twice = once.importBlocks(source: source, from: legacy, onConflict: ContextImportConflict.REPLACE)
+  assert { twice.blockIndex == once.blockIndex }
+  assert { twice.blockIndex.contains("questions/old  question  Q-1") }
   "Context short id checks passed."
 }
 
@@ -380,6 +417,21 @@ let testContextDrop(source: Workspace!): String! {
   let replaced = dropped.blockWrite("decisions/settled", ContextBlockKind.DECISION, "answered after all", supersedes: ["Q-1"])
   assert { replaced.blockIndex.contains("questions/moot  question  Q-1  1 line(s)  #blocker  superseded by decisions/settled") }
   assert { replaced.blockIndex.contains("1 superseded, 1 dropped") }
+
+  # A superseded Block whose replacement was dropped says so.
+  let chain = context
+    .blockWrite("results/r1", ContextBlockKind.RESULT, "first")
+    .blockWrite("results/r2", ContextBlockKind.RESULT, "second", supersedes: ["results/r1"])
+    .blockPrune(["results/r2"])
+  let read = chain.blockRead("results/r1")
+  assert { read.contains("superseded by results/r2 (dropped)") and read.contains("nothing active replaces it now") }
+
+  # Leading with a superseded Block whose replacement was forgotten names
+  # no empty pointer.
+  let orphan = chain.blockPrune(["results/r2"], forget: true).exportHtml(lead: ["results/r1"]).contents rescue {
+    e: Error => e.message
+  }
+  assert { orphan.contains(`cannot lead with "results/r1": it is superseded`) and !orphan.contains("()") }
   "Context drop checks passed."
 }
 

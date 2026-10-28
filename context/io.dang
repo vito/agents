@@ -128,9 +128,11 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
   )
 }
 
-# Parse an exportJson document.
-let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
-  let doc: {{version: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}}!]}}! = JSON.decode(raw) rescue {
+# Parse an exportJson document: its Blocks, and the highest question number
+# its Context ever assigned (question_count), so numbers a forgotten
+# question held stay retired in the importing session.
+let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
+  let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}}!]}}! = JSON.decode(raw) rescue {
     e: Error => raise `${origin}: not a Context export (exportJson): ${e.message}`
   }
   let version = doc.version ?? exportVersion
@@ -141,7 +143,7 @@ let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
   if (entries == null) {
     raise `${origin}: not a Context export (exportJson): no "blocks" list`
   }
-  entries.map { e, i =>
+  let parsed = entries.map { e, i =>
     let at = `${origin} (blocks[${toString(i)}])`
     let id = e.id
     if (id == null) {
@@ -153,6 +155,7 @@ let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
     }
     importedBlock(at, id, kind, e.text ?? "", e.tags ?? [], e.pin ?? false, e.supersedes ?? [], e.status ?? "", e.number)
   }
+  {{blocks: parsed, questions: doc.question_count ?? 0}}
 }
 
 # Read the blocks a directory holds: every **/*.md file with front matter,
@@ -160,13 +163,13 @@ let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
 # carries. Markdown wins on a shared id: it is what promote rewrites one
 # Block at a time, so a context.json beside it may be older (a gist bundle's
 # two forms agree, so either would do). Files without front matter are
-# skipped.
-let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!}}! {
+# skipped. Only a context.json carries the question high-water mark.
+let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!, questions: Int!}}! {
   let prefix = if (origin == "") { "" } else { origin + "/" }
   let fromJson = if (dir.glob("context.json").contains("context.json")) {
     parseJsonBlocks(prefix + "context.json", dir.file("context.json").contents)
   } else {
-    [] :: [Block!]!
+    {{blocks: [] :: [Block!]!, questions: 0}}
   }
   let blocks: [Block!]! = []
   let skipped: [String!]! = []
@@ -179,5 +182,33 @@ let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skippe
     }
   }
   let mdIds = blocks.map { b => b.address }
-  {{blocks: fromJson.reject { b => mdIds.contains(b.address) } + blocks, skipped: skipped}}
+  {{
+    blocks: fromJson.blocks.reject { b => mdIds.contains(b.address) } + blocks,
+    skipped: skipped,
+    questions: fromJson.questions,
+  }}
+}
+
+# Rewrite Q-number citations in a Block's text after an import renumbered
+# questions: renames pairs an old number with its new one.
+let renumberCitations(b: Block!, renames: [{{was: String!, now: String!}}!]!): Block! {
+  if (renames.isEmpty or !b.text.containsMatch(`\bQ-[0-9]+\b`)) {
+    return b
+  }
+  let text = b.text.rewriteMatches(`\bQ-([0-9]+)\b`) { m =>
+    let n = m.captures[0] ?? ""
+    let hit = renames.filter { r => r.was == n }.map { r => "Q-" + r.now }
+    hit[0] ?? m.string
+  }
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: b.number,
+    dropped: b.dropped,
+  )
 }
