@@ -229,9 +229,11 @@ type Staff {
   """
   Send a message to a named worker without waiting: it steers the worker's
   running turn (or opens a new one) and returns the delivery evidence —
-  STARTED (opened a turn), STEERED (absorbed mid-turn), or QUEUED (parked
-  behind a pause; a paused worker is resumed first, so QUEUED here means the
-  resume raced something).
+  STARTED (opened a turn), STEERED (absorbed mid-turn), or QUEUED (the worker
+  was paused or failed: the message was queued first and the worker then
+  resumed, so the message is the first thing its continued turn reads — or
+  the running turn failed before reading it, in which case it waits behind
+  the failure for the next sendTo to retry).
 
   This is also how you ANSWER a worker's question: set replyTo to the ref
   from the question's attribution header (e.g. "#3"), and the worker sees
@@ -255,10 +257,19 @@ type Staff {
     # @cache(Never): every send must actually enqueue — a cached replay would
     # silently drop the message and report stale delivery evidence.
     let worker = member(name)
-    # Resume-first: un-parks a worker paused by interruptWorker (or retries
-    # a failed one); a no-op otherwise — so the send actually drains.
+    # Send FIRST, then resume. Resume continues a suspended (interrupted,
+    # failed or stopped mid-turn) turn immediately: the relaunched loop
+    # drains whatever is in the mailbox and then steps the pending input.
+    # Resuming before the message is enqueued lets the worker take a whole
+    # step (model call and tool calls) before it ever sees the message.
+    # Enqueued first, the message is QUEUED behind the pause/failure (or
+    # relaunches a stopped worker itself), so the loop's first drain after
+    # resume puts it in front of the next step. send returns ID!, so the
+    # enqueue is forced here, before resume.
+    let sent = worker.send(message, replyTo: replyTo ?? "")
+    # Un-parks a paused worker or retries a failed one; a no-op otherwise.
     worker.resume
-    `delivery: ${toString(worker.send(message, replyTo: replyTo ?? "").delivery)}`
+    `delivery: ${toString(sent.delivery)}`
   }
 
   """
