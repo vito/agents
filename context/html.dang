@@ -294,7 +294,8 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
   let refs: Map[[String!]!]! = all.reduce(([:] :: Map[[String!]!]!)) { acc, b => acc.with(b.address, refsOf(b, known)) }
 
   # Tags of active blocks, most used first (ties: first seen in composition
-  # order), numbered for the filters' data attributes.
+  # order — tagCount is a fresh local Map, so its keys keep insertion order),
+  # numbered for the filters' data attributes.
   let tagCount: Map[Int!]! = [:]
   active.each { b =>
     b.tags.each { t => tagCount = tagCount.with(t, (tagCount[t] ?? 0) + 1) }
@@ -329,7 +330,11 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
       b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") +
       "</div>"
     let links: [String!]! = []
-    let by = all.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+    let by = if (b.superseded) {
+      all.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+    } else {
+      [] :: [String!]!
+    }
     if (!by.isEmpty) {
       links += ["<div>Superseded by " + by.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
     } else if (b.superseded) {

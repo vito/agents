@@ -37,10 +37,11 @@
 # Moving a whole Context (io.dang, html.dang): the export* tools return
 # plain Files and Directories — JSON, front-matter markdown (nested, or flat
 # for gists), a self-contained HTML page, and a gist bundle of the page plus
-# the JSON — and importBlocks reads any of them back, from the workspace or
-# from a Directory/File address such as a gist's git URL. Transport is the
-# caller's: nothing here knows GitHub. promoteAll lands exports in the
-# workspace changeset, for committing or for `gh gist create`.
+# the JSON — and importBlocks reads the JSON and markdown back (the HTML is
+# for reading only), from the workspace or from a Directory/File address
+# such as a gist's git URL. Transport is the caller's: nothing here knows
+# GitHub. promoteAll lands exports in the workspace changeset, for
+# committing or for `gh gist create`.
 #
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
@@ -436,7 +437,7 @@ type Context {
   ): Changeset! {
     let b = mustGet(id)
     let path = `context/${id}.md`
-    let contents = markdownOf(b, supersederIds(id))
+    let contents = markdownOf(b, supersededBy(b))
     let base = source.directory("/")
     print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
@@ -448,9 +449,10 @@ type Context {
   superseded, as markdown with front matter under the path — the files
   exportMarkdown returns, written into your pending changes like promote's.
   For committing the Context next to the code, or for publishing it: with
-  html, a browsable <path>/index.html lands too (exportHtml), ready for e.g.
-  `gh gist create <path>/*`. Files of Blocks no longer in the Context are
-  left alone.
+  html, a browsable <path>/index.html lands too (exportHtml). To publish a
+  gist, land it flat in a directory of its own — e.g. path: "gist", flat,
+  html and json — then `gh gist create gist/*`; gists hold no
+  subdirectories. Files of Blocks no longer in the Context are left alone.
   """
   promoteAll(
     source: Workspace!,
@@ -469,8 +471,8 @@ type Context {
     """
     html: Boolean! = false,
     """
-    Also write <path>/context.json (exportJson). importBlocks prefers it to
-    the markdown files beside it.
+    Also write <path>/context.json (exportJson). On import, markdown files
+    beside it win on a shared id, since promote may have rewritten them.
     """
     json: Boolean! = false,
     """
@@ -517,7 +519,7 @@ type Context {
           pin: b.pin,
           status: statusLabel(b),
           supersedes: b.supersedes,
-          superseded_by: supersederIds(b.address),
+          superseded_by: supersededBy(b),
         }}
       },
     }}
@@ -538,7 +540,7 @@ type Context {
     flat: Boolean! = false,
   ): Directory! {
     ordered.reduce(directory) { dir, b =>
-      dir.withNewFile(fileNameFor(b.address, flat), markdownOf(b, supersederIds(b.address)))
+      dir.withNewFile(fileNameFor(b.address, flat), markdownOf(b, supersededBy(b)))
     }
   }
 
@@ -598,12 +600,14 @@ type Context {
   repo's committed context/, an exportMarkdown or promoteAll result, flat or
   nested), from a JSON export, or from a gist made with exportGist. Every
   file is validated before anything is imported. Blocks arrive exactly as
-  recorded — superseded ones stay superseded.
+  recorded — superseded ones stay superseded — and an imported Block's
+  supersedes marks the session's Blocks it names superseded, as blockWrite
+  does.
 
-  A directory with context.json at its top level is read from that file;
-  otherwise every **/*.md with front matter is a Block, its id taken from
-  the front matter (else from the path, with ~ read as /). Files without
-  front matter are skipped and named.
+  In a directory, every **/*.md with front matter is a Block, its id taken
+  from the front matter (else from the path, with ~ read as /), plus any
+  Block only a top-level context.json holds; markdown wins on a shared id.
+  Files without front matter are skipped and named.
   """
   importBlocks(
     source: Workspace!,
@@ -658,7 +662,18 @@ type Context {
     } else {
       incoming
     }
-    self.blocks = taken.reduce(blocks) { acc, b => acc.with(b.address, b) }
+    # Imported supersedes apply to the session's own Blocks as blockWrite's
+    # do, so merging contexts never composes a truth beside its replacement.
+    # Imported Blocks keep their recorded status (one may have been revived).
+    let takenIds = taken.map { b => b.address }
+    let targets = taken.reduce(([] :: [String!]!)) { acc, b => acc + b.supersedes }.uniq
+    let retired = blocks.values
+      .filter { b => targets.contains(b.address) and !takenIds.contains(b.address) and !b.superseded }
+      .map { b => b.address }
+    let marked = blocks.map { bid, b =>
+      if (retired.contains(bid)) { asSuperseded(b) } else { b }
+    }
+    self.blocks = taken.reduce(marked) { acc, b => acc.with(b.address, b) }
 
     let notes: [String!]! = []
     let gone = taken.filter { b => b.superseded }.length
@@ -668,6 +683,9 @@ type Context {
     if (!clashes.isEmpty) {
       let verb = if (onConflict == ImportConflict.KEEP) { "kept the session's" } else { "replaced" }
       notes += [`${verb} ${clashes.join(", ")}`]
+    }
+    if (!retired.isEmpty) {
+      notes += ["superseding " + retired.join(", ")]
     }
     if (!read.skipped.isEmpty) {
       notes += ["skipped files without front matter: " + read.skipped.join(", ")]
@@ -707,6 +725,12 @@ type Context {
     blocks.values
       .filter { b => b.supersedes.contains(id) }
       .map { b => b.address }
+  }
+
+  # superseded_by as exported: empty for an active Block, even one revived
+  # by a blockWrite after something superseded it.
+  let supersededBy(b: Block!): [String!]! {
+    if (b.superseded) { supersederIds(b.address) } else { [] :: [String!]! }
   }
 
   # One compact line of metadata: the only metadata that ever reaches the

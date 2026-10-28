@@ -79,7 +79,7 @@ type AgentsDev {
     null
   }
 
-  """Check importBlocks' onConflict modes and that invalid files import nothing."""
+  """Check importBlocks' onConflict modes, imported supersession of session blocks, context.json beside markdown, and that invalid files import nothing."""
   contextImportConflicts(source: Workspace!): Void @check {
     print(testContextImportConflicts(source: source))
     null

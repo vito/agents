@@ -142,6 +142,30 @@ let testContextImportConflicts(source: Workspace!): String! {
   let replaced = session.importBlocks(source: source, json: json, onConflict: ContextImportConflict.REPLACE)
   assert { !replaced.blockRead("facts/current").contains("session truth") }
 
+  # An imported supersedes retires the session's Block it names, even one
+  # KEEP holds on to: facts/z supersedes facts/old in the export.
+  let stale = context.blockWrite("facts/old", ContextBlockKind.FACT, "session old")
+  let merged = stale.importBlocks(source: source, json: json, onConflict: ContextImportConflict.KEEP)
+  assert { merged.blockRead("facts/old").contains("session old") }
+  assert { merged.blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/z") }
+  assert { !merged.compose.contains("session old") }
+
+  # A context.json beside markdown fills in only what the markdown lacks;
+  # markdown promote rewrote later wins.
+  let older = context
+    .blockWrite("facts/a", ContextBlockKind.FACT, "a1")
+    .blockWrite("facts/c", ContextBlockKind.FACT, "only in json")
+    .exportJson
+  let mixed = context
+    .blockWrite("facts/a", ContextBlockKind.FACT, "a2")
+    .blockWrite("facts/b", ContextBlockKind.FACT, "promoted later")
+    .exportMarkdown
+    .withFile("context.json", older)
+  let fromMixed = context.importBlocks(source: source, from: mixed)
+  assert { fromMixed.blockRead("facts/a").contains("a2") }
+  assert { fromMixed.blockRead("facts/b").contains("promoted later") }
+  assert { fromMixed.blockRead("facts/c").contains("only in json") }
+
   let bad = directory.withNewFile("facts/bad.md", "---\nkind: rumor\n---\n\nx\n")
   let rejected = context.importBlocks(source: source, from: bad).blockIndex rescue {
     e: Error => e.message
@@ -168,6 +192,17 @@ let testContextHtml(source: Workspace!): String! {
   assert { html.contains("Superseded by ") and html.contains(`<code>decisions/pruned</code>`) }
   assert { html.contains("📌 pinned") and html.contains("1 superseded") }
   assert { fixture.exportHtml(title: "Ctx <&>", repo: "vito/agents").contents == html }
+
+  # A Block revived by blockWrite after being superseded is active: no
+  # superseded_by in its exports, no "Superseded by" on its card.
+  let revived = context
+    .blockWrite("facts/y", ContextBlockKind.FACT, "y")
+    .blockWrite("facts/x", ContextBlockKind.FACT, "x", supersedes: ["facts/y"])
+    .blockWrite("facts/y", ContextBlockKind.FACT, "y again")
+  let revivedDoc: {{blocks: [{{id: String!, status: String, superseded_by: [String!]!}}!]!}}! = JSON.decode(revived.exportJson.contents)
+  assert { revivedDoc.blocks.filter { b => b.id == "facts/y" }.map { b => b.superseded_by.isEmpty and b.status == null } == [true] }
+  assert { revived.exportMarkdown.file("facts/y.md").contents.contains("superseded_by: []") }
+  assert { !revived.exportHtml.contents.contains("Superseded by") }
 
   let changes = fixture.promoteAll(source, path: "out", flat: true, html: true, json: true)
   let landed = source.directory("/").withChanges(changes)

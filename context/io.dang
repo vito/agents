@@ -23,7 +23,7 @@ let statusLabel(b: Block!): String {
 }
 
 # The front matter of a promoted or exported Block. superseded_by is derived
-# (see Context.supersederIds), written for readers and ignored on import.
+# (see Context.supersededBy), written for readers and ignored on import.
 let frontMatter(b: Block!, supersededBy: [String!]!): String! {
   YAML.encode({{
     id: b.address,
@@ -145,14 +145,18 @@ let parseJsonBlocks(origin: String!, raw: String!): [Block!]! {
   }
 }
 
-# Read the blocks a directory holds: context.json at its root wins when
-# present (the lossless form, and what exportGist writes); otherwise every
-# **/*.md file with front matter. Files without front matter are skipped.
+# Read the blocks a directory holds: every **/*.md file with front matter,
+# plus the blocks of a context.json at its root that no markdown file
+# carries. Markdown wins on a shared id: it is what promote rewrites one
+# Block at a time, so a context.json beside it may be older (a gist bundle's
+# two forms agree, so either would do). Files without front matter are
+# skipped.
 let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!}}! {
   let prefix = if (origin == "") { "" } else { origin + "/" }
-  if (dir.glob("context.json").contains("context.json")) {
-    let file = prefix + "context.json"
-    return {{blocks: parseJsonBlocks(file, dir.file("context.json").contents), skipped: [] :: [String!]!}}
+  let fromJson = if (dir.glob("context.json").contains("context.json")) {
+    parseJsonBlocks(prefix + "context.json", dir.file("context.json").contents)
+  } else {
+    [] :: [Block!]!
   }
   let blocks: [Block!]! = []
   let skipped: [String!]! = []
@@ -164,5 +168,6 @@ let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skippe
       blocks += [b]
     }
   }
-  {{blocks: blocks, skipped: skipped}}
+  let mdIds = blocks.map { b => b.address }
+  {{blocks: fromJson.reject { b => mdIds.contains(b.address) } + blocks, skipped: skipped}}
 }
