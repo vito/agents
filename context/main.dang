@@ -34,6 +34,14 @@
 # is not here either, because it is composition: hand the noisy legwork to
 # a staff worker, then blockWrite only the distilled answer.
 #
+# Moving a whole Context (io.dang, html.dang): the export* tools return
+# plain Files and Directories — JSON, front-matter markdown (nested, or flat
+# for gists), a self-contained HTML page, and a gist bundle of the page plus
+# the JSON — and importBlocks reads any of them back, from the workspace or
+# from a Directory/File address such as a gist's git URL. Transport is the
+# caller's: nothing here knows GitHub. promoteAll lands exports in the
+# workspace changeset, for committing or for `gh gist create`.
+#
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
 #     fresh module instances, so promote anything that must outlive those.
@@ -611,7 +619,8 @@ type Context {
     """
     from: Directory = null,
     """
-    An exportJson file to read instead of the workspace.
+    An exportJson file to read instead of the workspace, by address — e.g.
+    from a gist, "https://gist.github.com/<gist-id>.git#main:context.json".
     """
     json: File = null,
     """
@@ -759,6 +768,9 @@ type Context {
     markdown under context/ in your pending changes, to be reviewed and
     committed alongside the code that motivated it. The in-session set does
     NOT survive recomposition (install/reload), so promote before those.
+    promoteAll lands the whole set at once (with html, a browsable
+    index.html to publish); importBlocks loads a committed context/, an
+    export, or a gist back into a fresh session.
 
     If you have a delegation tool, pair them: farm noisy legwork out to a
     sub-agent, then blockWrite only the distilled answer. The exploration
