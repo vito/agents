@@ -425,7 +425,9 @@ type Context {
   Land a Block in the workspace as a markdown file with front matter under
   context/, so it can outlive this session: the write shows up in your
   pending changes, to be reviewed and committed alongside the code that
-  motivated it. The Block also stays in the session's Context.
+  motivated it. The Block also stays in the session's Context. Promoted
+  files of the Blocks it supersedes are refreshed too, so the committed
+  context/ never shows a replaced Block as active.
   """
   promote(
     source: Workspace!,
@@ -437,11 +439,20 @@ type Context {
   ): Changeset! {
     let b = mustGet(id)
     let path = `context/${id}.md`
-    let contents = markdownOf(b, supersededBy(b))
     let base = source.directory("/")
-    print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
+    # Only files already promoted: promoting a Block never lands others.
+    let refreshed = b.supersedes.filter { t =>
+      let tp = `context/${t}.md`
+      blocks.has(t) and base.glob(tp).contains(tp)
+    }
+    let landed = refreshed.reduce(base.withNewFile(path, markdownOf(b, supersededBy(b)))) { dir, t =>
+      let target = mustGet(t)
+      dir.withNewFile(`context/${t}.md`, markdownOf(target, supersededBy(target)))
+    }
+    let also = if (refreshed.isEmpty) { "" } else { ` (refreshing ${refreshed.join(", ")}, which it supersedes)` }
+    print(`promoted ${id} to ${path}${also} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
-    base.withNewFile(path, contents).changes(from: base)
+    landed.changes(from: base)
   }
 
   """
@@ -600,14 +611,16 @@ type Context {
   repo's committed context/, an exportMarkdown or promoteAll result, flat or
   nested), from a JSON export, or from a gist made with exportGist. Every
   file is validated before anything is imported. Blocks arrive exactly as
-  recorded — superseded ones stay superseded — and an imported Block's
-  supersedes marks the session's Blocks it names superseded, as blockWrite
-  does.
+  recorded — superseded ones stay superseded, active ones stay active even
+  when another names them in supersedes (as after a revive) — and an
+  imported Block's supersedes marks the session's Blocks it names
+  superseded, as blockWrite does.
 
   In a directory, every **/*.md with front matter is a Block, its id taken
   from the front matter (else from the path, with ~ read as /), plus any
   Block only a top-level context.json holds; markdown wins on a shared id.
-  Files without front matter are skipped and named.
+  Files without front matter are skipped and named. Stale files come back
+  too: promoteAll never deletes the file of a pruned Block.
   """
   importBlocks(
     source: Workspace!,
@@ -663,8 +676,9 @@ type Context {
       incoming
     }
     # Imported supersedes apply to the session's own Blocks as blockWrite's
-    # do, so merging contexts never composes a truth beside its replacement.
-    # Imported Blocks keep their recorded status (one may have been revived).
+    # do. Imported Blocks keep their recorded status, even when another
+    # Block names them: a revived Block is active by design, and re-importing
+    # an older export can revive one the same way.
     let takenIds = taken.map { b => b.address }
     let targets = taken.reduce(([] :: [String!]!)) { acc, b => acc + b.supersedes }.uniq
     let retired = blocks.values

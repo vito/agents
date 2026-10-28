@@ -67,6 +67,12 @@ type AgentsDev {
     null
   }
 
+  """Check promote refreshes already-promoted files of the blocks it supersedes, so committed context/ imports consistently."""
+  contextPromoteSupersedes(source: Workspace!): Void @check {
+    print(testContextPromoteSupersedes(source: source))
+    null
+  }
+
   """Check regression methods are not exposed as context agent tools."""
   contextTools: Void @check {
     print(testContextTools)

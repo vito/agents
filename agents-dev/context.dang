@@ -54,6 +54,23 @@ let testContextPromotionDefaults(source: Workspace!): String! {
   "Promotion default checks passed."
 }
 
+# promote facts/old, supersede it, promote facts/new: the committed files
+# must import with facts/old superseded. A target never promoted stays out.
+let testContextPromoteSupersedes(source: Workspace!): String! {
+  let first = context.blockWrite("facts/old", ContextBlockKind.FACT, "old truth")
+  let ws1 = source.directory("/").withChanges(first.promote(source, "facts/old"))
+  let second = first
+    .blockWrite("facts/never", ContextBlockKind.FACT, "never promoted")
+    .blockWrite("facts/new", ContextBlockKind.FACT, "new truth", supersedes: ["facts/old", "facts/never"])
+  let ws2 = ws1.withChanges(second.promote(ws1.asWorkspace, "facts/new"))
+  assert { ws2.file("context/facts/old.md").contents.contains("status: superseded") }
+  assert { !ws2.glob("context/facts/*.md").contains("context/facts/never.md") }
+  let loaded = context.importBlocks(source: ws2.asWorkspace)
+  assert { loaded.blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/new") }
+  assert { !loaded.compose.contains("old truth") }
+  "Promote supersession checks passed."
+}
+
 # A Context exercising every field: kinds, special-character tags, pins, a
 # supersession chain, a dangling supersedes (its target pruned), markdown.
 # Ids are written in alphabetical order so map order matches a nested
