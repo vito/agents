@@ -379,8 +379,8 @@ let reviewerEvalGithubToken(source: Workspace!): String! {
 
 # What a review's caller composes besides reviewer: committer and
 # contributor from this workspace, so the sub-agents get their read-only
-# roles, and the editor the workspace's dagger.toml installs, for its file
-# tools.
+# roles, and the editor the workspace's effective config installs, for its
+# file tools.
 let reviewerEvalAgents(source: Workspace!): [String!]! {
   let local = ["committer", "contributor"]
   if (reviewerEvalEditorSource(source) == "") { local } else { local + ["editor"] }
@@ -963,7 +963,8 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   let names = source.directory("agents-dev/evals").entries.filter { e => e.hasSuffix("/") }.map { e => e.trimSuffix("/") }
   assert("the dang-187 case is on disk") { names.contains("dang-187") }
   names.each { n => loadReviewerEvalCase(source, n) }
-  # What a live run's fixture carries over from this workspace's dagger.toml.
+  # What a live run's fixture carries over from this workspace's effective
+  # config.
   # The github token is user-level config, so it may or may not be set here;
   # reading it must not fail either way.
   let editor = reviewerEvalEditorSource(source)

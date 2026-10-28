@@ -81,12 +81,14 @@
 # opened with `gh pr create` against their predecessor's branch, and
 # linked with `gh stack link`, which is API-only.
 #
-# Configuration lives in dagger.toml settings, not per-call arguments:
+# Configuration lives in module settings, not per-call arguments:
 # `githubToken` authenticates GitHub operations, reaching the container
 # only as a secret env var (GH_TOKEN) — never baked into an image layer,
-# never echoed. `remote` names the GitHub repository bare issue/PR numbers
-# resolve against; it's a property of the project rather than of any one
-# task (a permanent fork would simply configure a different value). When no
+# never echoed. It is personal, so it belongs in user-level configuration
+# rather than the project's dagger.toml. `remote` names the GitHub
+# repository bare issue/PR numbers resolve against; it's a property of the
+# project rather than of any one task (a permanent fork would simply
+# configure a different value), so it belongs in dagger.toml. When no
 # remote is configured, the tools fall back to the checkout's own origin
 # remote: the toolbox mounts the workspace's git directory at .git, so git —
 # and therefore gh — sees the repository it is operating on.
@@ -146,10 +148,10 @@ type Contributor {
     """
     A GitHub token used to authenticate `gh` and the GitHub API.
 
-    Wire it up in dagger.toml settings rather than passing it around:
+    The token is personal, so wire it up in your user-level configuration
+    rather than the project's dagger.toml or passing it around:
 
-        [modules.contributor.settings]
-        githubToken = "env://GITHUB_TOKEN"
+        dagger settings --global contributor githubToken 'cmd://gh auth token'
 
     Without it, everything that talks to GitHub is unavailable. Git
     operations use the host's own git credentials instead.
@@ -1530,10 +1532,9 @@ type Contributor {
 
   let noTokenError: String! = """
     No GitHub token is configured, so GitHub operations are unavailable.
-    Wire one up in dagger.toml:
+    Wire one up in your user-level configuration:
 
-        [modules.contributor.settings]
-        githubToken = "env://GITHUB_TOKEN"
+        dagger settings --global contributor githubToken 'cmd://gh auth token'
   """
 
   let robotPrefixError: String! = """
