@@ -96,6 +96,14 @@ let kindLabel(kind: BlockKind!): String! {
 # Block ids are addresses: lowercase path-shaped segments.
 let idShape: Regexp! = `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`
 
+# A question's short id: Q-<number>. Uppercase, so it can never be an id.
+let shortIdShape: Regexp! = `^Q-[0-9]+$`
+
+let shortId(b: Block!): String {
+  let n = b.number
+  if (n == null) { null } else { `Q-${toString(n)}` }
+}
+
 # Size in text lines — the unit the composition budget is counted in.
 let blockLines(b: Block!): Int! {
   b.text.split("\n").length
@@ -112,7 +120,29 @@ let asSuperseded(b: Block!): Block! {
     pin: b.pin,
     superseded: true,
     supersedes: b.supersedes,
+    number: b.number,
   )
+}
+
+let withNumber(b: Block!, n: Int!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: n,
+  )
+}
+
+# The highest question number among these Blocks, or floor.
+let maxNumber(bs: [Block!]!, floor: Int!): Int! {
+  bs.reduce(floor) { m, b =>
+    let n = b.number
+    if (n == null) { m } else if (n > m) { n } else { m }
+  }
 }
 
 """
@@ -157,6 +187,14 @@ type Block {
   Ids of the Blocks this one replaced.
   """
   supersedes: [String!]!
+
+  """
+  A QUESTION's stable short number, cited as Q-<number> wherever an id is
+  accepted. Assigned when the question is first written, kept for good
+  (also once it is superseded or rewritten as another kind), never reused.
+  Null for every other Block.
+  """
+  number: Int = null
 }
 
 """
@@ -171,6 +209,10 @@ type Context {
   # is key-ordered, which is exactly the ties-broken-by-address rule
   # composition wants.
   let blocks: Map[Block!]! = [:]
+
+  # The highest question number ever assigned, so pruning a question never
+  # frees its number for another.
+  let questionCount: Int! = 0
 
   """
   Compose the Context tools onto a base LLM.
@@ -217,9 +259,11 @@ type Context {
     """
     pin: Boolean! = false,
     """
-    Ids of Blocks this one replaces. They are kept but marked superseded and
-    dropped from composition — supersede a contradicted Block rather than
-    pruning it, so the reasoning stays readable.
+    Ids of Blocks this one replaces (a question's Q-number works too). They
+    are kept but marked superseded and dropped from composition — supersede
+    a contradicted Block rather than pruning it, so the reasoning stays
+    readable. Answer a QUESTION by writing the DECISION or FACT that settles
+    it, superseding the question.
     """
     supersedes: [String!]! = [],
   ): Context! {
@@ -229,7 +273,8 @@ type Context {
     if (text.trimSpace == "") {
       raise `block "${id}" needs a text payload — a Block is text plus metadata, not metadata alone`
     }
-    supersedes.each { target =>
+    let targets = supersedes.map { target => resolveId(target) }.uniq
+    targets.each { target =>
       if (target == id) {
         raise `block "${id}" cannot supersede itself`
       }
@@ -238,10 +283,26 @@ type Context {
       }
     }
 
+    # A Block keeps its number across rewrites; a new QUESTION takes the
+    # next one.
+    let prior = blocks[id]
+    let kept = if (prior == null) { null } else { prior.number }
+    let next = maxNumber(blocks.values, questionCount) + 1
+    let number = if (kept != null) {
+      kept
+    } else if (kind == BlockKind.QUESTION) {
+      next
+    } else {
+      null
+    }
+    if (kept == null and kind == BlockKind.QUESTION) {
+      self.questionCount = next
+    }
+
     let cleaned = tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq
     self.blocks = blocks
       .map { bid, b =>
-        if (supersedes.contains(bid)) { asSuperseded(b) } else { b }
+        if (targets.contains(bid)) { asSuperseded(b) } else { b }
       }
       .with(id, Block(
         address: id,
@@ -250,10 +311,12 @@ type Context {
         tags: cleaned,
         pin: pin,
         superseded: false,
-        supersedes: supersedes,
+        supersedes: targets,
+        number: number,
       ))
-    let note = if (supersedes.isEmpty) { "" } else { `, superseding ${supersedes.join(", ")}` }
-    print(`wrote ${id}${note}` + "\n\n" + blockIndex)
+    let short = if (number == null) { "" } else { ` (Q-${toString(number)})` }
+    let note = if (targets.isEmpty) { "" } else { `, superseding ${targets.join(", ")}` }
+    print(`wrote ${id}${short}${note}` + "\n\n" + blockIndex)
     self
   }
 
@@ -264,13 +327,13 @@ type Context {
   """
   blockRead(
     """
-    The Block's id, as listed by blockIndex.
+    The Block's id, as listed by blockIndex, or a question's Q-number.
     """
     id: String!,
   ): String! {
     let b = mustGet(id)
     let note = if (b.superseded) {
-      let by = supersederOf(id)
+      let by = supersederOf(b.address)
       if (by == "") {
         "\n\n(superseded — kept for the reasoning, excluded from composition)"
       } else {
@@ -312,20 +375,21 @@ type Context {
   """
   blockPrune(
     """
-    Ids of the Blocks to remove, as listed by blockIndex.
+    Ids of the Blocks to remove, as listed by blockIndex (or Q-numbers).
     """
     ids: [String!]!,
   ): Context! {
     if (ids.isEmpty) {
       raise "name at least one block id to prune"
     }
-    ids.each { id =>
+    let addrs = ids.map { id => resolveId(id) }.uniq
+    addrs.each { id =>
       if (!blocks.has(id)) {
         raise `no block "${id}" in the Context — blockIndex lists what is there`
       }
     }
-    self.blocks = ids.reduce(blocks) { acc, id => acc.without(id) }
-    print(`pruned ${ids.join(", ")}` + "\n\n" + blockIndex)
+    self.blocks = addrs.reduce(blocks) { acc, id => acc.without(id) }
+    print(`pruned ${addrs.join(", ")}` + "\n\n" + blockIndex)
     self
   }
 
@@ -346,7 +410,8 @@ type Context {
   """
   compose(
     """
-    Ids to include. An unknown id is an error, so typos surface.
+    Ids (or Q-numbers) to include. An unknown id is an error, so typos
+    surface.
     """
     ids: [String!]! = [],
     """
@@ -368,17 +433,18 @@ type Context {
       return "The Context is empty — nothing to compose. blockWrite records the first Block."
     }
     ids.each { id =>
-      if (!blocks.has(id)) {
+      if (!blocks.has(resolveId(id))) {
         raise `no block "${id}" in the Context — blockIndex lists what is there`
       }
     }
+    let wanted = ids.map { id => resolveId(id) }
 
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
     let active = all.filter { b => !b.superseded }
     let selected = active.filter { b =>
       b.pin or wantAll or
-        ids.contains(b.address) or
+        wanted.contains(b.address) or
         kinds.contains(b.kind) or
         b.tags.any { t => tags.contains(t) }
     }
@@ -432,13 +498,13 @@ type Context {
   promote(
     source: Workspace!,
     """
-    The Block's id, as listed by blockIndex. Its file lands at
-    "context/<id>.md".
+    The Block's id, as listed by blockIndex, or a question's Q-number. Its
+    file lands at "context/<id>.md".
     """
     id: String!,
   ): Changeset! {
     let b = mustGet(id)
-    let path = `context/${id}.md`
+    let path = `context/${b.address}.md`
     let base = source.directory("/")
     # Only files already promoted: promoting a Block never lands others.
     let refreshed = b.supersedes.filter { t =>
@@ -450,7 +516,7 @@ type Context {
       dir.withNewFile(`context/${t}.md`, markdownOf(target, supersededBy(target)))
     }
     let also = if (refreshed.isEmpty) { "" } else { ` (refreshing ${refreshed.join(", ")}, which it supersedes)` }
-    print(`promoted ${id} to ${path}${also} — it is in your pending changes now; ` +
+    print(`promoted ${b.address} to ${path}${also} — it is in your pending changes now; ` +
       "review and commit it alongside the change that motivated it")
     landed.changes(from: base)
   }
@@ -538,6 +604,7 @@ type Context {
           status: statusLabel(b),
           supersedes: b.supersedes,
           superseded_by: supersededBy(b),
+          number: b.number,
         }}
       },
     }}
@@ -587,12 +654,13 @@ type Context {
     """
     repo: String! = "",
     """
-    Ids of active Blocks to feature first, under "At a glance", in this
-    order. An unknown or superseded id is an error, so typos surface.
+    Ids (or Q-numbers) of active Blocks to feature first, under "At a
+    glance", in this order. An unknown or superseded id is an error, so
+    typos surface.
     """
     lead: [String!]! = [],
   ): File! {
-    let featured = lead.uniq
+    let featured = lead.map { id => resolveId(id) }.uniq
     featured.each { id =>
       let b = mustGet(id)
       if (b.superseded) {
@@ -716,7 +784,37 @@ type Context {
     let marked = blocks.map { bid, b =>
       if (retired.contains(bid)) { asSuperseded(b) } else { b }
     }
-    self.blocks = taken.reduce(marked) { acc, b => acc.with(b.address, b) }
+
+    # Imported questions keep their numbers, unless one already belongs to
+    # another of the session's Blocks (session numbers are what this
+    # session has been citing) or two imported Blocks share one; those, and
+    # questions recorded without a number, take the next free one.
+    let staying = marked.values.reject { b => takenIds.contains(b.address) }
+    let used: [Int!]! = staying.reduce(([] :: [Int!]!)) { acc, b =>
+      let n = b.number
+      if (n == null) { acc } else { acc + [n] }
+    }
+    let high = maxNumber(taken, maxNumber(marked.values, questionCount))
+    let numbered: [Block!]! = []
+    let renumbered: [String!]! = []
+    taken.each { b =>
+      let n = b.number
+      let free = if (n == null) { false } else { !used.contains(n) }
+      if (n != null and free) {
+        numbered += [b]
+        used += [n]
+      } else if (n == null and b.kind != BlockKind.QUESTION) {
+        numbered += [b]
+      } else {
+        high += 1
+        numbered += [withNumber(b, high)]
+        used += [high]
+        let was = if (n == null) { "" } else { ` (was Q-${toString(n)})` }
+        renumbered += [`${b.address} Q-${toString(high)}${was}`]
+      }
+    }
+    self.questionCount = high
+    self.blocks = numbered.reduce(marked) { acc, b => acc.with(b.address, b) }
 
     let notes: [String!]! = []
     let gone = taken.filter { b => b.superseded }.length
@@ -730,6 +828,9 @@ type Context {
     if (!retired.isEmpty) {
       notes += ["superseding " + retired.join(", ")]
     }
+    if (!renumbered.isEmpty) {
+      notes += ["numbered " + renumbered.join(", ")]
+    }
     if (!read.skipped.isEmpty) {
       notes += ["skipped files without front matter: " + read.skipped.join(", ")]
     }
@@ -741,11 +842,26 @@ type Context {
   # ---- helpers ------------------------------------------------------------
 
   let mustGet(id: String!): Block! {
-    let b = blocks[id]
+    let addr = resolveId(id)
+    let b = blocks[addr]
     if (b == null) {
       raise `no block "${id}" in the Context — blockIndex lists what is there`
     }
     b
+  }
+
+  # An id argument as an address: a question's Q-number names its Block;
+  # anything else is already an address.
+  let resolveId(ref: String!): String! {
+    if (!ref.containsMatch(shortIdShape)) {
+      return ref
+    }
+    let hit = blocks.values.filter { b => shortId(b) == ref }.map { b => b.address }
+    let addr = hit[0]
+    if (addr == null) {
+      raise `no question ${ref} in the Context — blockIndex lists every Q-number`
+    }
+    addr
   }
 
   # Every Block in composition order: kind rank, ties broken by address
@@ -787,13 +903,17 @@ type Context {
     } else {
       ""
     }
-    `${b.address}  ${kindLabel(b.kind)}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
+    let short = shortId(b)
+    let number = if (short == null) { "" } else { "  " + short }
+    `${b.address}  ${kindLabel(b.kind)}${number}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
   }
 
   let headerOf(b: Block!): String! {
     let tags = if (b.tags.isEmpty) { "" } else { " · " + b.tags.map { t => "#" + t }.join(" ") }
     let pin = if (b.pin) { " · pinned" } else { "" }
-    `── ${b.address} · ${kindLabel(b.kind)}${tags}${pin} ──`
+    let short = shortId(b)
+    let number = if (short == null) { "" } else { " · " + short }
+    `── ${b.address} · ${kindLabel(b.kind)}${number}${tags}${pin} ──`
   }
 
   let renderBlock(b: Block!): String! {
@@ -830,6 +950,11 @@ type Context {
     supersedes: naming the old — superseded Blocks are kept out of
     composition but preserved, because the reasoning outlives the
     conclusion.
+
+    QUESTIONS get a stable short id, Q-<n>, shown in blockIndex and
+    accepted wherever an id is: cite open questions by it. Answer one by
+    writing the DECISION or FACT that settles it with supersedes: naming
+    the question.
 
     PROMOTE what should outlive this session: promote lands a Block as
     markdown under context/ in your pending changes, to be reviewed and

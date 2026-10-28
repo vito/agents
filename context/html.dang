@@ -30,11 +30,17 @@ let escLit(s: String!): String! {
 # One pass over raw inline text; the alternation is ordered, leftmost first:
 #   1 `code`   2,3 [text](url)   4 bare URL   5,6 owner/repo#N   7 #N
 #   8 path-shaped token (a block id when the Context has it)   9 a character
-#   HTML needs escaped. Everything else passes through untouched.
-let inlineToken: Regexp! = `\x60([^\x60\n]+)\x60|\[([^\]\n]+)\]\((https?://[^\s)]+)\)|(https?://[^\s<>"'\x60]*[^\s<>"'\x60.,;:!?)\]])|\b([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)#(\d+)\b|\B#(\d+)\b|\b([a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)+)|([&<>"'])`
+#   HTML needs escaped   10 a question's Q-number. Everything else passes
+#   through untouched.
+let inlineToken: Regexp! = `\x60([^\x60\n]+)\x60|\[([^\]\n]+)\]\((https?://[^\s)]+)\)|(https?://[^\s<>"'\x60]*[^\s<>"'\x60.,;:!?)\]])|\b([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)#(\d+)\b|\B#(\d+)\b|\b([a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)+)|([&<>"'])|\bQ-(\d+)\b`
 
 let cap(caps: [String!]!, i: Int!): String! {
   caps[i] ?? ""
+}
+
+# The Block a Q-number names, if the Context has it.
+let numberedId(n: String!, known: Map[Block!]!): String {
+  known.values.filter { b => toString(b.number) == n }.map { b => b.address }[0]
 }
 
 # The known block a path-shaped token names, tolerating trailing sentence
@@ -53,8 +59,17 @@ let refsOf(b: Block!, known: Map[Block!]!): [String!]! {
   b.text.matchAll(inlineToken)
     .map { m =>
       let code = cap(m.captures, 0)
+      let q = cap(m.captures, 9)
       if (code != "") {
-        if (known.has(code)) { code } else { null }
+        if (known.has(code)) {
+          code
+        } else if (code.containsMatch(shortIdShape)) {
+          numberedId(code.trimPrefix("Q-"), known)
+        } else {
+          null
+        }
+      } else if (q != "") {
+        numberedId(q, known)
       } else {
         tokenId(cap(m.captures, 7), known)
       }
@@ -73,13 +88,37 @@ let chipHtml(id: String!, known: Map[Block!]!): String! {
   `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${kindLabel(b.kind).toUpper}">${escLit(id)}</a>`
 }
 
+# A Q-number in text: a chip reading "Q-3", titled with the Block's id.
+let shortChipHtml(n: String!, known: Map[Block!]!): String {
+  let id = numberedId(n, known)
+  if (id == null) {
+    return null
+  }
+  let b = known[id]
+  if (b == null) {
+    return null
+  }
+  let gone = if (b.superseded) { " gone" } else { "" }
+  `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${escLit(id)}">Q-${n}</a>`
+}
+
 let inlineHtml(s: String!, known: Map[Block!]!, repo: String!): String! {
   s.rewriteMatches(inlineToken) { m =>
     let c = m.captures
     let code = cap(c, 0)
     let path = cap(c, 7)
+    let q = cap(c, 9)
     if (code != "") {
-      if (known.has(code)) { chipHtml(code, known) } else { "<code>" + escLit(code) + "</code>" }
+      let qchip = if (code.containsMatch(shortIdShape)) { shortChipHtml(code.trimPrefix("Q-"), known) } else { null }
+      if (known.has(code)) {
+        chipHtml(code, known)
+      } else if (qchip != null) {
+        qchip
+      } else {
+        "<code>" + escLit(code) + "</code>"
+      }
+    } else if (q != "") {
+      shortChipHtml(q, known) ?? ("Q-" + q)
     } else if (cap(c, 1) != "") {
       `<a href="${escLit(cap(c, 2))}">${escLit(cap(c, 1))}</a>`
     } else if (cap(c, 3) != "") {
@@ -242,6 +281,7 @@ let contextCss: String! = """
   .pin{font-size:12px;color:#b03a2e;font-weight:700}
   .badge{font:700 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#fff;background:#b03a2e;border-radius:4px;padding:4px 6px}
   a.bid{color:inherit}
+  .qn{font:700 14px ui-monospace,Menlo,monospace;color:var(--k-question)}
   table{border-collapse:collapse;font-size:13.5px;background:var(--card);margin:8px 0}
   th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
   th{background:#f3f4f1}
@@ -353,8 +393,10 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     } else {
       ""
     }
+    let short = shortId(b)
+    let qn = if (short == null) { "" } else { `<span class="qn">${short}</span>` }
     let head = open +
-      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${bid}${blocker}` +
+      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${qn}${bid}${blocker}` +
       (if (b.pin) { `<span class="pin">📌 pinned</span>` } else { "" }) +
       b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") +
       "</div>"
@@ -414,7 +456,7 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
   }
   if (!questions.isEmpty) {
     let blockerNote = if (blockers.isEmpty) { "" } else { `, ${toString(blockers.length)} blocking` }
-    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}: blockers (tagged #${blockerTag}) first, then pinned.</div>` + "\n" +
+    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}: blockers (tagged #${blockerTag}) first, then pinned. Cite one by its Q-number; answering it means writing the decision that supersedes it.</div>` + "\n" +
       questions.map { b => card(b, true) }.join("")
   }
 

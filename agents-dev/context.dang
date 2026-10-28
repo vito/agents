@@ -280,6 +280,62 @@ let testContextHtmlCurated(source: Workspace!): String! {
   "Context curated HTML checks passed."
 }
 
+# Questions get Q-numbers: assigned in order, kept across rewrites and
+# supersession, never reused after a prune, accepted as ids, exported and
+# imported, renumbered only on a clash.
+let testContextShortIds(source: Workspace!): String! {
+  let ctx = context
+    .blockWrite("facts/a", ContextBlockKind.FACT, "not a question")
+    .blockWrite("questions/one", ContextBlockKind.QUESTION, "first?")
+    .blockWrite("questions/two", ContextBlockKind.QUESTION, "second? see Q-1")
+  assert { ctx.blockIndex.contains("questions/one  question  Q-1  1 line(s)") }
+  assert { ctx.blockIndex.contains("questions/two  question  Q-2  1 line(s)") }
+  assert { ctx.blockIndex.contains("facts/a  fact  1 line(s)") }
+  assert { ctx.blockRead("Q-2").contains("── questions/two · question · Q-2 ──") }
+  assert { ctx.compose(ids: ["Q-1"]).contains("first?") }
+
+  # Rewrites keep the number; pruning the newest never frees it.
+  let rewritten = ctx.blockWrite("questions/one", ContextBlockKind.QUESTION, "first, reworded?")
+  assert { rewritten.blockIndex.contains("questions/one  question  Q-1") }
+  let pruned = rewritten.blockPrune(["Q-2"]).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
+  assert { pruned.blockIndex.contains("questions/three  question  Q-3") }
+
+  # Answering supersedes the question by its number; the number stays.
+  let answered = pruned.blockWrite("decisions/one", ContextBlockKind.DECISION, "answered", supersedes: ["Q-1"])
+  assert { answered.blockIndex.contains("questions/one  question  Q-1  1 line(s)  superseded by decisions/one") }
+  assert { answered.blockRead("Q-1").contains("superseded by decisions/one") }
+  let unknown = answered.blockRead("Q-9") rescue { e: Error => e.message }
+  assert { unknown.contains("no question Q-9") }
+
+  # Exports carry the number; a fresh session keeps it.
+  let md = answered.exportMarkdown.file("questions/three.md").contents
+  assert { md.contains("number: 3") }
+  assert { answered.exportMarkdown.file("facts/a.md").contents.contains("number: null") }
+  let fresh = context.importBlocks(source: source, json: answered.exportJson)
+  assert { fresh.blockRead("Q-3").contains("third?") }
+  assert { fresh.blockWrite("questions/four", ContextBlockKind.QUESTION, "fourth?").blockIndex.contains("questions/four  question  Q-4") }
+
+  # A clash with the session's own numbers renumbers the import; a
+  # question recorded without a number (an older export) gets one.
+  let other = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?")
+  let legacy = directory.withNewFile("questions/old.md", "---\nkind: question\n---\n\nolder export\n")
+  let merged = other
+    .importBlocks(source: source, json: answered.exportJson)
+    .importBlocks(source: source, from: legacy)
+  assert { merged.blockRead("Q-1").contains("mine?") }
+  assert { merged.blockIndex.contains("questions/one  question  Q-4") }
+  assert { merged.blockIndex.contains("questions/three  question  Q-3") }
+  assert { merged.blockIndex.contains("questions/old  question  Q-5") }
+
+  # The page labels questions and links Q-numbers in text.
+  let html = answered.blockWrite("notes/n", ContextBlockKind.NOTE, "open: Q-3 and `Q-1`").exportHtml(lead: ["Q-3"]).contents
+  assert { html.contains(`<span class="qn">Q-3</span>`) }
+  assert { html.contains(`<a class="chip k-question" href="#b-questions/three" title="questions/three">Q-3</a>`) }
+  assert { html.contains(`<a class="chip k-question gone" href="#b-questions/one" title="questions/one">Q-1</a>`) }
+  assert { html.contains(`<a class="bid" href="#b-questions/three">`) }
+  "Context short id checks passed."
+}
+
 let testContextTools: String! {
   let tools = context.agent(llm).tools
   assert { tools.contains("promote") and tools.contains("blockWrite") }

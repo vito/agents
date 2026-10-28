@@ -103,6 +103,12 @@ type AgentsDev {
     null
   }
 
+  """Check questions' Q-numbers: assignment, stability, resolution as ids, export/import and renumbering on clashes, and the HTML labels and links."""
+  contextShortIds(source: Workspace!): Void @check {
+    print(testContextShortIds(source: source))
+    null
+  }
+
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: Void @check {
     print(checkContributorMountsOutsideToolbox)
