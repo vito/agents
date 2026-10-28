@@ -22,24 +22,32 @@
 #     squashes the transcript, one compose call re-materializes everything
 #     worth knowing.
 #   * The reflex. The @agent system prompt (which survives compaction along
-#     with the tools) teaches the discipline — write on resolution, prune on
+#     with the tools) teaches the discipline — write on resolution, drop on
 #     irrelevance, compose on doubt — and every mutation prints the updated
 #     index, so the tail of the transcript always carries the set's shape.
 #
 # Scope: the SESSION half of the Context/Blocks design
 # (https://gist.github.com/vito/6c12ba8aff1e3576f9ce2b9d446540f0). The
 # durable half — markdown + front matter under context/, verification
-# (anchors/asserts/drift) and its CI checks — is not here; `promote` is the
-# bridge, landing a Block in the workspace changeset for review. resolve()
-# is not here either, because it is composition: hand the noisy legwork to
-# a staff worker, then blockWrite only the distilled answer.
+# (anchors/asserts/drift) and its CI checks — is not here; exportContext is
+# the bridge, landing Blocks in the workspace changeset for review.
+# resolve() is not here either, because it is composition: hand the noisy
+# legwork to a staff worker, then blockWrite only the distilled answer.
+#
+# The tools follow a Context's lifecycle: curate (blockWrite, blockDrop),
+# query (blockIndex, compose), and move — exportContext writes markdown,
+# JSON or a self-contained HTML page (io.dang, html.dang) into the pending
+# changes, and importContext reads them back from the workspace, a git URL
+# or a gist. Transport is the caller's: nothing here knows GitHub; a gist
+# is published from the exported files with whatever tools the agent has.
 #
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
-#     fresh module instances, so promote anything that must outlive those.
-#   * No @cache(Never) anywhere, deliberately: every tool is a pure function
-#     of (state, args), so a cache replay is indistinguishable from a re-run
-#     — contrast staff/sandbox, whose tools carry real side effects.
+#     fresh module instances, so export anything that must outlive those.
+#   * Every tool but importContext is a pure function of (state, args), so
+#     a cache replay is indistinguishable from a re-run — contrast
+#     staff/sandbox, whose tools carry real side effects. importContext is
+#     @cache(Never): a remote it reads (a gist, say) changes in place.
 #
 # Installed in this workspace's dagger.toml, so ambient sessions here carry
 # it; other workspaces install per taste, e.g. `dagger install ./context`.
@@ -55,6 +63,28 @@ enum BlockKind {
   RESULT
   QUESTION
   NOTE
+}
+
+"""
+What importContext does with an imported Block whose id the Context already
+has: ERROR imports nothing and names the clashing ids, KEEP keeps the
+session's Block, REPLACE takes the imported one.
+"""
+enum ImportConflict {
+  ERROR
+  KEEP
+  REPLACE
+}
+
+"""
+What exportContext writes: MARKDOWN, one front-matter file per Block (what
+a repo commits); JSON, context.json, lossless; HTML, index.html, the
+Context as one self-contained page.
+"""
+enum ExportFormat {
+  MARKDOWN
+  JSON
+  HTML
 }
 
 # Composition order: definitions land before the things that use them; loose
@@ -76,13 +106,27 @@ let kindLabel(kind: BlockKind!): String! {
 # Block ids are addresses: lowercase path-shaped segments.
 let idShape: Regexp! = `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`
 
+# A question's short id: Q-<number>. Uppercase, so it can never be an id.
+let shortIdShape: Regexp! = `^Q-[0-9]+$`
+
+let shortId(b: Block!): String {
+  let n = b.number
+  if (n == null) { null } else { `Q-${toString(n)}` }
+}
+
 # Size in text lines — the unit the composition budget is counted in.
 let blockLines(b: Block!): Int! {
   b.text.split("\n").length
 }
 
+# Active Blocks are the ones composed: neither superseded nor dropped.
+let isActive(b: Block!): Boolean! {
+  !b.superseded and !b.dropped
+}
+
 # Fork of a Block marked superseded. Kept, never deleted: the reasoning
-# outlives the conclusion.
+# outlives the conclusion. A Block has one status, so a dropped Block that
+# something later replaces is superseded, no longer dropped.
 let asSuperseded(b: Block!): Block! {
   Block(
     address: b.address,
@@ -92,7 +136,46 @@ let asSuperseded(b: Block!): Block! {
     pin: b.pin,
     superseded: true,
     supersedes: b.supersedes,
+    number: b.number,
+    dropped: false,
   )
+}
+
+# Fork of a Block marked dropped: kept for the record, never composed.
+let asDropped(b: Block!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: b.number,
+    dropped: true,
+  )
+}
+
+let withNumber(b: Block!, n: Int!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: n,
+    dropped: b.dropped,
+  )
+}
+
+# The highest question number among these Blocks, or floor.
+let maxNumber(bs: [Block!]!, floor: Int!): Int! {
+  bs.reduce(floor) { m, b =>
+    let n = b.number
+    if (n == null) { m } else if (n > m) { n } else { m }
+  }
 }
 
 """
@@ -137,6 +220,22 @@ type Block {
   Ids of the Blocks this one replaced.
   """
   supersedes: [String!]!
+
+  """
+  A QUESTION's stable short number, cited as Q-<number> wherever an id is
+  accepted. Assigned when the question is first written, kept for good
+  (also once it is superseded or rewritten as another kind), never reused
+  in a session — nor in one that imports its context.json, which carries
+  the high-water mark. Null for every other Block.
+  """
+  number: Int = null
+
+  """
+  Dropped Blocks stopped mattering without anything replacing them — a
+  moot question, a result that served its purpose. Kept for the record
+  and exported, but never composed.
+  """
+  dropped: Boolean! = false
 }
 
 """
@@ -151,6 +250,10 @@ type Context {
   # is key-ordered, which is exactly the ties-broken-by-address rule
   # composition wants.
   let blocks: Map[Block!]! = [:]
+
+  # The highest question number ever assigned, so pruning a question never
+  # frees its number for another.
+  let questionCount: Int! = 0
 
   """
   Compose the Context tools onto a base LLM.
@@ -173,7 +276,8 @@ type Context {
     """
     Address for the Block, path-shaped: e.g. "facts/engine-caches-by-id",
     "decisions/no-git-store". Writing an existing id replaces that Block
-    (and revives it, if it was superseded).
+    (and revives it, if it was superseded or dropped); an existing
+    question's Q-number names it too.
     """
     id: String!,
     """
@@ -192,74 +296,72 @@ type Context {
     """
     tags: [String!]! = [],
     """
-    Pin the Block: composed every time, regardless of selection and budget.
-    For the handful of things every future turn needs.
+    Pin the Block: composed every time, regardless of selection and budget
+    (a read by ids alone returns just those Blocks). For the handful of
+    things every future turn needs.
     """
     pin: Boolean! = false,
     """
-    Ids of Blocks this one replaces. They are kept but marked superseded and
-    dropped from composition — supersede a contradicted Block rather than
-    pruning it, so the reasoning stays readable.
+    Ids of Blocks this one replaces (a question's Q-number works too). They
+    are kept but marked superseded and left out of composition — supersede
+    a contradicted Block rather than dropping it, so the reasoning stays
+    readable. Answer a QUESTION by writing the DECISION or FACT that settles
+    it, superseding the question.
     """
     supersedes: [String!]! = [],
   ): Context! {
-    if (!id.containsMatch(idShape)) {
+    let addr = resolveId(id)
+    if (!addr.containsMatch(idShape)) {
       raise `block id "${id}" is not an address — use lowercase path-shaped ids like "facts/engine-caches-by-id"`
     }
     if (text.trimSpace == "") {
-      raise `block "${id}" needs a text payload — a Block is text plus metadata, not metadata alone`
+      raise `block "${addr}" needs a text payload — a Block is text plus metadata, not metadata alone`
     }
-    supersedes.each { target =>
-      if (target == id) {
-        raise `block "${id}" cannot supersede itself`
+    let targets = supersedes.map { target => resolveId(target) }.uniq
+    targets.each { target =>
+      if (target == addr) {
+        raise `block "${addr}" cannot supersede itself`
       }
       if (!blocks.has(target)) {
         raise `cannot supersede "${target}": no such block — blockIndex lists what is there`
       }
     }
 
+    # A Block keeps its number across rewrites; a new QUESTION takes the
+    # next one.
+    let prior = blocks[addr]
+    let kept = if (prior == null) { null } else { prior.number }
+    let next = maxNumber(blocks.values, questionCount) + 1
+    let number = if (kept != null) {
+      kept
+    } else if (kind == BlockKind.QUESTION) {
+      next
+    } else {
+      null
+    }
+    if (kept == null and kind == BlockKind.QUESTION) {
+      self.questionCount = next
+    }
+
     let cleaned = tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq
     self.blocks = blocks
       .map { bid, b =>
-        if (supersedes.contains(bid)) { asSuperseded(b) } else { b }
+        if (targets.contains(bid)) { asSuperseded(b) } else { b }
       }
-      .with(id, Block(
-        address: id,
+      .with(addr, Block(
+        address: addr,
         kind: kind,
         text: text,
         tags: cleaned,
         pin: pin,
         superseded: false,
-        supersedes: supersedes,
+        supersedes: targets,
+        number: number,
       ))
-    let note = if (supersedes.isEmpty) { "" } else { `, superseding ${supersedes.join(", ")}` }
-    print(`wrote ${id}${note}` + "\n\n" + blockIndex)
+    let short = if (number == null) { "" } else { ` (Q-${toString(number)})` }
+    let note = if (targets.isEmpty) { "" } else { `, superseding ${targets.join(", ")}` }
+    print(`wrote ${addr}${short}${note}` + "\n\n" + blockIndex)
     self
-  }
-
-  """
-  Read one Block in full: its header line and complete text. Works on
-  superseded Blocks too — the reasoning is kept — with a pointer to what
-  replaced them.
-  """
-  blockRead(
-    """
-    The Block's id, as listed by blockIndex.
-    """
-    id: String!,
-  ): String! {
-    let b = mustGet(id)
-    let note = if (b.superseded) {
-      let by = supersederOf(id)
-      if (by == "") {
-        "\n\n(superseded — kept for the reasoning, excluded from composition)"
-      } else {
-        "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
-      }
-    } else {
-      ""
-    }
-    renderBlock(b) + note
   }
 
   """
@@ -272,40 +374,67 @@ type Context {
       return "The Context is empty — no Blocks yet. blockWrite records the first."
     }
     let all = ordered
-    let active = all.filter { b => !b.superseded }
+    let active = all.filter { b => isActive(b) }
     let pinned = active.filter { b => b.pin }
     let total = active.reduce(0) { acc, b => acc + blockLines(b) }
+    let superseded = all.filter { b => b.superseded }.length
+    let dropped = all.filter { b => b.dropped }.length
+    let droppedNote = if (dropped == 0) { "" } else { `, ${toString(dropped)} dropped` }
     let headline = `${toString(all.length)} block(s) — ${toString(active.length)} active ` +
       `(${toString(total)} text line(s), ${toString(pinned.length)} pinned), ` +
-      `${toString(all.length - active.length)} superseded`
+      `${toString(superseded)} superseded${droppedNote}`
     headline + "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
   }
 
   """
-  Take Blocks out of the Context — the operation a log cannot perform on
-  itself. For Blocks that stopped mattering: noise, settled questions,
-  results that served their purpose.
+  Take Blocks out of composition when they stopped mattering and nothing
+  replaces them: a moot question, a result that served its purpose. They
+  are DROPPED, not deleted — kept for the record, listed by blockIndex,
+  readable with compose(ids:), and exported as dropped — and blockWrite at
+  the same id revives one. Files you exported before still say active
+  until you export again.
 
-  Pruning forgets entirely. A Block that was CONTRADICTED should be
-  superseded instead (blockWrite with supersedes:), which keeps the
-  reasoning readable.
+  Do not drop what something replaces: supersede a CONTRADICTED Block
+  (blockWrite with supersedes:), and answer a QUESTION with the DECISION
+  that supersedes it, so the reasoning stays linked.
+
+  forget: true deletes outright. Only for mistakes and misadventures whose
+  mere presence would confuse future agents — a block written at the wrong
+  id, junk, a dead end with nothing to learn from.
   """
-  blockPrune(
+  blockDrop(
     """
-    Ids of the Blocks to remove, as listed by blockIndex.
+    Ids of the Blocks to drop, as listed by blockIndex (or Q-numbers).
     """
     ids: [String!]!,
+    """
+    Delete the Blocks outright instead of dropping them: no record is left,
+    and exports no longer carry them (a file exported earlier stays where
+    it is — delete it yourself). Only for mistakes and misadventures.
+    """
+    forget: Boolean! = false,
   ): Context! {
     if (ids.isEmpty) {
-      raise "name at least one block id to prune"
+      raise "name at least one block id to drop"
     }
-    ids.each { id =>
-      if (!blocks.has(id)) {
-        raise `no block "${id}" in the Context — blockIndex lists what is there`
+    let addrs = ids.map { id => resolveId(id) }.uniq
+    addrs.each { id =>
+      let b = mustGet(id)
+      if (!forget and !isActive(b)) {
+        let state = if (b.superseded) { "superseded" } else { "dropped" }
+        raise `"${id}" is already ${state}, so it is out of composition — pass forget: true only if its record would confuse future agents`
       }
     }
-    self.blocks = ids.reduce(blocks) { acc, id => acc.without(id) }
-    print(`pruned ${ids.join(", ")}` + "\n\n" + blockIndex)
+    if (forget) {
+      self.blocks = addrs.reduce(blocks) { acc, id => acc.without(id) }
+      print(`forgot ${addrs.join(", ")}` + "\n\n" + blockIndex)
+    } else {
+      self.blocks = blocks.map { bid, b =>
+        if (addrs.contains(bid)) { asDropped(b) } else { b }
+      }
+      print(`dropped ${addrs.join(", ")} — kept for the record, out of composition; ` +
+        "files you exported before still say active until you exportContext again" + "\n\n" + blockIndex)
+    }
     self
   }
 
@@ -317,7 +446,9 @@ type Context {
 
   With no selectors this composes every active Block. Selectors union: a
   Block is included when its id, its kind, or any of its tags matches.
-  Pinned Blocks are always included; superseded Blocks never are.
+  Pinned Blocks are always included, except in a read by ids alone, which
+  returns just those Blocks; superseded and dropped Blocks only when named
+  in ids — that is how to read one, with a note on what replaced it.
 
   Call it whenever you are unsure what you know — and ALWAYS as your first
   move after your conversation has been compacted: the Context lives in
@@ -326,7 +457,8 @@ type Context {
   """
   compose(
     """
-    Ids to include. An unknown id is an error, so typos surface.
+    Ids (or Q-numbers) to include, whatever their status. An unknown id is
+    an error, so typos surface.
     """
     ids: [String!]! = [],
     """
@@ -348,19 +480,24 @@ type Context {
       return "The Context is empty — nothing to compose. blockWrite records the first Block."
     }
     ids.each { id =>
-      if (!blocks.has(id)) {
+      if (!blocks.has(resolveId(id))) {
         raise `no block "${id}" in the Context — blockIndex lists what is there`
       }
     }
+    let wanted = ids.map { id => resolveId(id) }
 
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
+    # A read by id alone (no tags or kinds) is just those Blocks: pins ride
+    # along with every other composition.
+    let readOnly = !ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
-    let active = all.filter { b => !b.superseded }
-    let selected = active.filter { b =>
-      b.pin or wantAll or
-        ids.contains(b.address) or
-        kinds.contains(b.kind) or
-        b.tags.any { t => tags.contains(t) }
+    let active = all.filter { b => isActive(b) }
+    let selected = all.filter { b =>
+      wanted.contains(b.address) or isActive(b) and (
+        (b.pin and !readOnly) or wantAll or
+          kinds.contains(b.kind) or
+          b.tags.any { t => tags.contains(t) }
+      )
     }
 
     let included: [Block!]! = []
@@ -380,16 +517,17 @@ type Context {
     manifest += [`CONTEXT — composed ${toString(included.length)} of ${toString(all.length)} block(s), ${toString(used)} text line(s)`]
     included.each { b => manifest += ["  " + indexLine(b)] }
     if (!overBudget.isEmpty) {
-      manifest += ["over budget — blockRead these, or raise the budget:"]
+      manifest += ["over budget — compose these by id, or raise the budget:"]
       overBudget.each { b => manifest += ["  " + indexLine(b)] }
     }
     let notes: [String!]! = []
-    let filtered = active.length - selected.length
+    let filtered = active.filter { b => !selected.contains(b) }.length
     if (filtered > 0) {
       notes += [`${toString(filtered)} active block(s) outside this selection`]
     }
-    if (all.length > active.length) {
-      notes += [`${toString(all.length - active.length)} superseded block(s) held out`]
+    let heldOut = all.filter { b => !isActive(b) and !selected.contains(b) }.length
+    if (heldOut > 0) {
+      notes += [`${toString(heldOut)} superseded or dropped block(s) held out`]
     }
     if (!notes.isEmpty) {
       manifest += ["  (" + notes.join("; ") + " — blockIndex lists everything)"]
@@ -398,47 +536,373 @@ type Context {
     if (included.isEmpty) {
       return manifest.join("\n") + "\n\n(nothing matched the selection)"
     }
-    manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) }.join("\n\n")
+    manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) + statusNote(b) }.join("\n\n")
   }
 
   """
-  Land a Block in the workspace as a markdown file with front matter under
-  context/, so it can outlive this session: the write shows up in your
-  pending changes, to be reviewed and committed alongside the code that
-  motivated it. The Block also stays in the session's Context.
+  Export the Context into your pending changes, under path: to commit it
+  beside the code it explains, or to publish it (as a gist, say) with
+  whatever tools you have. Formats:
+
+  - MARKDOWN: one <id>.md per Block, front matter then text. Reviewable
+    and diffable; what a repo commits under context/.
+  - JSON: <path>/context.json, every field plus the Q-number high-water
+    mark. The lossless form.
+  - HTML: <path>/index.html, the Context as one self-contained page —
+    "At a glance" (the lead Blocks), open questions, kind and tag filters,
+    every Block as a card.
+
+  Every Block of every status is exported unless ids, tags or kinds narrow
+  it, e.g. to the decisions a pull request motivated. What path already
+  holds stays whole: the Blocks earlier exports put there (in markdown or
+  context.json) are rewritten with their current status, whatever the
+  formats and selection, so a copy never keeps a stale status nor loses a
+  Block to a narrower export.
+
+  For a gist: a path of its own, flat, formats HTML and JSON; gistpreview
+  renders its index.html, and importContext(from: "<gist id>") reads it
+  back. To curate the page, write the curated content as Blocks (a status
+  table, a checklist) and name them in lead.
   """
-  promote(
+  exportContext(
     source: Workspace!,
     """
-    The Block's id, as listed by blockIndex. Its file lands at
-    "context/<id>.md".
+    Directory to write into, relative to the workspace root.
     """
-    id: String!,
+    path: String! = "context",
+    """
+    What to write: MARKDOWN, JSON, HTML, or several.
+    """
+    formats: [ExportFormat!]! = [ExportFormat.MARKDOWN],
+    """
+    Write markdown files directly under path, "facts/foo" as facts~foo.md,
+    as gists require. "~" never occurs in an id, so the name reverses.
+    """
+    flat: Boolean! = false,
+    """
+    Ids (or Q-numbers) to export. Selectors union, as in compose; none
+    exports everything.
+    """
+    ids: [String!]! = [],
+    """
+    Tags to export: any Block carrying any of these.
+    """
+    tags: [String!]! = [],
+    """
+    Kinds to export.
+    """
+    kinds: [BlockKind!]! = [],
+    """
+    The page title, with HTML.
+    """
+    title: String! = "Context",
+    """
+    GitHub "owner/repo" that bare #123 references point at, with HTML.
+    owner/repo#123 is always linked.
+    """
+    repo: String! = "",
+    """
+    Ids (or Q-numbers) of active, exported Blocks to feature first in the
+    page, in this order, with HTML.
+    """
+    lead: [String!]! = [],
   ): Changeset! {
-    let b = mustGet(id)
-    let front = YAML.encode({{
-      kind: kindLabel(b.kind),
-      tags: b.tags,
-      pin: b.pin,
-      supersedes: b.supersedes,
-      status: if (b.superseded) { "superseded" } else { null },
-    }})
-    let path = `context/${id}.md`
-    let contents = "---\n" + front + "\n---\n\n" + b.text + "\n"
+    if (blocks.isEmpty) {
+      raise "the Context is empty — nothing to export"
+    }
+    if (formats.isEmpty) {
+      raise "name at least one format: MARKDOWN, JSON or HTML"
+    }
+    let wantHtml = formats.contains(ExportFormat.HTML)
+    if (!lead.isEmpty and !wantHtml) {
+      raise "lead features Blocks in the HTML page — add HTML to formats"
+    }
+    ids.each { id => mustGet(id) }
+    let wanted = ids.map { id => resolveId(id) }
+    let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
+    let selected = ordered.filter { b =>
+      wantAll or wanted.contains(b.address) or kinds.contains(b.kind) or
+        b.tags.any { t => tags.contains(t) }
+    }
+    if (selected.isEmpty) {
+      raise "nothing matched the selection — blockIndex lists what is there"
+    }
+    let chosen = selected.map { b => b.address }
+    let featured = lead.map { id => resolveId(id) }.uniq
+    featured.each { id =>
+      let b = mustGet(id)
+      if (b.superseded) {
+        let by = supersederOf(id)
+        let pointer = if (by == "") { "" } else { ` — lead with what replaced it (${by})` }
+        raise `cannot lead with "${id}": it is superseded${pointer}`
+      }
+      if (b.dropped) {
+        raise `cannot lead with "${id}": it is dropped`
+      }
+      if (!chosen.contains(id)) {
+        raise `cannot lead with "${id}": it is not in the selection being exported`
+      }
+    }
+
+    let dest = path.trimRight("/")
+    let into = if (dest == "") { "." } else { dest }
+    let prefix = if (into == ".") { "" } else { into + "/" }
     let base = source.directory("/")
-    print(`promoted ${id} to ${path} — it is in your pending changes now; ` +
-      "review and commit it alongside the change that motivated it")
-    base.withNewFile(path, contents).changes(from: base)
+
+    # What path already holds from earlier exports stays whole: whatever the
+    # formats and selection, every Block it held is rewritten with its
+    # current status, so a narrower or partial export never drops a Block
+    # from the copy, nor leaves one stale for an import to bring back.
+    let mdFiles = base.glob(prefix + "**/*.md")
+    let jsonPath = prefix + "context.json"
+    let prior = if (base.glob(jsonPath).contains(jsonPath)) {
+      parseJsonBlocks(jsonPath, base.file(jsonPath).contents).blocks
+    } else {
+      [] :: [Block!]!
+    }
+    let held = mdFiles.map { f => idForFile(f.trimPrefix(prefix)) } + prior.map { b => b.address }
+    let copy = ordered.filter { b => chosen.contains(b.address) or held.contains(b.address) }
+    # Blocks of the old context.json this Context lacks (forgotten, or from
+    # another session) stay as they were, as their markdown files do.
+    let foreign = prior.filter { b => !blocks.has(b.address) }
+    let kept = copy.length - selected.length + foreign.length
+
+    let out = base
+    let written: [String!]! = []
+    let refreshed: [String!]! = []
+    let moved: [String!]! = []
+    let wantMd = formats.contains(ExportFormat.MARKDOWN)
+    let fresh = if (wantMd) {
+      selected.map { b => prefix + fileNameFor(b.address, flat) }
+    } else {
+      [] :: [String!]!
+    }
+    if (wantMd) {
+      selected.each { b =>
+        out = out.withNewFile(prefix + fileNameFor(b.address, flat), markdownOf(b, supersededBy(b)))
+      }
+      written += [`${toString(selected.length)} markdown file(s)`]
+    }
+    mdFiles.each { f =>
+      let id = idForFile(f.trimPrefix(prefix))
+      let b = blocks[id]
+      if (b != null and !fresh.contains(f)) {
+        if (wantMd and chosen.contains(id)) {
+          # Written just now under the other layout (nested or flat): one
+          # file per Block, or the directory no longer imports.
+          out = out.withoutFile(f)
+          moved += [id]
+        } else {
+          out = out.withNewFile(f, markdownOf(b, supersededBy(b)))
+          refreshed += [id]
+        }
+      }
+    }
+    if (formats.contains(ExportFormat.JSON)) {
+      out = out.withNewFile(jsonPath, jsonOf(copy + foreign))
+      written += ["context.json"]
+    }
+    if (wantHtml) {
+      out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
+      written += ["index.html"]
+    }
+    let notes: [String!]! = []
+    if (!refreshed.isEmpty) {
+      notes += ["refreshing " + refreshed.join(", ")]
+    }
+    if (!moved.isEmpty) {
+      notes += ["removing the other layout's file of " + moved.join(", ")]
+    }
+    if (kept > 0 and (formats.contains(ExportFormat.JSON) or wantHtml)) {
+      notes += [`keeping ${toString(kept)} more block(s) already exported here in the copy`]
+    }
+    let also = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
+    print(`exported ${toString(selected.length)} block(s) to ${into}/ as ${written.join(", ")}${also} — ` +
+      "they are in your pending changes now; review and commit them, or publish them")
+    out.changes(from: base)
+  }
+
+  """
+  Load Blocks into the Context from an export: a directory of markdown (a
+  repo's committed context/, flat or nested), a context.json, or a gist.
+  Every file is validated before anything is imported. Blocks arrive
+  exactly as recorded — superseded and dropped ones stay so, active ones
+  stay active even when another names them in supersedes (as after a
+  revive) — and an imported Block's supersedes marks the session's Blocks
+  it names superseded, as blockWrite does.
+
+  In a directory, every **/*.md with front matter is a Block, its id taken
+  from the front matter (else from the path, with ~ read as /), plus any
+  Block only a top-level context.json holds; markdown wins on a shared id.
+  Files without front matter are skipped and named. A forgotten Block's
+  file, if it was ever exported, comes back too: delete it.
+  """
+  importContext(
+    source: Workspace!,
+    """
+    Where to read: a workspace path (a directory, or a .json file); a git
+    URL, optionally with #<ref> and :<path>
+    ("https://github.com/org/repo#main:context"); or a gist, by id or URL
+    ("https://gist.github.com/<id>").
+    """
+    from: String! = "context",
+    """
+    What to do with imported ids the Context already has: ERROR (the
+    default) imports nothing and names them; KEEP keeps the session's Block;
+    REPLACE takes the imported one.
+    """
+    onConflict: ImportConflict! = ImportConflict.ERROR,
+  ): Context! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): a git URL or gist resolves live, and a gist is updated
+    # in place, so a later identical import must read it as it is then.
+    let read = readFrom(source, from)
+    let incoming = read.blocks
+    let ids = incoming.map { b => b.address }
+    let dupes = ids.filter { id => ids.filter { x => x == id }.length > 1 }.uniq
+    if (!dupes.isEmpty) {
+      raise `the import holds more than one block for ${dupes.join(", ")} — nothing imported`
+    }
+    let clashes = ids.filter { id => blocks.has(id) }
+    if (!clashes.isEmpty and onConflict == ImportConflict.ERROR) {
+      raise `already in the Context: ${clashes.join(", ")} — nothing imported; ` +
+        "pass onConflict: KEEP to keep the session's blocks, or REPLACE to take the imported ones"
+    }
+    let taken = if (onConflict == ImportConflict.KEEP) {
+      incoming.reject { b => clashes.contains(b.address) }
+    } else {
+      incoming
+    }
+    # Imported supersedes apply to the session's own Blocks as blockWrite's
+    # do. Imported Blocks keep their recorded status, even when another
+    # Block names them: a revived Block is active by design, and re-importing
+    # an older export can revive one the same way.
+    let takenIds = taken.map { b => b.address }
+    let targets = taken.reduce(([] :: [String!]!)) { acc, b => acc + b.supersedes }.uniq
+    let retired = blocks.values
+      .filter { b => targets.contains(b.address) and !takenIds.contains(b.address) and !b.superseded }
+      .map { b => b.address }
+    let marked = blocks.map { bid, b =>
+      if (retired.contains(bid)) { asSuperseded(b) } else { b }
+    }
+
+    # Question numbers. The session's numbers are what it has been citing,
+    # so they win: a Block replacing one of the session's keeps that
+    # Block's number, and an imported number at or below the session's
+    # high-water mark (held by another Block, or retired by forget) is
+    # renumbered, as is a number two imported Blocks share. A question
+    # recorded without one (an older export) gets the next free number.
+    # New numbers start above everything either side ever assigned, and
+    # citations of a renumbered question in the imported text follow it.
+    let sessionHigh = maxNumber(blocks.values, questionCount)
+    let high = maxNumber(taken, if (read.questions > sessionHigh) { read.questions } else { sessionHigh })
+    let used: [Int!]! = []
+    let numbered: [Block!]! = []
+    let renames: [{{was: String!, now: String!}}!]! = []
+    let renumbered: [String!]! = []
+    # A question KEEP left out stands for the session's Block of that id, so
+    # the imported text's citations of it follow the session's number.
+    if (onConflict == ImportConflict.KEEP) {
+      incoming.each { b =>
+        let prev = blocks[b.address]
+        let pn = if (prev == null) { null } else { prev.number }
+        let n = b.number
+        if (pn != null) {
+          if (n != null) {
+            if (n != pn) {
+              renames += [{{was: toString(n), now: toString(pn)}}]
+            }
+          }
+        }
+      }
+    }
+    taken.each { b =>
+      let n = b.number
+      let prev = blocks[b.address]
+      let pn = if (prev == null) { null } else { prev.number }
+      let keepable = if (n == null) { false } else { n > sessionHigh and !used.contains(n) }
+      let final = if (pn != null) {
+        pn
+      } else if (n != null and keepable) {
+        n
+      } else if (n == null and b.kind != BlockKind.QUESTION) {
+        null
+      } else {
+        high += 1
+        high
+      }
+      if (final != null) {
+        used += [final]
+      }
+      numbered += [if (final == null) { b } else { withNumber(b, final) }]
+      # A legacy file replacing a numbered session Block just keeps its
+      # number: nothing changed that is worth reporting.
+      let quiet = n == null and pn != null
+      if (final != null and final != n and !quiet) {
+        let was = if (n == null) { "" } else { ` (was Q-${toString(n)})` }
+        renumbered += [`${b.address} Q-${toString(final)}${was}`]
+        if (n != null) {
+          renames += [{{was: toString(n), now: toString(final)}}]
+        }
+      }
+    }
+    let cited = numbered.map { b => renumberCitations(b, renames) }
+    let rewritten = cited.filter { b => !numbered.contains(b) }.map { b => b.address }
+    self.questionCount = high
+    self.blocks = cited.reduce(marked) { acc, b => acc.with(b.address, b) }
+
+    let notes: [String!]! = []
+    let gone = taken.filter { b => b.superseded }.length
+    if (gone > 0) {
+      notes += [`${toString(gone)} superseded`]
+    }
+    let dropped = taken.filter { b => b.dropped }.length
+    if (dropped > 0) {
+      notes += [`${toString(dropped)} dropped`]
+    }
+    if (!clashes.isEmpty) {
+      let verb = if (onConflict == ImportConflict.KEEP) { "kept the session's" } else { "replaced" }
+      notes += [`${verb} ${clashes.join(", ")}`]
+    }
+    if (!retired.isEmpty) {
+      notes += ["superseding " + retired.join(", ")]
+    }
+    if (!renumbered.isEmpty) {
+      notes += ["numbered " + renumbered.join(", ")]
+    }
+    if (!rewritten.isEmpty) {
+      notes += ["updated Q-number citations in " + rewritten.join(", ")]
+    }
+    if (!read.skipped.isEmpty) {
+      notes += ["skipped files without front matter: " + read.skipped.join(", ")]
+    }
+    let detail = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
+    print(`imported ${toString(taken.length)} block(s)${detail}` + "\n\n" + blockIndex)
+    self
   }
 
   # ---- helpers ------------------------------------------------------------
 
   let mustGet(id: String!): Block! {
-    let b = blocks[id]
+    let addr = resolveId(id)
+    let b = blocks[addr]
     if (b == null) {
       raise `no block "${id}" in the Context — blockIndex lists what is there`
     }
     b
+  }
+
+  # An id argument as an address: a question's Q-number names its Block;
+  # anything else is already an address.
+  let resolveId(ref: String!): String! {
+    if (!ref.containsMatch(shortIdShape)) {
+      return ref
+    }
+    let hit = blocks.values.filter { b => shortId(b) == ref }.map { b => b.address }
+    let addr = hit[0]
+    if (addr == null) {
+      raise `no question ${ref} in the Context — blockIndex lists every Q-number`
+    }
+    addr
   }
 
   # Every Block in composition order: kind rank, ties broken by address
@@ -450,12 +914,33 @@ type Context {
   }
 
   # Who replaced a Block — scanned rather than stored, so pruning a
-  # superseder can never leave a dangling pointer.
+  # superseder can never leave a dangling pointer. A superseder dropped
+  # since is marked, since it no longer holds the current truth.
   let supersederOf(id: String!): String! {
+    supersederIds(id).map { s =>
+      let b = blocks[s]
+      let gone = if (b == null) { false } else { b.dropped }
+      if (gone) { s + " (dropped)" } else { s }
+    }.join(", ")
+  }
+
+  # Whether any Block that replaced this one is still composed.
+  let hasLiveSuperseder(id: String!): Boolean! {
+    blocks.values.any { b => b.supersedes.contains(id) and isActive(b) }
+  }
+
+  # The ids of the Blocks that list this one in their supersedes — exported
+  # as superseded_by.
+  let supersederIds(id: String!): [String!]! {
     blocks.values
       .filter { b => b.supersedes.contains(id) }
       .map { b => b.address }
-      .join(", ")
+  }
+
+  # superseded_by as exported: empty for an active Block, even one revived
+  # by a blockWrite after something superseded it.
+  let supersededBy(b: Block!): [String!]! {
+    if (b.superseded) { supersederIds(b.address) } else { [] :: [String!]! }
   }
 
   # One compact line of metadata: the only metadata that ever reaches the
@@ -466,20 +951,70 @@ type Context {
     let superseded = if (b.superseded) {
       let by = supersederOf(b.address)
       if (by == "") { "  superseded" } else { `  superseded by ${by}` }
+    } else if (b.dropped) {
+      "  dropped"
     } else {
       ""
     }
-    `${b.address}  ${kindLabel(b.kind)}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
+    let short = shortId(b)
+    let number = if (short == null) { "" } else { "  " + short }
+    `${b.address}  ${kindLabel(b.kind)}${number}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
   }
 
   let headerOf(b: Block!): String! {
     let tags = if (b.tags.isEmpty) { "" } else { " · " + b.tags.map { t => "#" + t }.join(" ") }
     let pin = if (b.pin) { " · pinned" } else { "" }
-    `── ${b.address} · ${kindLabel(b.kind)}${tags}${pin} ──`
+    let short = shortId(b)
+    let number = if (short == null) { "" } else { " · " + short }
+    `── ${b.address} · ${kindLabel(b.kind)}${number}${tags}${pin} ──`
   }
 
   let renderBlock(b: Block!): String! {
     headerOf(b) + "\n" + b.text
+  }
+
+  # What compose appends to a superseded or dropped Block named by id.
+  let statusNote(b: Block!): String! {
+    if (b.superseded) {
+      let by = supersederOf(b.address)
+      if (by == "") {
+        "\n\n(superseded — kept for the reasoning, excluded from composition)"
+      } else if (hasLiveSuperseder(b.address)) {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; the current truth lives there)`
+      } else {
+        "\n\n" + `(superseded by ${by} — kept for the reasoning; nothing active replaces it now)`
+      }
+    } else if (b.dropped) {
+      "\n\n(dropped — kept for the record, excluded from composition; blockWrite at this id revives it)"
+    } else {
+      ""
+    }
+  }
+
+  # context.json for these Blocks: every field, plus question_count, the
+  # highest Q-number this Context ever assigned, so a session importing it
+  # never reuses a forgotten one.
+  let jsonOf(bs: [Block!]!): String! {
+    # Computed outside the record: inside it, `blocks` is the sibling field.
+    let high = maxNumber(blocks.values, questionCount)
+    let doc = {{
+      version: exportVersion,
+      question_count: high,
+      blocks: bs.map { b =>
+        {{
+          id: b.address,
+          kind: kindLabel(b.kind),
+          text: b.text,
+          tags: b.tags,
+          pin: b.pin,
+          status: statusLabel(b),
+          supersedes: b.supersedes,
+          superseded_by: supersededBy(b),
+          number: b.number,
+        }}
+      },
+    }}
+    JSON.encode(doc) + "\n"
   }
 
   # Instructions for the agent holding these tools.
@@ -504,19 +1039,29 @@ type Context {
     left out, and why), then the Blocks, definitions first. Call it
     whenever you are unsure what you know — ALWAYS as your first move after
     a compaction. blockIndex is the cheap one-line-per-block overview;
-    blockRead fetches one Block in full.
+    compose(ids: [...]) reads particular Blocks, superseded and dropped
+    ones included.
 
-    CURATE. A set can have things taken out — its whole advantage over a
-    log. blockPrune drops Blocks that stopped mattering. When a new truth
-    contradicts an old one, do not prune: blockWrite the new Block with
-    supersedes: naming the old — superseded Blocks are kept out of
-    composition but preserved, because the reasoning outlives the
-    conclusion.
+    CURATE. A set can have things taken out of composition — its whole
+    advantage over a log. When a new truth contradicts an old one,
+    blockWrite the new Block with supersedes: naming the old. When a Block
+    stopped mattering and nothing replaces it, blockDrop drops it. Either
+    way it is kept out of composition but preserved, because the reasoning
+    outlives the conclusion. blockDrop with forget: true deletes outright —
+    only for mistakes and misadventures that would just confuse a future
+    reader.
 
-    PROMOTE what should outlive this session: promote lands a Block as
-    markdown under context/ in your pending changes, to be reviewed and
-    committed alongside the code that motivated it. The in-session set does
-    NOT survive recomposition (install/reload), so promote before those.
+    QUESTIONS get a stable short id, Q-<n>, shown in blockIndex and
+    accepted wherever an id is: cite open questions by it. Answer one by
+    writing the DECISION or FACT that settles it with supersedes: naming
+    the question.
+
+    EXPORT what should outlive this session: exportContext writes the
+    Context into your pending changes — markdown under context/ to commit
+    beside the code that motivated it, or an HTML page and context.json to
+    publish. The in-session set does NOT survive recomposition
+    (install/reload), so export before those. importContext loads an
+    export back: a committed context/, a git URL, or a gist.
 
     If you have a delegation tool, pair them: farm noisy legwork out to a
     sub-agent, then blockWrite only the distilled answer. The exploration

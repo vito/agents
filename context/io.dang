@@ -1,0 +1,271 @@
+# Import/export formats for a Context: front-matter markdown, one JSON
+# document, and the flat layout gists need, plus reading them back from the
+# workspace, a git URL or a gist. Plain-data helpers only; the tools live on
+# Context in main.dang.
+
+# Version of the JSON export. importContext refuses anything newer.
+let exportVersion: Int! = 1
+
+# Gists are flat — one level of files, no "/" in names — so the flat layout
+# writes "facts/foo" as "facts~foo.md". "~" never occurs in a block id
+# (idShape), so the mapping reverses exactly.
+let flatSeparator: String! = "~"
+
+let fileNameFor(id: String!, flat: Boolean!): String! {
+  if (flat) { id.replace("/", flatSeparator) + ".md" } else { id + ".md" }
+}
+
+let idForFile(path: String!): String! {
+  path.trimSuffix(".md").replace(flatSeparator, "/")
+}
+
+let statusLabel(b: Block!): String {
+  if (b.superseded) { "superseded" } else if (b.dropped) { "dropped" } else { null }
+}
+
+# The front matter of an exported Block. superseded_by is derived
+# (see Context.supersededBy), written for readers and ignored on import.
+let frontMatter(b: Block!, supersededBy: [String!]!): String! {
+  YAML.encode({{
+    id: b.address,
+    kind: kindLabel(b.kind),
+    tags: b.tags,
+    pin: b.pin,
+    supersedes: b.supersedes,
+    superseded_by: supersededBy,
+    status: statusLabel(b),
+    number: b.number,
+  }})
+}
+
+let markdownOf(b: Block!, supersededBy: [String!]!): String! {
+  "---\n" + frontMatter(b, supersededBy) + "\n---\n\n" + b.text + "\n"
+}
+
+# Build a Block from imported fields, validated like blockWrite validates —
+# except that supersedes targets may be absent (pruned, or not imported).
+let importedBlock(
+  origin: String!,
+  id: String!,
+  kind: String!,
+  text: String!,
+  tags: [String!]!,
+  pin: Boolean!,
+  supersedes: [String!]!,
+  status: String!,
+  number: Int,
+): Block! {
+  if (!id.containsMatch(idShape)) {
+    raise `${origin}: block id "${id}" is not an address — ids are lowercase and path-shaped, like "facts/engine-caches-by-id"`
+  }
+  if (number != null) {
+    if (number < 1) {
+      raise `${origin}: block "${id}" has number ${toString(number)} — question numbers start at 1`
+    }
+  }
+  let label = kind.trimSpace.toLower
+  let k = kindOrder.find { candidate => kindLabel(candidate) == label }
+  if (k == null) {
+    raise `${origin}: unknown kind "${kind}" — one of ${kindOrder.map { candidate => kindLabel(candidate) }.join(", ")}`
+  }
+  if (text.trimSpace == "") {
+    raise `${origin}: block "${id}" has no text payload`
+  }
+  if (supersedes.contains(id)) {
+    raise `${origin}: block "${id}" cannot supersede itself`
+  }
+  let st = status.trimSpace.toLower
+  if (st != "" and st != "superseded" and st != "dropped" and st != "active") {
+    raise `${origin}: unknown status "${status}" — "superseded", "dropped", or null for an active block`
+  }
+  Block(
+    address: id,
+    kind: k,
+    text: text,
+    tags: tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq,
+    pin: pin,
+    superseded: st == "superseded",
+    supersedes: supersedes,
+    number: number,
+    dropped: st == "dropped",
+  )
+}
+
+# Parse one exported markdown file. Null when it has no front matter (a
+# README beside the blocks, say): the caller reports it as skipped. The id
+# comes from the front matter when present, else from the file's path.
+let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
+  let s = raw.replace("\r\n", "\n")
+  if (!s.hasPrefix("---\n")) {
+    return null
+  }
+  # Prefix the newline back so empty front matter ("---\n---\n") splits too.
+  let parts = ("\n" + s.trimPrefix("---\n")).split("\n---\n", limit: 2)
+  if (parts.length < 2) {
+    raise `${origin}: front matter is not closed by a "---" line`
+  }
+  let front = parts[0] ?? ""
+  let body = (parts[1] ?? "").trimPrefix("\n").trimSuffix("\n")
+  let meta: {{id: String, kind: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}} = YAML.decode(front) rescue {
+    e: Error => raise `${origin}: front matter is not valid YAML: ${e.message}`
+  }
+  if (meta == null) {
+    raise `${origin}: front matter is empty — it needs at least a kind`
+  }
+  let kind = meta.kind
+  if (kind == null) {
+    raise `${origin}: front matter has no kind`
+  }
+  importedBlock(
+    origin,
+    meta.id ?? idForFile(path),
+    kind,
+    body,
+    meta.tags ?? [],
+    meta.pin ?? false,
+    meta.supersedes ?? [],
+    meta.status ?? "",
+    meta.number,
+  )
+}
+
+# Parse a context.json document: its Blocks, and the highest question number
+# its Context ever assigned (question_count), so numbers a forgotten
+# question held stay retired in the importing session.
+let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
+  let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}}!]}}! = JSON.decode(raw) rescue {
+    e: Error => raise `${origin}: not a Context export (context.json): ${e.message}`
+  }
+  let version = doc.version ?? exportVersion
+  if (version > exportVersion) {
+    raise `${origin}: export version ${toString(version)} is newer than this module reads (${toString(exportVersion)})`
+  }
+  let entries = doc.blocks
+  if (entries == null) {
+    raise `${origin}: not a Context export (context.json): no "blocks" list`
+  }
+  let parsed = entries.map { e, i =>
+    let at = `${origin} (blocks[${toString(i)}])`
+    let id = e.id
+    if (id == null) {
+      raise `${at}: missing id`
+    }
+    let kind = e.kind
+    if (kind == null) {
+      raise `${at}: missing kind`
+    }
+    importedBlock(at, id, kind, e.text ?? "", e.tags ?? [], e.pin ?? false, e.supersedes ?? [], e.status ?? "", e.number)
+  }
+  {{blocks: parsed, questions: doc.question_count ?? 0}}
+}
+
+# Read the blocks a directory holds: every **/*.md file with front matter,
+# plus the blocks of a context.json at its root that no markdown file
+# carries. Markdown wins on a shared id: a selective exportContext rewrites
+# only some files, so a context.json beside them may be older (a gist's
+# two forms agree, so either would do). Files without front matter are
+# skipped. Only a context.json carries the question high-water mark.
+let readBlocksDir(origin: String!, dir: Directory!): {{blocks: [Block!]!, skipped: [String!]!, questions: Int!}}! {
+  let prefix = if (origin == "") { "" } else { origin + "/" }
+  let fromJson = if (dir.glob("context.json").contains("context.json")) {
+    parseJsonBlocks(prefix + "context.json", dir.file("context.json").contents)
+  } else {
+    {{blocks: [] :: [Block!]!, questions: 0}}
+  }
+  let blocks: [Block!]! = []
+  let skipped: [String!]! = []
+  dir.glob("**/*.md").each { path =>
+    let b = parseMarkdownBlock(prefix + path, path, dir.file(path).contents)
+    if (b == null) {
+      skipped += [prefix + path]
+    } else {
+      blocks += [b]
+    }
+  }
+  let mdIds = blocks.map { b => b.address }
+  {{
+    blocks: fromJson.blocks.reject { b => mdIds.contains(b.address) } + blocks,
+    skipped: skipped,
+    questions: fromJson.questions,
+  }}
+}
+
+# A gist's id: hex, as in https://gist.github.com/<id>.
+let gistIdShape: Regexp! = `^[0-9a-f]{20,}$`
+
+# Read the Blocks importContext's `from` names:
+#   * a gist id, or a gist URL (https://gist.github.com/[<owner>/]<id>[.git])
+#     — its git repository, at its default branch;
+#   * a git URL (https:// ssh:// git@), optionally #<ref> and :<path>, as
+#     in "https://github.com/org/repo#main:context";
+#   * otherwise a workspace path.
+# A path ending in .json is read as a context.json document, anything else
+# as a directory (readBlocksDir).
+let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [String!]!, questions: Int!}}! {
+  let spec = from.trimSpace
+  if (spec == "") {
+    raise "name where to import from: a workspace path, a git URL, or a gist"
+  }
+  let gist = if (spec.containsMatch(gistIdShape)) {
+    spec
+  } else if (spec.hasPrefix("https://gist.github.com/")) {
+    let parts = spec.split("#", limit: 2)
+    let tail = (parts[0] ?? "").trimRight("/").trimSuffix(".git").split("/")
+    let id = tail[tail.length - 1] ?? ""
+    # A #file-<name> anchor (GitHub's link to one file of the gist) is not a
+    # ref; any other fragment is #<ref>[:<path>] as for a git URL.
+    let anchor = parts[1] ?? ""
+    let frag = if (parts.length > 1 and !anchor.hasPrefix("file-")) { "#" + anchor } else { "" }
+    `https://gist.github.com/${id}.git${frag}`
+  } else {
+    null
+  }
+  let target = if (gist == null) { spec } else if (gist.containsMatch(gistIdShape)) { `https://gist.github.com/${gist}.git` } else { gist }
+  let remote = target.hasPrefix("https://") or target.hasPrefix("http://") or
+    target.hasPrefix("ssh://") or target.hasPrefix("git@")
+  if (!remote) {
+    if (target.hasSuffix(".json")) {
+      let doc = parseJsonBlocks(target, source.file(target).contents)
+      return {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
+    }
+    return readBlocksDir(target.trimRight("/"), source.directory(target))
+  }
+  let parts = target.split("#", limit: 2)
+  let url = parts[0] ?? ""
+  let frag = parts[1] ?? ""
+  let refAndPath = frag.split(":", limit: 2)
+  let ref = refAndPath[0] ?? ""
+  let sub = (refAndPath[1] ?? "").trimPrefix("/").trimRight("/")
+  let tree = if (ref == "") { git(url).head(noLock: true).tree } else { git(url).ref(ref, noLock: true).tree }
+  let origin = if (sub == "") { url } else { url + ":" + sub }
+  if (sub.hasSuffix(".json")) {
+    let doc = parseJsonBlocks(origin, tree.file(sub).contents)
+    return {{blocks: doc.blocks, skipped: [] :: [String!]!, questions: doc.questions}}
+  }
+  let dir = if (sub == "") { tree } else { tree.directory(sub) }
+  readBlocksDir(origin, dir)
+}
+
+# Rewrite Q-number citations in a Block's text after an import renumbered
+# questions: renames pairs an old number with its new one.
+let renumberCitations(b: Block!, renames: [{{was: String!, now: String!}}!]!): Block! {
+  if (renames.isEmpty or !b.text.containsMatch(`\bQ-[0-9]+\b`)) {
+    return b
+  }
+  let text = b.text.rewriteMatches(`\bQ-([0-9]+)\b`) { m =>
+    let n = m.captures[0] ?? ""
+    let hit = renames.filter { r => r.was == n }.map { r => "Q-" + r.now }
+    hit[0] ?? m.string
+  }
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: text,
+    tags: b.tags,
+    pin: b.pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: b.number,
+    dropped: b.dropped,
+  )
+}

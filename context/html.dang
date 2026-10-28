@@ -1,0 +1,512 @@
+# exportContext's HTML: a Context rendered as one self-contained page — kind
+# legend and counts, pins, tags, kind/tag filters, a kind × tag matrix, block
+# cards with their markdown rendered, linkified URLs, GitHub refs and block
+# ids, references / referenced-by inferred from block text, supersession, and
+# collapsed superseded and dropped sections. Deterministic (no timestamps),
+# so it caches like every other tool. No external assets: it works from a
+# file, a gist preview, or anywhere else a lone HTML file can be served.
+#
+# Above the fold sit two curated sections made of Blocks, never of separate
+# content: "At a glance" features the Blocks the caller names (lead), and
+# "Open questions" gathers every active QUESTION, those tagged #blocker
+# first. Featured cards are copies; the Blocks list below stays complete.
+
+# The tag that marks a QUESTION as blocking: badged and listed first.
+let blockerTag: String! = "blocker"
+
+let escHtml(s: String!): String! {
+  s.replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&#39;")
+}
+
+# Escape text that must also stay out of the emphasis pass (code, URLs, ids).
+let escLit(s: String!): String! {
+  escHtml(s).replace("*", "&#42;").replace("~", "&#126;")
+}
+
+# One pass over raw inline text; the alternation is ordered, leftmost first:
+#   1 `code`   2,3 [text](url)   4 bare URL   5,6 owner/repo#N   7 #N
+#   8 path-shaped token (a block id when the Context has it)   9 a character
+#   HTML needs escaped   10 a question's Q-number. Everything else passes
+#   through untouched.
+let inlineToken: Regexp! = `\x60([^\x60\n]+)\x60|\[([^\]\n]+)\]\((https?://[^\s)]+)\)|(https?://[^\s<>"'\x60]*[^\s<>"'\x60.,;:!?)\]])|\b([A-Za-z0-9][\w.-]*/[A-Za-z0-9][\w.-]*)#(\d+)\b|\B#(\d+)\b|\b([a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)+)|([&<>"'])|\bQ-(\d+)\b`
+
+let cap(caps: [String!]!, i: Int!): String! {
+  caps[i] ?? ""
+}
+
+# The Block a Q-number names, if the Context has it.
+let numberedId(n: String!, known: Map[Block!]!): String {
+  known.values.filter { b => toString(b.number) == n }.map { b => b.address }[0]
+}
+
+# The known block a path-shaped token names, tolerating trailing sentence
+# punctuation ("see facts/foo.").
+let tokenId(token: String!, known: Map[Block!]!): String {
+  if (known.has(token)) {
+    return token
+  }
+  let core = token.trimRight("._-")
+  if (core != token and known.has(core)) { core } else { null }
+}
+
+# Ids a Block's text mentions: path-shaped tokens and `code` spans naming a
+# Block, itself excluded. These are the "references →" edges.
+let refsOf(b: Block!, known: Map[Block!]!): [String!]! {
+  b.text.matchAll(inlineToken)
+    .map { m =>
+      let code = cap(m.captures, 0)
+      let q = cap(m.captures, 9)
+      if (code != "") {
+        if (known.has(code)) {
+          code
+        } else if (code.containsMatch(shortIdShape)) {
+          numberedId(code.trimPrefix("Q-"), known)
+        } else {
+          null
+        }
+      } else if (q != "") {
+        numberedId(q, known)
+      } else {
+        tokenId(cap(m.captures, 7), known)
+      }
+    }
+    .filter { id => id != null and id != b.address }
+    .map { id => id ?? "" }
+    .uniq
+}
+
+let chipHtml(id: String!, known: Map[Block!]!): String! {
+  let b = known[id]
+  if (b == null) {
+    return "<code>" + escLit(id) + "</code>"
+  }
+  let gone = if (!isActive(b)) { " gone" } else { "" }
+  `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${kindLabel(b.kind).toUpper}">${escLit(id)}</a>`
+}
+
+# A Q-number in text: a chip reading "Q-3", titled with the Block's id.
+let shortChipHtml(n: String!, known: Map[Block!]!): String {
+  let id = numberedId(n, known)
+  if (id == null) {
+    return null
+  }
+  let b = known[id]
+  if (b == null) {
+    return null
+  }
+  let gone = if (!isActive(b)) { " gone" } else { "" }
+  `<a class="chip k-${kindLabel(b.kind)}${gone}" href="#b-${escLit(id)}" title="${escLit(id)}">Q-${n}</a>`
+}
+
+let inlineHtml(s: String!, known: Map[Block!]!, repo: String!): String! {
+  s.rewriteMatches(inlineToken) { m =>
+    let c = m.captures
+    let code = cap(c, 0)
+    let path = cap(c, 7)
+    let q = cap(c, 9)
+    if (code != "") {
+      let qchip = if (code.containsMatch(shortIdShape)) { shortChipHtml(code.trimPrefix("Q-"), known) } else { null }
+      if (known.has(code)) {
+        chipHtml(code, known)
+      } else if (qchip != null) {
+        qchip
+      } else {
+        "<code>" + escLit(code) + "</code>"
+      }
+    } else if (q != "") {
+      shortChipHtml(q, known) ?? ("Q-" + q)
+    } else if (cap(c, 1) != "") {
+      `<a href="${escLit(cap(c, 2))}">${escLit(cap(c, 1))}</a>`
+    } else if (cap(c, 3) != "") {
+      `<a href="${escLit(cap(c, 3))}">${escLit(cap(c, 3))}</a>`
+    } else if (cap(c, 4) != "") {
+      let ref = cap(c, 4) + "#" + cap(c, 5)
+      `<a class="pr" href="https://github.com/${escLit(cap(c, 4))}/issues/${cap(c, 5)}">${escLit(ref)}</a>`
+    } else if (cap(c, 6) != "") {
+      if (repo == "") {
+        "#" + cap(c, 6)
+      } else {
+        `<a class="pr" href="https://github.com/${escLit(repo)}/issues/${cap(c, 6)}">#${cap(c, 6)}</a>`
+      }
+    } else if (path != "") {
+      let id = tokenId(path, known)
+      if (id == null) { escLit(path) } else { chipHtml(id, known) + escLit(path.trimPrefix(id)) }
+    } else {
+      escHtml(m.string)
+    }
+  }
+    .replaceMatches(`\*\*(\S(?:.*?\S)?)\*\*`, with: "<b>$1</b>")
+    .replaceMatches(`~~(\S(?:.*?\S)?)~~`, with: "<s>$1</s>")
+    .replaceMatches(`(^|[^\w*])\*([^*\s](?:[^*]*[^*\s])?)\*`, with: "$1<i>$2</i>")
+}
+
+let tableHtml(rows: [String!]!, known: Map[Block!]!, repo: String!): String! {
+  let cells = rows.map { r => r.trimSpace.trimPrefix("|").trimSuffix("|").split("|").map { c => c.trimSpace } }
+  let isRule = rows.map { r => r.containsMatch(`^\s*\|?[\s:|-]*-[\s:|-]*$`) }
+  let headed = rows.length > 1 and (isRule[1] ?? false)
+  let out = "<table>"
+  cells.each { row, i =>
+    if (isRule[i] ?? false) {
+      continue
+    }
+    let tag = if (headed and i == 0) { "th" } else { "td" }
+    out += "<tr>" + row.map { c => `<${tag}>` + inlineHtml(c, known, repo) + `</${tag}>` }.join("") + "</tr>"
+  }
+  out + "</table>"
+}
+
+# Whatever block-level element is open, closed.
+let flushHtml(mode: String!, para: [String!]!, items: [String!]!, rows: [String!]!, known: Map[Block!]!, repo: String!): String! {
+  if (mode == "p") {
+    "<p>" + inlineHtml(para.join("\n"), known, repo) + "</p>"
+  } else if (mode == "ul" or mode == "ol") {
+    `<${mode}>` + items.map { it => "<li>" + inlineHtml(it, known, repo) + "</li>" }.join("") + `</${mode}>`
+  } else if (mode == "table") {
+    tableHtml(rows, known, repo)
+  } else {
+    ""
+  }
+}
+
+# The markdown agents write in Blocks: paragraphs, bullet and numbered lists
+# (indented lines continue an item), fenced code, headings, quotes, rules and
+# pipe tables; inline code, bold, italics, strikethrough and links.
+let markdownHtml(text: String!, known: Map[Block!]!, repo: String!): String! {
+  let out = ""
+  let mode = ""
+  let para: [String!]! = []
+  let items: [String!]! = []
+  let rows: [String!]! = []
+  let fence: [String!]! = []
+  let inFence = false
+  text.split("\n").each { line =>
+    let t = line.trimSpace
+    if (inFence) {
+      if (t.hasPrefix("```")) {
+        out += "<pre>" + escHtml(fence.join("\n")) + "</pre>"
+        fence = []
+        inFence = false
+      } else {
+        fence += [line]
+      }
+      continue
+    }
+    let kindOf = if (t == "") {
+      "blank"
+    } else if (t.hasPrefix("```")) {
+      "fence"
+    } else if (t.containsMatch(`^#{1,6}\s`)) {
+      "heading"
+    } else if (t.hasPrefix(">")) {
+      "quote"
+    } else if (t.containsMatch(`^(-{3,}|\*{3,}|_{3,})$`)) {
+      "rule"
+    } else if (t.containsMatch(`^[-*+]\s+`)) {
+      "ul"
+    } else if (t.containsMatch(`^\d+[.)]\s+`)) {
+      "ol"
+    } else if (t.hasPrefix("|")) {
+      "table"
+    } else if ((mode == "ul" or mode == "ol") and line.containsMatch(`^\s`)) {
+      "more"
+    } else {
+      "p"
+    }
+    if (kindOf == "more") {
+      let last = items[items.length - 1] ?? ""
+      items = items.dropLast(1) + [last + "\n" + t]
+      continue
+    }
+    if (kindOf != mode or (kindOf != "p" and kindOf != "ul" and kindOf != "ol" and kindOf != "table")) {
+      out += flushHtml(mode, para, items, rows, known, repo)
+      para = []
+      items = []
+      rows = []
+      mode = ""
+    }
+    if (kindOf == "fence") {
+      inFence = true
+    } else if (kindOf == "heading") {
+      out += `<p class="h">` + inlineHtml(t.trimLeft("#").trimSpace, known, repo) + "</p>"
+    } else if (kindOf == "quote") {
+      out += "<blockquote>" + inlineHtml(t.trimPrefix(">").trimSpace, known, repo) + "</blockquote>"
+    } else if (kindOf == "rule") {
+      out += "<hr>"
+    } else if (kindOf == "ul" or kindOf == "ol") {
+      mode = kindOf
+      items += [t.replaceMatches(`^([-*+]|\d+[.)])\s+`, with: "")]
+    } else if (kindOf == "table") {
+      mode = "table"
+      rows += [t]
+    } else if (kindOf == "p") {
+      mode = "p"
+      para += [t]
+    }
+  }
+  if (inFence) {
+    out += "<pre>" + escHtml(fence.join("\n")) + "</pre>"
+  }
+  out + flushHtml(mode, para, items, rows, known, repo)
+}
+
+let contextCss: String! = """
+  :root{--bg:#fbfbfa;--fg:#1d1f21;--mut:#6b7075;--line:#e3e4e2;--card:#fff;
+  --k-glossary:#7a7f86;--k-fact:#2f6fdb;--k-decision:#1f8a4c;--k-design:#7b4fd6;--k-result:#0f8b8d;--k-question:#d9822b;--k-note:#5d6b7a}
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--fg)}
+  main{max-width:1180px;margin:0 auto;padding:24px 28px 80px}
+  h1{font-size:26px;margin:0 0 4px}
+  h2{font-size:20px;margin:40px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line)}
+  h3{font-size:16px;margin:24px 0 8px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+  a{color:#1a5fb4;text-decoration:none}a:hover{text-decoration:underline}
+  code{font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;background:#f0f1ef;padding:1px 4px;border-radius:4px}
+  pre{font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;background:#1e2227;color:#e6e6e6;padding:12px 14px;border-radius:8px;overflow:auto;margin:8px 0}
+  .sub{color:var(--mut)}
+  nav{position:sticky;top:0;background:rgba(251,251,250,.95);backdrop-filter:blur(4px);border-bottom:1px solid var(--line);padding:8px 0;margin:12px 0 0;z-index:5}
+  nav a{margin-right:16px;font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0}
+  .kind{display:inline-block;font:700 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#fff;padding:4px 6px;border-radius:4px;vertical-align:middle}
+  .kind.k-glossary{background:var(--k-glossary)}.kind.k-fact{background:var(--k-fact)}.kind.k-decision{background:var(--k-decision)}
+  .kind.k-design{background:var(--k-design)}.kind.k-result{background:var(--k-result)}.kind.k-question{background:var(--k-question)}.kind.k-note{background:var(--k-note)}
+  .chip{display:inline-block;font:12px/1.3 ui-monospace,Menlo,monospace;padding:1px 6px;border-radius:10px;border:1px solid;margin:1px 0;white-space:nowrap}
+  .chip.k-glossary{color:var(--k-glossary)}.chip.k-fact{color:var(--k-fact)}.chip.k-decision{color:var(--k-decision)}.chip.k-design{color:var(--k-design)}
+  .chip.k-result{color:var(--k-result)}.chip.k-question{color:var(--k-question)}.chip.k-note{color:var(--k-note)}
+  .chip.gone{text-decoration:line-through;opacity:.7}
+  .chip::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:5px;vertical-align:1px}
+  .tag{display:inline-block;font:12px/1.3 ui-monospace,Menlo,monospace;color:var(--mut);background:#eeefec;border-radius:4px;padding:1px 5px;margin:1px 2px 1px 0}
+  .pin{font-size:12px;color:#b03a2e;font-weight:700}
+  .badge{font:700 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#fff;background:#b03a2e;border-radius:4px;padding:4px 6px}
+  a.bid{color:inherit}
+  .qn{font:700 14px ui-monospace,Menlo,monospace;color:var(--k-question)}
+  table{border-collapse:collapse;font-size:13.5px;background:var(--card);margin:8px 0}
+  th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
+  th{background:#f3f4f1}
+  .filters{margin:8px 0 4px;display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+  .filters button{font:12px ui-monospace,Menlo,monospace;border:1px solid var(--line);background:#fff;border-radius:12px;padding:2px 8px;cursor:pointer}
+  .filters button.on{background:#1d1f21;color:#fff;border-color:#1d1f21}
+  .blk{background:var(--card);border:1px solid var(--line);border-top:4px solid var(--k-note);border-radius:8px;padding:10px 14px;margin:12px 0;scroll-margin-top:60px}
+  .blk.k-glossary{border-top-color:var(--k-glossary)}.blk.k-fact{border-top-color:var(--k-fact)}.blk.k-decision{border-top-color:var(--k-decision)}
+  .blk.k-design{border-top-color:var(--k-design)}.blk.k-result{border-top-color:var(--k-result)}.blk.k-question{border-top-color:var(--k-question)}
+  .blk:target{box-shadow:0 0 0 3px #f6d58e}
+  .blk .h{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .blk .bid{font:700 14px ui-monospace,Menlo,monospace}
+  .blk p{margin:6px 0}
+  .blk p.h{font-weight:700}
+  .blk ul,.blk ol{margin:4px 0;padding-left:22px}
+  .blk li{margin:2px 0}
+  .blk blockquote{margin:6px 0;padding:2px 12px;border-left:3px solid var(--line);color:var(--mut)}
+  .blk hr{border:0;border-top:1px solid var(--line)}
+  .blk .links{font-size:12.5px;border-top:1px dashed var(--line);margin-top:8px;padding-top:6px;color:var(--mut)}
+  .blk .links div{margin:2px 0}
+  .blk.hide{display:none}
+  details.sup .blk{opacity:.75}
+  details.sup summary{cursor:pointer;color:var(--mut)}
+  .matrix td{text-align:center;font:12px ui-monospace,Menlo,monospace}
+  .matrix td.l{text-align:left}
+  .matrix td.x{background:#fff4e6;color:#d9822b;font-weight:700}
+  footer{margin-top:50px;color:var(--mut);font-size:13px}
+"""
+
+let contextJs: String! = """
+  (function(){
+    var active={kind:null,tag:null};
+    function apply(){
+      document.querySelectorAll('#blocks-list .blk').forEach(function(el){
+        var ok=true;
+        if(active.kind&&el.dataset.kind!==active.kind)ok=false;
+        if(active.tag&&(' '+el.dataset.tags+' ').indexOf(' '+active.tag+' ')<0)ok=false;
+        el.classList.toggle('hide',!ok);
+      });
+      document.querySelectorAll('.filters button').forEach(function(b){
+        b.classList.toggle('on',active[b.dataset.f]===b.dataset.v);
+      });
+    }
+    document.querySelectorAll('.filters button').forEach(function(b){
+      b.addEventListener('click',function(){
+        if(b.dataset.f==='all'){active={kind:null,tag:null};}
+        else{active[b.dataset.f]=active[b.dataset.f]===b.dataset.v?null:b.dataset.v;}
+        apply();
+      });
+    });
+  })();
+"""
+
+# Render Blocks (in composition order) as the page. lead names Blocks to
+# feature above the fold, in the caller's order; the caller validates it.
+let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!): String! {
+  let known: Map[Block!]! = all.reduce(([:] :: Map[Block!]!)) { acc, b => acc.with(b.address, b) }
+  let active = all.filter { b => isActive(b) }
+  let gone = all.filter { b => b.superseded }
+  let dropped = all.filter { b => b.dropped }
+  let pinned = active.filter { b => b.pin }
+  let refs: Map[[String!]!]! = all.reduce(([:] :: Map[[String!]!]!)) { acc, b => acc.with(b.address, refsOf(b, known)) }
+
+  # Tags of active blocks, most used first (ties: first seen in composition
+  # order — tagCount is a fresh local Map, so its keys keep insertion order),
+  # numbered for the filters' data attributes.
+  let tagCount: Map[Int!]! = [:]
+  active.each { b =>
+    b.tags.each { t => tagCount = tagCount.with(t, (tagCount[t] ?? 0) + 1) }
+  }
+  let tags: [String!]! = []
+  let remaining = tagCount.keys
+  loop {
+    if (remaining.isEmpty) {
+      break
+    }
+    let best = remaining.reduce(0) { m, t =>
+      let n = tagCount[t] ?? 0
+      if (n > m) { n } else { m }
+    }
+    tags += remaining.filter { t => (tagCount[t] ?? 0) == best }
+    remaining = remaining.reject { t => (tagCount[t] ?? 0) == best }
+  }
+  let tagIndex: Map[Int!]! = [:]
+  tags.each { t, i => tagIndex = tagIndex.with(t, i) }
+
+  let kindCount(k: BlockKind!): Int! {
+    active.filter { b => b.kind == k }.length
+  }
+  let kinds = kindOrder.filter { k => kindCount(k) > 0 }
+
+  # A featured card (at a glance, open questions) is a copy: it carries no
+  # anchor and no filter data — its id links to the canonical card in the
+  # Blocks list, which stays complete.
+  let card(b: Block!, featured: Boolean!): String! {
+    let k = kindLabel(b.kind)
+    let tagIds = b.tags.map { t => tagIndex[t] }.filter { i => i != null }.map { i => toString(i) }.join(" ")
+    let open = if (featured) {
+      `<div class="blk k-${k}">`
+    } else {
+      `<div class="blk k-${k}" id="b-${escLit(b.address)}" data-kind="${k}" data-tags="${tagIds}">`
+    }
+    let bid = if (featured) {
+      `<a class="bid" href="#b-${escLit(b.address)}">${escLit(b.address)}</a>`
+    } else {
+      `<span class="bid">${escLit(b.address)}</span>`
+    }
+    let blocker = if (b.kind == BlockKind.QUESTION and isActive(b) and b.tags.contains(blockerTag)) {
+      `<span class="badge">BLOCKER</span>`
+    } else {
+      ""
+    }
+    let short = shortId(b)
+    let qn = if (short == null) { "" } else { `<span class="qn">${short}</span>` }
+    let head = open +
+      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${qn}${bid}${blocker}` +
+      (if (b.pin) { `<span class="pin">📌 pinned</span>` } else { "" }) +
+      b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") +
+      "</div>"
+    let links: [String!]! = []
+    let by = if (b.superseded) {
+      all.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+    } else {
+      [] :: [String!]!
+    }
+    if (!by.isEmpty) {
+      links += ["<div>Superseded by " + by.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
+    } else if (b.superseded) {
+      links += ["<div>Superseded</div>"]
+    } else if (b.dropped) {
+      links += ["<div>Dropped: stopped mattering, with nothing replacing it</div>"]
+    }
+    if (!b.supersedes.isEmpty) {
+      links += ["<div>Supersedes " + b.supersedes.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
+    }
+    let out = refs[b.address] ?? []
+    if (!out.isEmpty) {
+      links += ["<div>References → " + out.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
+    }
+    let back = active.filter { x => (refs[x.address] ?? []).contains(b.address) }.map { x => x.address }
+    if (!back.isEmpty) {
+      links += ["<div>Referenced by ← " + back.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
+    }
+    let foot = if (links.isEmpty) { "" } else { `<div class="links">` + links.join("") + "</div>" }
+    head + markdownHtml(b.text, known, repo) + foot + "</div>\n"
+  }
+
+  let page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)}</title><style>` +
+    contextCss + "</style></head><body><main>\n"
+  let droppedCount = if (dropped.isEmpty) { "" } else { `, ${toString(dropped.length)} dropped` }
+  page += `<h1>${escHtml(title)}</h1><div class="sub">${toString(active.length)} active block(s), ${toString(pinned.length)} pinned, ${toString(gone.length)} superseded${droppedCount}.</div>` + "\n"
+
+  page += `<div class="legend">` + kinds.map { k =>
+    `<span><span class="kind k-${kindLabel(k)}">${kindLabel(k).toUpper}</span> ×${toString(kindCount(k))}</span>`
+  }.join("") + `<span><span class="pin">📌 pinned</span> ×${toString(pinned.length)}</span><span class="sub">(pinned = composed into every turn)</span></div>` + "\n"
+
+  let leading = lead.reduce(([] :: [Block!]!)) { acc, id =>
+    let b = known[id]
+    if (b == null) { acc } else { acc + [b] }
+  }
+  # Open questions: every active QUESTION not already featured, blockers
+  # (#blocker) first, then pinned, each group in composition order.
+  let asked = active.filter { b => b.kind == BlockKind.QUESTION and !lead.contains(b.address) }
+  let blockers = asked.filter { b => b.tags.contains(blockerTag) }
+  let questions = blockers +
+    asked.filter { b => b.pin and !b.tags.contains(blockerTag) } +
+    asked.filter { b => !b.pin and !b.tags.contains(blockerTag) }
+
+  let goneNav = if (gone.isEmpty) { "" } else { `<a href="#superseded">Superseded</a>` }
+  let droppedNav = if (dropped.isEmpty) { "" } else { `<a href="#dropped">Dropped</a>` }
+  let leadNav = if (leading.isEmpty) { "" } else { `<a href="#glance">At a glance</a>` }
+  let askedNav = if (questions.isEmpty) { "" } else { `<a href="#questions">Open questions</a>` }
+  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}${droppedNav}<a href="#about">About</a></nav>` + "\n"
+
+  if (!leading.isEmpty) {
+    page += `<h2 id="glance">At a glance</h2>` + "\n" + leading.map { b => card(b, true) }.join("")
+  }
+  if (!questions.isEmpty) {
+    let blockerNote = if (blockers.isEmpty) { "" } else { `, ${toString(blockers.length)} blocking` }
+    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}: blockers (tagged #${blockerTag}) first, then pinned. Cite one by its Q-number; answering it means writing the decision that supersedes it.</div>` + "\n" +
+      questions.map { b => card(b, true) }.join("")
+  }
+
+  page += `<h2 id="overview">Overview</h2>`
+  if (!pinned.isEmpty) {
+    page += `<h3>Pinned</h3><div>` + pinned.map { b => chipHtml(b.address, known) }.join(" ") + "</div>\n"
+  }
+  if (!tags.isEmpty) {
+    let top = tags.takeFirst(12)
+    page += `<h3>Kind × tag (top tags)</h3><table class="matrix"><tr><th></th>` +
+      top.map { t => `<th>#${escLit(t)}</th>` }.join("") + "</tr>\n"
+    kinds.each { k =>
+      page += `<tr><td class="l"><span class="kind k-${kindLabel(k)}">${kindLabel(k).toUpper}</span></td>` +
+        top.map { t =>
+          let n = active.filter { b => b.kind == k and b.tags.contains(t) }.length
+          if (n == 0) { "<td></td>" } else { `<td class="x">${toString(n)}</td>` }
+        }.join("") + "</tr>\n"
+    }
+    page += "</table>\n"
+  }
+
+  page += `<h2 id="blocks">Blocks</h2><div class="sub">Every active block in composition order: kind, then id. Click a kind or tag to filter.</div>` + "\n"
+  page += `<div class="filters"><button data-f="all" data-v="">all</button>` +
+    kinds.map { k => `<button data-f="kind" data-v="${kindLabel(k)}">${kindLabel(k).toUpper}</button>` }.join("") + "</div>"
+  if (!tags.isEmpty) {
+    page += `<div class="filters">` + tags.map { t, i =>
+      `<button data-f="tag" data-v="${toString(i)}">#${escLit(t)} ×${toString(tagCount[t] ?? 0)}</button>`
+    }.join("") + "</div>"
+  }
+  page += "\n<div id=\"blocks-list\">\n" + active.map { b => card(b, false) }.join("") + "</div>\n"
+
+  if (!gone.isEmpty) {
+    page += `<h2 id="superseded">Superseded</h2><div class="sub">Kept for the reasoning; never composed.</div>` +
+      `<details class="sup"><summary>${toString(gone.length)} superseded block(s)</summary>` + "\n" +
+      gone.map { b => card(b, false) }.join("") + "</details>\n"
+  }
+  if (!dropped.isEmpty) {
+    page += `<h2 id="dropped">Dropped</h2><div class="sub">Stopped mattering with nothing replacing them; kept for the record, never composed.</div>` +
+      `<details class="sup"><summary>${toString(dropped.length)} dropped block(s)</summary>` + "\n" +
+      dropped.map { b => card(b, false) }.join("") + "</details>\n"
+  }
+
+  page += `<h2 id="about">About</h2><ul>` +
+    "<li>Rendered by the context module's <code>exportContext</code> from a session's Context: a set of Blocks held beside the conversation.</li>" +
+    "<li>Links between blocks are inferred from block ids mentioned in block text (references → and referenced by ←), plus each block's <code>supersedes</code> list.</li>" +
+    "</ul>\n"
+  page + "</main><script>" + contextJs + "</script></body></html>\n"
+}
