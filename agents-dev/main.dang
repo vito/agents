@@ -91,6 +91,12 @@ type AgentsDev {
     null
   }
 
+  """Check gistSync's offline validation: flat directories of non-empty files and a real gist reference."""
+  contributorGistSync: Void @check {
+    print(checkContributorGistSync)
+    null
+  }
+
   """Check the read-only contributor role: exactly the read tools, sticky through recomposition and reload, gh write verbs refused, no agent adoption on checkout."""
   contributorReadonly(source: Workspace!): Void @check {
     print(testContributorReadonly(source: source))
