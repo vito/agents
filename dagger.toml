@@ -18,9 +18,6 @@ source = "staff"
 [modules.contributor]
 source = "contributor"
 
-[modules.contributor.settings]
-githubToken = "cmd://gh auth token"
-
 [sdks.dang]
 module = "dang"
 
