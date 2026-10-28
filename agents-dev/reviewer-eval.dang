@@ -366,18 +366,15 @@ let reviewerEvalFixture(source: Workspace!, agents: [String!]!, input: Directory
   dir.withNewFile("dagger.toml", toml.join("\n")).asWorkspace
 }
 
-# The contributor's githubToken setting in the workspace's dagger.toml (a
-# secret reference such as "cmd://gh auth token"), or "".
+# The contributor's githubToken setting in the workspace's effective config
+# (a secret reference such as "cmd://gh auth token"), or "". Effective, so
+# a token set in the user-level config, not dagger.toml, still reaches the
+# fixture: a plain-directory workspace has no git origin to match a
+# user-level entry by.
 let reviewerEvalGithubToken(source: Workspace!): String! {
-  let cfg: {{modules: {{contributor: {{settings: {{githubToken: String}}}}}}!}}! = TOML.decode(source.file("dagger.toml").contents) rescue {
-    e: Error => return ""
+  source.configRead(key: "modules.contributor.settings.githubToken", effective: true) rescue {
+    e: Error => ""
   }
-  let contributor = cfg.modules.contributor
-  if (contributor == null) {
-    return ""
-  }
-  let settings = contributor.settings
-  if (settings == null) { "" } else { settings.githubToken ?? "" }
 }
 
 # What a review's caller composes besides reviewer: committer and
@@ -389,13 +386,11 @@ let reviewerEvalAgents(source: Workspace!): [String!]! {
   if (reviewerEvalEditorSource(source) == "") { local } else { local + ["editor"] }
 }
 
-# The editor module the workspace's dagger.toml installs, or "".
+# The editor module the workspace's effective config installs, or "".
 let reviewerEvalEditorSource(source: Workspace!): String! {
-  let cfg: {{modules: {{editor: {{source: String}}}}!}}! = TOML.decode(source.file("dagger.toml").contents) rescue {
-    e: Error => return ""
+  source.configRead(key: "modules.editor.source", effective: true) rescue {
+    e: Error => ""
   }
-  let editor = cfg.modules.editor
-  if (editor == null) { "" } else { editor.source ?? "" }
 }
 
 # Evaluate reviewer-eval's `fn` in the fixture and read its result file, in
@@ -969,9 +964,11 @@ let checkReviewerEvalScoring(source: Workspace!): String! {
   assert("the dang-187 case is on disk") { names.contains("dang-187") }
   names.each { n => loadReviewerEvalCase(source, n) }
   # What a live run's fixture carries over from this workspace's dagger.toml.
+  # The github token is user-level config, so it may or may not be set here;
+  # reading it must not fail either way.
   let editor = reviewerEvalEditorSource(source)
-  let token = reviewerEvalGithubToken(source)
-  assert("the live fixture carries the editor source and github token") { editor.contains("editor") and token != "" }
+  reviewerEvalGithubToken(source)
+  assert("the live fixture carries the editor source") { editor.contains("editor") }
 
   # Validation catches what it should.
   let bad = decodeReviewerEvalCase(reviewerEvalSyntheticCase
