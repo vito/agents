@@ -103,6 +103,29 @@ let testContextExportRefresh(source: Workspace!): String! {
   let loaded = context.importContext(source: d2.asWorkspace)
   assert { loaded.blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/new") }
   assert { !loaded.compose.contains("old truth") }
+
+  # Switching layout moves the files: one per Block, so it still imports.
+  let d3 = d2.withChanges(second.exportContext(source: d2.asWorkspace, flat: true))
+  assert { d3.glob("context/**/*.md") == ["context/facts~never.md", "context/facts~new.md", "context/facts~old.md"] }
+  assert { context.importContext(source: d3.asWorkspace).blockIndex.contains("facts/old  fact  1 line(s)  superseded by facts/new") }
+
+  # An update without MARKDOWN (the gist recipe) still refreshes the
+  # markdown already there, which would otherwise win on import.
+  let third = second.blockWrite("facts/newer", ContextBlockKind.FACT, "newer truth", supersedes: ["facts/new"])
+  let gistFormats = [ContextExportFormat.JSON, ContextExportFormat.HTML]
+  let d4 = d3.withChanges(third.exportContext(source: d3.asWorkspace, formats: gistFormats))
+  assert { d4.file("context/facts~new.md").contents.contains("status: superseded") }
+  assert { context.importContext(source: d4.asWorkspace).blockIndex.contains("facts/new  fact  1 line(s)  superseded by facts/newer") }
+
+  # A narrower JSON export keeps every Block the copy already held, and the
+  # entries of Blocks this Context lacks.
+  let d5 = d4.withChanges(third.exportContext(source: d4.asWorkspace, formats: [ContextExportFormat.JSON], ids: ["facts/newer"]))
+  let doc: {{blocks: [{{id: String!}}!]!}}! = JSON.decode(d5.file("context/context.json").contents)
+  assert { doc.blocks.map { b => b.id } == ["facts/never", "facts/new", "facts/newer", "facts/old"] }
+  let elsewhere = d5.withFile("context/context.json", jsonOf(context.blockWrite("notes/elsewhere", ContextBlockKind.NOTE, "elsewhere")))
+  let d6 = elsewhere.withChanges(third.exportContext(source: elsewhere.asWorkspace, formats: [ContextExportFormat.JSON], ids: ["facts/newer"]))
+  let json = d6.file("context/context.json").contents
+  assert { json.contains(`"notes/elsewhere"`) and json.contains(`"facts/old"`) }
   "Export refresh checks passed."
 }
 
@@ -411,6 +434,13 @@ let testContextShortIds(source: Workspace!): String! {
   assert { readBlock(mine, "notes/m").contains("blocked on Q-2, not Q-7") }
   assert { readBlock(mine, "Q-1").contains("mine?") }
 
+  # KEEP leaves a clashing question out; citations of it follow the
+  # session's number for it (questions/theirs is Q-2 in mine, Q-1 there).
+  let kept = importJson(mine, jsonOf(context
+    .blockWrite("notes/k", ContextBlockKind.NOTE, "about Q-1")
+    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?")), onConflict: ContextImportConflict.KEEP)
+  assert { readBlock(kept, "notes/k").contains("about Q-2") }
+
   # Re-importing a legacy file with REPLACE keeps the number it got.
   let once = importDir(context, legacy)
   let twice = importDir(once, legacy, onConflict: ContextImportConflict.REPLACE)
@@ -436,6 +466,12 @@ let testContextDrop(source: Workspace!): String! {
   let named = readBlock(dropped, "results/served")
   assert { named.contains("served its purpose") and named.contains("(dropped — kept for the record") }
   assert { named.contains("composed 1 of 3 block(s)") }
+
+  # A read by id alone is just that Block; pins ride along otherwise.
+  let pinned = dropped.blockWrite("facts/pinned", ContextBlockKind.FACT, "always here", pin: true)
+  assert { !readBlock(pinned, "results/served").contains("always here") }
+  assert { pinned.compose.contains("always here") }
+  assert { pinned.compose(tags: ["nope"]).contains("always here") }
 
   # Dropping twice is refused; forget is the explicit way out.
   let again = dropped.blockDrop(["results/served"]).blockIndex rescue { e: Error => e.message }

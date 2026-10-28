@@ -44,9 +44,10 @@
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
 #     fresh module instances, so export anything that must outlive those.
-#   * No @cache(Never) anywhere, deliberately: every tool is a pure function
-#     of (state, args), so a cache replay is indistinguishable from a re-run
-#     — contrast staff/sandbox, whose tools carry real side effects.
+#   * Every tool but importContext is a pure function of (state, args), so
+#     a cache replay is indistinguishable from a re-run — contrast
+#     staff/sandbox, whose tools carry real side effects. importContext is
+#     @cache(Never): a remote it reads (a gist, say) changes in place.
 #
 # Installed in this workspace's dagger.toml, so ambient sessions here carry
 # it; other workspaces install per taste, e.g. `dagger install ./context`.
@@ -295,14 +296,15 @@ type Context {
     """
     tags: [String!]! = [],
     """
-    Pin the Block: composed every time, regardless of selection and budget.
-    For the handful of things every future turn needs.
+    Pin the Block: composed every time, regardless of selection and budget
+    (a read by ids alone returns just those Blocks). For the handful of
+    things every future turn needs.
     """
     pin: Boolean! = false,
     """
     Ids of Blocks this one replaces (a question's Q-number works too). They
     are kept but marked superseded and left out of composition — supersede
-    a contradicted Block rather than pruning it, so the reasoning stays
+    a contradicted Block rather than dropping it, so the reasoning stays
     readable. Answer a QUESTION by writing the DECISION or FACT that settles
     it, superseding the question.
     """
@@ -444,9 +446,9 @@ type Context {
 
   With no selectors this composes every active Block. Selectors union: a
   Block is included when its id, its kind, or any of its tags matches.
-  Pinned Blocks are always included; superseded and dropped Blocks only
-  when named in ids — that is how to read one, with a note on what
-  replaced it.
+  Pinned Blocks are always included, except in a read by ids alone, which
+  returns just those Blocks; superseded and dropped Blocks only when named
+  in ids — that is how to read one, with a note on what replaced it.
 
   Call it whenever you are unsure what you know — and ALWAYS as your first
   move after your conversation has been compacted: the Context lives in
@@ -485,11 +487,14 @@ type Context {
     let wanted = ids.map { id => resolveId(id) }
 
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
+    # A read by id alone (no tags or kinds) is just those Blocks: pins ride
+    # along with every other composition.
+    let readOnly = !ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
     let active = all.filter { b => isActive(b) }
     let selected = all.filter { b =>
       wanted.contains(b.address) or isActive(b) and (
-        b.pin or wantAll or
+        (b.pin and !readOnly) or wantAll or
           kinds.contains(b.kind) or
           b.tags.any { t => tags.contains(t) }
       )
@@ -548,9 +553,11 @@ type Context {
     every Block as a card.
 
   Every Block of every status is exported unless ids, tags or kinds narrow
-  it, e.g. to the decisions a pull request motivated. Markdown files of the
-  Context's Blocks already under path are rewritten either way, so a
-  committed copy never keeps a stale status.
+  it, e.g. to the decisions a pull request motivated. What path already
+  holds stays whole: the Blocks earlier exports put there (in markdown or
+  context.json) are rewritten with their current status, whatever the
+  formats and selection, so a copy never keeps a stale status nor loses a
+  Block to a narrower export.
 
   For a gist: a path of its own, flat, formats HTML and JSON; gistpreview
   renders its index.html, and importContext(from: "<gist id>") reads it
@@ -641,36 +648,75 @@ type Context {
     let into = if (dest == "") { "." } else { dest }
     let prefix = if (into == ".") { "" } else { into + "/" }
     let base = source.directory("/")
+
+    # What path already holds from earlier exports stays whole: whatever the
+    # formats and selection, every Block it held is rewritten with its
+    # current status, so a narrower or partial export never drops a Block
+    # from the copy, nor leaves one stale for an import to bring back.
+    let mdFiles = base.glob(prefix + "**/*.md")
+    let jsonPath = prefix + "context.json"
+    let prior = if (base.glob(jsonPath).contains(jsonPath)) {
+      parseJsonBlocks(jsonPath, base.file(jsonPath).contents).blocks
+    } else {
+      [] :: [Block!]!
+    }
+    let held = mdFiles.map { f => idForFile(f.trimPrefix(prefix)) } + prior.map { b => b.address }
+    let copy = ordered.filter { b => chosen.contains(b.address) or held.contains(b.address) }
+    # Blocks of the old context.json this Context lacks (forgotten, or from
+    # another session) stay as they were, as their markdown files do.
+    let foreign = prior.filter { b => !blocks.has(b.address) }
+    let kept = copy.length - selected.length + foreign.length
+
     let out = base
     let written: [String!]! = []
     let refreshed: [String!]! = []
-    if (formats.contains(ExportFormat.MARKDOWN)) {
+    let moved: [String!]! = []
+    let wantMd = formats.contains(ExportFormat.MARKDOWN)
+    let fresh = if (wantMd) {
+      selected.map { b => prefix + fileNameFor(b.address, flat) }
+    } else {
+      [] :: [String!]!
+    }
+    if (wantMd) {
       selected.each { b =>
         out = out.withNewFile(prefix + fileNameFor(b.address, flat), markdownOf(b, supersededBy(b)))
       }
-      # Files of Blocks already exported here under another name, nested or
-      # flat, or of Blocks outside the selection: their status may have
-      # changed since.
-      let fresh = selected.map { b => prefix + fileNameFor(b.address, flat) }
-      base.glob(prefix + "**/*.md").each { f =>
-        let id = idForFile(f.trimPrefix(prefix))
-        let b = blocks[id]
-        if (b != null and !fresh.contains(f)) {
+      written += [`${toString(selected.length)} markdown file(s)`]
+    }
+    mdFiles.each { f =>
+      let id = idForFile(f.trimPrefix(prefix))
+      let b = blocks[id]
+      if (b != null and !fresh.contains(f)) {
+        if (wantMd and chosen.contains(id)) {
+          # Written just now under the other layout (nested or flat): one
+          # file per Block, or the directory no longer imports.
+          out = out.withoutFile(f)
+          moved += [id]
+        } else {
           out = out.withNewFile(f, markdownOf(b, supersededBy(b)))
           refreshed += [id]
         }
       }
-      written += [`${toString(selected.length)} markdown file(s)`]
     }
     if (formats.contains(ExportFormat.JSON)) {
-      out = out.withNewFile(prefix + "context.json", jsonOf(selected))
+      out = out.withNewFile(jsonPath, jsonOf(copy + foreign))
       written += ["context.json"]
     }
     if (wantHtml) {
-      out = out.withNewFile(prefix + "index.html", contextHtml(selected, title, repo, featured))
+      out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
       written += ["index.html"]
     }
-    let also = if (refreshed.isEmpty) { "" } else { `, refreshing ${refreshed.join(", ")}` }
+    let notes: [String!]! = []
+    if (!refreshed.isEmpty) {
+      notes += ["refreshing " + refreshed.join(", ")]
+    }
+    if (!moved.isEmpty) {
+      notes += ["removing the other layout's file of " + moved.join(", ")]
+    }
+    if (kept > 0 and (formats.contains(ExportFormat.JSON) or wantHtml)) {
+      notes += [`keeping ${toString(kept)} more block(s) already exported here in the copy`]
+    }
+    let also = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
     print(`exported ${toString(selected.length)} block(s) to ${into}/ as ${written.join(", ")}${also} — ` +
       "they are in your pending changes now; review and commit them, or publish them")
     out.changes(from: base)
@@ -706,7 +752,9 @@ type Context {
     REPLACE takes the imported one.
     """
     onConflict: ImportConflict! = ImportConflict.ERROR,
-  ): Context! {
+  ): Context! @cache(policy: FunctionCachePolicy.Never) {
+    # @cache(Never): a git URL or gist resolves live, and a gist is updated
+    # in place, so a later identical import must read it as it is then.
     let read = readFrom(source, from)
     let incoming = read.blocks
     let ids = incoming.map { b => b.address }
@@ -751,6 +799,22 @@ type Context {
     let numbered: [Block!]! = []
     let renames: [{{was: String!, now: String!}}!]! = []
     let renumbered: [String!]! = []
+    # A question KEEP left out stands for the session's Block of that id, so
+    # the imported text's citations of it follow the session's number.
+    if (onConflict == ImportConflict.KEEP) {
+      incoming.each { b =>
+        let prev = blocks[b.address]
+        let pn = if (prev == null) { null } else { prev.number }
+        let n = b.number
+        if (pn != null) {
+          if (n != null) {
+            if (n != pn) {
+              renames += [{{was: toString(n), now: toString(pn)}}]
+            }
+          }
+        }
+      }
+    }
     taken.each { b =>
       let n = b.number
       let prev = blocks[b.address]

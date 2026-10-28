@@ -129,7 +129,7 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
   )
 }
 
-# Parse an exportJson document: its Blocks, and the highest question number
+# Parse a context.json document: its Blocks, and the highest question number
 # its Context ever assigned (question_count), so numbers a forgotten
 # question held stay retired in the importing session.
 let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
@@ -212,7 +212,10 @@ let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [
     let parts = spec.split("#", limit: 2)
     let tail = (parts[0] ?? "").trimRight("/").trimSuffix(".git").split("/")
     let id = tail[tail.length - 1] ?? ""
-    let frag = if (parts.length > 1) { "#" + (parts[1] ?? "") } else { "" }
+    # A #file-<name> anchor (GitHub's link to one file of the gist) is not a
+    # ref; any other fragment is #<ref>[:<path>] as for a git URL.
+    let anchor = parts[1] ?? ""
+    let frag = if (parts.length > 1 and !anchor.hasPrefix("file-")) { "#" + anchor } else { "" }
     `https://gist.github.com/${id}.git${frag}`
   } else {
     null
@@ -233,7 +236,7 @@ let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [
   let refAndPath = frag.split(":", limit: 2)
   let ref = refAndPath[0] ?? ""
   let sub = (refAndPath[1] ?? "").trimPrefix("/").trimRight("/")
-  let tree = if (ref == "") { git(url).head.tree } else { git(url).ref(ref).tree }
+  let tree = if (ref == "") { git(url).head(noLock: true).tree } else { git(url).ref(ref, noLock: true).tree }
   let origin = if (sub == "") { url } else { url + ":" + sub }
   if (sub.hasSuffix(".json")) {
     let doc = parseJsonBlocks(origin, tree.file(sub).contents)
