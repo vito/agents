@@ -229,6 +229,57 @@ let testContextHtml(source: Workspace!): String! {
   "Context HTML and promoteAll checks passed."
 }
 
+# The curated sections: lead Blocks under "At a glance" in the caller's
+# order, then every active QUESTION, #blocker first, then pinned.
+let testContextHtmlCurated(source: Workspace!): String! {
+  let plain = contextIoFixture.exportHtml.contents
+  assert { !plain.contains(`id="glance"`) and !plain.contains(`id="questions"`) }
+
+  let fixture = contextIoFixture
+    .blockWrite("results/status", ContextBlockKind.RESULT, "| pr | state |\n|---|---|\n| #40 | draft |")
+    .blockWrite("questions/a-plain", ContextBlockKind.QUESTION, "plain question")
+    .blockWrite("questions/b-blocks", ContextBlockKind.QUESTION, "blocking question", tags: ["blocker"])
+    .blockWrite("questions/c-pinned", ContextBlockKind.QUESTION, "pinned question", pin: true)
+    .blockWrite("questions/d-led", ContextBlockKind.QUESTION, "led question")
+    .blockWrite("questions/e-old", ContextBlockKind.QUESTION, "old question")
+    .blockWrite("questions/f-new", ContextBlockKind.QUESTION, "new question", supersedes: ["questions/e-old"])
+  let html = fixture.exportHtml(lead: ["results/status", "questions/d-led", "glossary"]).contents
+
+  let afterGlance = html.split(`<h2 id="glance">`)[1] ?? ""
+  let glance = afterGlance.split(`<h2 id="questions">`)[0] ?? ""
+  let afterQuestions = afterGlance.split(`<h2 id="questions">`)[1] ?? ""
+  let questions = afterQuestions.split(`<h2 id="overview">`)[0] ?? ""
+  assert { glance != "" and questions != "" and afterQuestions.contains(`<h2 id="overview">`) }
+  assert { html.contains(`<a href="#glance">At a glance</a><a href="#questions">Open questions</a>`) }
+
+  # Lead keeps the caller's order; featured cards are anchorless copies.
+  let ledOrder = glance.split(`<a class="bid" href="#b-`).dropFirst(1).map { s => s.split(`"`)[0] ?? "" }
+  assert { ledOrder == ["results/status", "questions/d-led", "glossary"] }
+  assert { glance.contains("<th>pr</th>") }
+  assert { html.split(`id="b-results/status"`).length == 2 }
+
+  # Questions: blocker, pinned, then the rest; led and superseded ones out.
+  let asked = questions.split(`<a class="bid" href="#b-`).dropFirst(1).map { s => s.split(`"`)[0] ?? "" }
+  assert { asked == ["questions/b-blocks", "questions/c-pinned", "questions/a-plain", "questions/f-new"] }
+  assert { questions.contains(`<span class="badge">BLOCKER</span>`) and questions.contains("1 blocking") }
+  assert { html.split(`<span class="badge">BLOCKER</span>`).length == 3 }
+
+  # The Blocks list stays complete: every active Block has its one card.
+  assert { html.split(`id="b-questions/d-led"`).length == 2 }
+
+  let unknown = fixture.exportHtml(lead: ["facts/nope"]).contents rescue { e: Error => e.message }
+  assert { unknown.contains(`no block "facts/nope"`) }
+  let stale = fixture.exportHtml(lead: ["questions/e-old"]).contents rescue { e: Error => e.message }
+  assert { stale.contains("it is superseded") and stale.contains("questions/f-new") }
+  let noHtml = source.directory("/").withChanges(fixture.promoteAll(source, lead: ["glossary"])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { noHtml.any { m => m.contains("pass html: true") } }
+  let gist = fixture.exportGist(lead: ["results/status"]).file("index.html").contents
+  assert { gist.contains(`<h2 id="glance">`) }
+  "Context curated HTML checks passed."
+}
+
 let testContextTools: String! {
   let tools = context.agent(llm).tools
   assert { tools.contains("promote") and tools.contains("blockWrite") }

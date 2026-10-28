@@ -5,6 +5,14 @@
 # a collapsed superseded section. Deterministic (no timestamps), so it caches
 # like every other tool. No external assets: it works from a file, a gist
 # preview, or anywhere else a lone HTML file can be served.
+#
+# Above the fold sit two curated sections made of Blocks, never of separate
+# content: "At a glance" features the Blocks the caller names (lead), and
+# "Open questions" gathers every active QUESTION, those tagged #blocker
+# first. Featured cards are copies; the Blocks list below stays complete.
+
+# The tag that marks a QUESTION as blocking: badged and listed first.
+let blockerTag: String! = "blocker"
 
 let escHtml(s: String!): String! {
   s.replace("&", "&amp;")
@@ -232,6 +240,8 @@ let contextCss: String! = """
   .chip::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;margin-right:5px;vertical-align:1px}
   .tag{display:inline-block;font:12px/1.3 ui-monospace,Menlo,monospace;color:var(--mut);background:#eeefec;border-radius:4px;padding:1px 5px;margin:1px 2px 1px 0}
   .pin{font-size:12px;color:#b03a2e;font-weight:700}
+  .badge{font:700 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#fff;background:#b03a2e;border-radius:4px;padding:4px 6px}
+  a.bid{color:inherit}
   table{border-collapse:collapse;font-size:13.5px;background:var(--card);margin:8px 0}
   th,td{border:1px solid var(--line);padding:6px 8px;text-align:left;vertical-align:top}
   th{background:#f3f4f1}
@@ -285,8 +295,9 @@ let contextJs: String! = """
   })();
 """
 
-# Render Blocks (in composition order) as the page.
-let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
+# Render Blocks (in composition order) as the page. lead names Blocks to
+# feature above the fold, in the caller's order; the caller validates it.
+let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!): String! {
   let known: Map[Block!]! = all.reduce(([:] :: Map[Block!]!)) { acc, b => acc.with(b.address, b) }
   let active = all.filter { b => !b.superseded }
   let gone = all.filter { b => b.superseded }
@@ -321,11 +332,29 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
   }
   let kinds = kindOrder.filter { k => kindCount(k) > 0 }
 
-  let card(b: Block!): String! {
+  # A featured card (at a glance, open questions) is a copy: it carries no
+  # anchor and no filter data — its id links to the canonical card in the
+  # Blocks list, which stays complete.
+  let card(b: Block!, featured: Boolean!): String! {
     let k = kindLabel(b.kind)
     let tagIds = b.tags.map { t => tagIndex[t] }.filter { i => i != null }.map { i => toString(i) }.join(" ")
-    let head = `<div class="blk k-${k}" id="b-${escLit(b.address)}" data-kind="${k}" data-tags="${tagIds}">` +
-      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span><span class="bid">${escLit(b.address)}</span>` +
+    let open = if (featured) {
+      `<div class="blk k-${k}">`
+    } else {
+      `<div class="blk k-${k}" id="b-${escLit(b.address)}" data-kind="${k}" data-tags="${tagIds}">`
+    }
+    let bid = if (featured) {
+      `<a class="bid" href="#b-${escLit(b.address)}">${escLit(b.address)}</a>`
+    } else {
+      `<span class="bid">${escLit(b.address)}</span>`
+    }
+    let blocker = if (b.kind == BlockKind.QUESTION and !b.superseded and b.tags.contains(blockerTag)) {
+      `<span class="badge">BLOCKER</span>`
+    } else {
+      ""
+    }
+    let head = open +
+      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${bid}${blocker}` +
       (if (b.pin) { `<span class="pin">📌 pinned</span>` } else { "" }) +
       b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") +
       "</div>"
@@ -363,8 +392,31 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
     `<span><span class="kind k-${kindLabel(k)}">${kindLabel(k).toUpper}</span> ×${toString(kindCount(k))}</span>`
   }.join("") + `<span><span class="pin">📌 pinned</span> ×${toString(pinned.length)}</span><span class="sub">(pinned = composed into every turn)</span></div>` + "\n"
 
+  let leading = lead.reduce(([] :: [Block!]!)) { acc, id =>
+    let b = known[id]
+    if (b == null) { acc } else { acc + [b] }
+  }
+  # Open questions: every active QUESTION not already featured, blockers
+  # (#blocker) first, then pinned, each group in composition order.
+  let asked = active.filter { b => b.kind == BlockKind.QUESTION and !lead.contains(b.address) }
+  let blockers = asked.filter { b => b.tags.contains(blockerTag) }
+  let questions = blockers +
+    asked.filter { b => b.pin and !b.tags.contains(blockerTag) } +
+    asked.filter { b => !b.pin and !b.tags.contains(blockerTag) }
+
   let goneNav = if (gone.isEmpty) { "" } else { `<a href="#superseded">Superseded</a>` }
-  page += `<nav><a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}<a href="#about">About</a></nav>` + "\n"
+  let leadNav = if (leading.isEmpty) { "" } else { `<a href="#glance">At a glance</a>` }
+  let askedNav = if (questions.isEmpty) { "" } else { `<a href="#questions">Open questions</a>` }
+  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}<a href="#about">About</a></nav>` + "\n"
+
+  if (!leading.isEmpty) {
+    page += `<h2 id="glance">At a glance</h2>` + "\n" + leading.map { b => card(b, true) }.join("")
+  }
+  if (!questions.isEmpty) {
+    let blockerNote = if (blockers.isEmpty) { "" } else { `, ${toString(blockers.length)} blocking` }
+    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}: blockers (tagged #${blockerTag}) first, then pinned.</div>` + "\n" +
+      questions.map { b => card(b, true) }.join("")
+  }
 
   page += `<h2 id="overview">Overview</h2>`
   if (!pinned.isEmpty) {
@@ -392,12 +444,12 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!): String! {
       `<button data-f="tag" data-v="${toString(i)}">#${escLit(t)} ×${toString(tagCount[t] ?? 0)}</button>`
     }.join("") + "</div>"
   }
-  page += "\n<div id=\"blocks-list\">\n" + active.map { b => card(b) }.join("") + "</div>\n"
+  page += "\n<div id=\"blocks-list\">\n" + active.map { b => card(b, false) }.join("") + "</div>\n"
 
   if (!gone.isEmpty) {
     page += `<h2 id="superseded">Superseded</h2><div class="sub">Kept for the reasoning; never composed.</div>` +
       `<details class="sup"><summary>${toString(gone.length)} superseded block(s)</summary>` + "\n" +
-      gone.map { b => card(b) }.join("") + "</details>\n"
+      gone.map { b => card(b, false) }.join("") + "</details>\n"
   }
 
   page += `<h2 id="about">About</h2><ul>` +

@@ -494,15 +494,22 @@ type Context {
     GitHub "owner/repo" for bare #123 references in the page, with html.
     """
     repo: String! = "",
+    """
+    Ids of Blocks to feature first in the page, with html (see exportHtml).
+    """
+    lead: [String!]! = [],
   ): Changeset! {
     if (blocks.isEmpty) {
       raise "the Context is empty — nothing to promote"
+    }
+    if (!lead.isEmpty and !html) {
+      raise "lead features Blocks in the HTML page — pass html: true too"
     }
     let dest = path.trimRight("/")
     let into = if (dest == "") { "." } else { dest }
     let base = source.directory("/")
     let landed = base.withDirectory(into, exportMarkdown(flat: flat))
-    let withHtml = if (html) { landed.withFile(into + "/index.html", exportHtml(title: title, repo: repo)) } else { landed }
+    let withHtml = if (html) { landed.withFile(into + "/index.html", exportHtml(title: title, repo: repo, lead: lead)) } else { landed }
     let withJson = if (json) { withHtml.withFile(into + "/context.json", exportJson) } else { withHtml }
     let extras = (if (html) { [into + "/index.html"] } else { [] :: [String!]! }) +
       (if (json) { [into + "/context.json"] } else { [] :: [String!]! })
@@ -556,12 +563,18 @@ type Context {
   }
 
   """
-  Render the whole Context as one self-contained HTML page, context.html:
-  kind legend and counts, pins, kind and tag filters, a kind × tag matrix,
-  every Block as a card with its markdown rendered, block ids, URLs and
-  GitHub refs linked, references and referenced-by inferred from the text,
-  supersession, and the superseded Blocks collapsed at the end. Nothing
-  lands in your pending changes.
+  Render the whole Context as one self-contained HTML page, context.html.
+  Above the fold: "At a glance", the Blocks named in lead, and "Open
+  questions", every active QUESTION Block — tagged #blocker first, badged,
+  then pinned. Then kind legend and counts, pins, kind and tag filters, a
+  kind × tag matrix, every Block as a card with its markdown rendered, block
+  ids, URLs and GitHub refs linked, references and referenced-by inferred
+  from the text, supersession, and the superseded Blocks collapsed at the
+  end. Nothing lands in your pending changes.
+
+  To curate the page, write the curated content as Blocks — a status table,
+  a ship checklist, a code snippet with its permalink — and name them in
+  lead, rather than keeping it anywhere else.
   """
   exportHtml(
     """
@@ -573,8 +586,20 @@ type Context {
     stay text. owner/repo#123 is always linked.
     """
     repo: String! = "",
+    """
+    Ids of active Blocks to feature first, under "At a glance", in this
+    order. An unknown or superseded id is an error, so typos surface.
+    """
+    lead: [String!]! = [],
   ): File! {
-    directory.withNewFile("context.html", contextHtml(ordered, title, repo)).file("context.html")
+    let featured = lead.uniq
+    featured.each { id =>
+      let b = mustGet(id)
+      if (b.superseded) {
+        raise `cannot lead with "${id}": it is superseded — lead with what replaced it (${supersederOf(id)})`
+      }
+    }
+    directory.withNewFile("context.html", contextHtml(ordered, title, repo, featured)).file("context.html")
   }
 
   """
@@ -599,10 +624,14 @@ type Context {
     reading the gist on GitHub. context.json alone round-trips.
     """
     markdown: Boolean! = false,
+    """
+    Ids of Blocks to feature first in the page (see exportHtml).
+    """
+    lead: [String!]! = [],
   ): Directory! {
     let base = if (markdown) { exportMarkdown(flat: true) } else { directory }
     base
-      .withFile("index.html", exportHtml(title: title, repo: repo))
+      .withFile("index.html", exportHtml(title: title, repo: repo, lead: lead))
       .withFile("context.json", exportJson)
   }
 

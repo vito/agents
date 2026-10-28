@@ -97,6 +97,12 @@ type AgentsDev {
     null
   }
 
+  """Check exportHtml's curated sections: lead order, open questions (blockers, then pinned), anchorless featured copies, and lead validation."""
+  contextHtmlCurated(source: Workspace!): Void @check {
+    print(testContextHtmlCurated(source: source))
+    null
+  }
+
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: Void @check {
     print(checkContributorMountsOutsideToolbox)
