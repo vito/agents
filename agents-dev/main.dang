@@ -73,6 +73,24 @@ type AgentsDev {
     null
   }
 
+  """Check exportJson, exportMarkdown (nested and flat), exportGist and the workspace path all round-trip through importBlocks."""
+  contextExportRoundTrip(source: Workspace!): Void @check {
+    print(testContextExportRoundTrip(source: source))
+    null
+  }
+
+  """Check importBlocks' onConflict modes and that invalid files import nothing."""
+  contextImportConflicts(source: Workspace!): Void @check {
+    print(testContextImportConflicts(source: source))
+    null
+  }
+
+  """Check exportHtml's rendering, escaping and links, and what promoteAll lands."""
+  contextHtml(source: Workspace!): Void @check {
+    print(testContextHtml(source: source))
+    null
+  }
+
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: Void @check {
     print(checkContributorMountsOutsideToolbox)

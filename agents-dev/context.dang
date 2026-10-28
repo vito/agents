@@ -18,15 +18,18 @@ let testContextPromotionMetadata(source: Workspace!): String! {
     let parts = contents.trimPrefix("---\n").split("\n---\n\n", limit: 2)
     assert { parts.length == 2 }
     let front = parts[0] ?? ""
-    let metadata: {{kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, status: String}}! = YAML.decode(front)
+    let metadata: {{id: String!, kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, superseded_by: [String!]!, status: String}}! = YAML.decode(front)
+    assert { metadata.id == "facts/current" }
     assert { metadata.kind == "decision" }
     assert { metadata.tags == tags }
     assert { metadata.pin }
     assert { metadata.supersedes == ["facts/old"] }
     let expectedStatus = if (i == 0) { null } else { "superseded" }
     assert { metadata.status == expectedStatus }
+    let expectedBy = if (i == 0) { [] :: [String!]! } else { ["facts/new"] }
+    assert { metadata.superseded_by == expectedBy }
     assert { parts[1] == text + "\n" }
-    let roundtrip: {{kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, status: String}}! = YAML.decode(YAML.encode(metadata))
+    let roundtrip: {{id: String!, kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, superseded_by: [String!]!, status: String}}! = YAML.decode(YAML.encode(metadata))
     assert { roundtrip == metadata }
   }
   "Promotion metadata and payload checks passed."
@@ -45,14 +48,141 @@ let testContextPromotionDefaults(source: Workspace!): String! {
   assert { metadata.tags.isEmpty and metadata.supersedes.isEmpty }
   assert { !metadata.pin and metadata.status == null }
   assert { front.contains("tags: []") and front.contains("supersedes: []") }
+  assert { front.contains("superseded_by: []") and front.contains("id: notes/defaults") }
   assert { front.contains("pin: false") and front.contains("status: null") }
   assert { parts[1] == "plain payload\n" }
   "Promotion default checks passed."
 }
 
+# A Context exercising every field: kinds, special-character tags, pins, a
+# supersession chain, a dangling supersedes (its target pruned), markdown.
+# Ids are written in alphabetical order so map order matches a nested
+# directory's (glob) order.
+let contextIoFixture: Context! {
+  context
+    .blockWrite("decisions/pruned", ContextBlockKind.NOTE, "gone soon")
+    .blockWrite("decisions/x", ContextBlockKind.DECISION,
+      "We **chose** facts/current over `facts/old`; see vito/agents#12 and #34.\n\n- one\n- two\n  continued\n\n| a | b |\n|---|---|\n| <script>alert(1)</script> | https://example.com/?a=1&b=2 |",
+      tags: ["io", "colon: inside", "line\nbreak"], pin: true,
+      supersedes: ["decisions/pruned"])
+    .blockPrune(["decisions/pruned"])
+    .blockWrite("facts/current", ContextBlockKind.FACT, "current\n\n```\ncode ~~here~~\n```\n", tags: ["io"])
+    .blockWrite("facts/old", ContextBlockKind.FACT, "old")
+    .blockWrite("facts/z", ContextBlockKind.FACT, "z", supersedes: ["facts/old"])
+    .blockWrite("glossary", ContextBlockKind.GLOSSARY, "a single-segment id", tags: ["io"])
+}
+
+let sameContext(a: Context!, b: Context!): Boolean! {
+  a.blockIndex == b.blockIndex and a.compose == b.compose and
+    a.blockRead("facts/old") == b.blockRead("facts/old") and
+    a.exportJson.contents == b.exportJson.contents
+}
+
+let testContextExportRoundTrip(source: Workspace!): String! {
+  let fixture = contextIoFixture
+  let json = fixture.exportJson
+  let doc: {{version: Int!, blocks: [{{id: String!, status: String, superseded_by: [String!]!, supersedes: [String!]!}}!]!}}! = JSON.decode(json.contents)
+  assert { doc.version == 1 and doc.blocks.length == 5 }
+  let byId(id: String!): [{{id: String!, status: String, superseded_by: [String!]!, supersedes: [String!]!}}!]! {
+    doc.blocks.filter { b => b.id == id }
+  }
+  assert { byId("facts/old").map { b => b.status } == ["superseded"] }
+  assert { byId("facts/old").map { b => b.superseded_by } == [["facts/z"]] }
+  assert { byId("decisions/x").map { b => b.supersedes } == [["decisions/pruned"]] }
+  assert { byId("decisions/x").map { b => b.superseded_by.isEmpty } == [true] }
+
+  let fromJson = context.importBlocks(source: source, json: json)
+  assert { sameContext(fromJson, fixture) }
+
+  let nested = fixture.exportMarkdown
+  assert { nested.glob("**/*.md").contains("facts/old.md") }
+  assert { sameContext(context.importBlocks(source: source, from: nested), fixture) }
+
+  # Flat files carry their ids in front matter; names are only a fallback.
+  let flat = fixture.exportMarkdown(flat: true)
+  assert { flat.entries.contains("facts~old.md") and !flat.entries.contains("facts/") }
+  assert { sameContext(context.importBlocks(source: source, from: flat), fixture) }
+
+  # Renamed files still import by their front-matter id; a file without an
+  # id falls back to its name (~ read as /); stray files are skipped.
+  let renamed = directory
+    .withFile("one.md", flat.file("facts~old.md"))
+    .withNewFile("notes~no-id.md", "---\nkind: note\n---\n\nfrom the name\n")
+    .withNewFile("README.md", "# not a block\n")
+  let loose = context.importBlocks(source: source, from: renamed)
+  assert { loose.blockRead("facts/old").contains("old") }
+  assert { loose.blockRead("notes/no-id").contains("from the name") }
+
+  # The workspace path: a promoted context/, and a committed .json export.
+  let ws = directory.withDirectory("context", nested).withFile("ctx.json", json).asWorkspace
+  assert { sameContext(context.importBlocks(source: ws), fixture) }
+  assert { sameContext(context.importBlocks(source: ws, path: "ctx.json"), fixture) }
+
+  # The gist bundle: flat, index.html as the entry point, context.json wins.
+  let gist = fixture.exportGist(markdown: true)
+  assert { gist.entries.contains("index.html") and gist.entries.contains("context.json") }
+  assert { gist.entries.contains("facts~old.md") }
+  assert { gist.entries.all { e => !e.hasSuffix("/") } }
+  assert { sameContext(context.importBlocks(source: source, from: gist), fixture) }
+  assert { sameContext(context.importBlocks(source: source, from: fixture.exportGist), fixture) }
+  "Context export/import round-trip checks passed."
+}
+
+let testContextImportConflicts(source: Workspace!): String! {
+  let json = contextIoFixture.exportJson
+  let session = context.blockWrite("facts/current", ContextBlockKind.FACT, "session truth")
+  let refused = session.importBlocks(source: source, json: json).blockIndex rescue {
+    e: Error => e.message
+  }
+  assert { refused.contains("already in the Context: facts/current") }
+  assert { session.blockIndex.contains("1 block(s)") }
+  let kept = session.importBlocks(source: source, json: json, onConflict: ContextImportConflict.KEEP)
+  assert { kept.blockRead("facts/current").contains("session truth") }
+  assert { kept.blockIndex.contains("decisions/x") }
+  let replaced = session.importBlocks(source: source, json: json, onConflict: ContextImportConflict.REPLACE)
+  assert { !replaced.blockRead("facts/current").contains("session truth") }
+
+  let bad = directory.withNewFile("facts/bad.md", "---\nkind: rumor\n---\n\nx\n")
+  let rejected = context.importBlocks(source: source, from: bad).blockIndex rescue {
+    e: Error => e.message
+  }
+  assert { rejected.contains("facts/bad.md") and rejected.contains("unknown kind") }
+  "Context import conflict checks passed."
+}
+
+let testContextHtml(source: Workspace!): String! {
+  let fixture = contextIoFixture
+  let html = fixture.exportHtml(title: "Ctx <&>", repo: "vito/agents").contents
+  assert { html.hasPrefix("<!doctype html>") and html.contains("<title>Ctx &lt;&amp;&gt;</title>") }
+  assert { html.contains(`id="b-decisions/x"`) and html.contains(`data-kind="decision"`) }
+  assert { html.contains(`<a class="chip k-fact" href="#b-facts/current"`) }
+  assert { html.contains(`<a class="chip k-fact gone" href="#b-facts/old"`) }
+  assert { html.contains(`href="https://github.com/vito/agents/issues/12"`) }
+  assert { html.contains(`href="https://github.com/vito/agents/issues/34"`) }
+  assert { html.contains(`href="https://example.com/?a=1&amp;b=2"`) }
+  assert { html.contains("<b>chose</b>") and html.contains("<li>two\ncontinued</li>") }
+  assert { html.contains("<th>a</th>") and html.contains("&lt;script&gt;alert(1)&lt;/script&gt;") }
+  assert { !html.contains("<script>alert") }
+  assert { html.contains("<pre>code ~~here~~</pre>") }
+  assert { html.contains("References → ") and html.contains("Referenced by ← ") }
+  assert { html.contains("Superseded by ") and html.contains(`<code>decisions/pruned</code>`) }
+  assert { html.contains("📌 pinned") and html.contains("1 superseded") }
+  assert { fixture.exportHtml(title: "Ctx <&>", repo: "vito/agents").contents == html }
+
+  let changes = fixture.promoteAll(source, path: "out", flat: true, html: true, json: true)
+  let landed = source.directory("/").withChanges(changes)
+  assert { landed.file("out/facts~old.md").contents == fixture.exportMarkdown(flat: true).file("facts~old.md").contents }
+  assert { landed.file("out/index.html").contents.hasPrefix("<!doctype html>") }
+  assert { landed.file("out/context.json").contents == fixture.exportJson.contents }
+  "Context HTML and promoteAll checks passed."
+}
+
 let testContextTools: String! {
   let tools = context.agent(llm).tools
   assert { tools.contains("promote") and tools.contains("blockWrite") }
+  assert { tools.contains("promoteAll") and tools.contains("importBlocks") }
+  assert { tools.contains("exportJson") and tools.contains("exportMarkdown") }
+  assert { tools.contains("exportHtml") and tools.contains("exportGist") }
   assert { !tools.contains("checkPromotionMetadata") }
   assert { !tools.contains("checkPromotionDefaults") and !tools.contains("checkTools") }
   "Context tool visibility checks passed."
