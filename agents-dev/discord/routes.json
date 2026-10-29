@@ -56,6 +56,17 @@
      "reactions": [{"count": 2, "emoji": {"id": null, "name": "👍"}}],
      "thread": {"id": "300000000000000001", "name": "Release plans", "message_count": 3}}
   ]],
+  "/channels/200000000000000007": [200, {"id": "200000000000000007", "type": 0, "name": "feed", "guild_id": "100000000000000001"}],
+  "/channels/200000000000000007/messages": [200, [
+    {"id": "1235199543214080000", "type": 19, "content": "Me too",
+     "author": {"id": "500000000000000002", "username": "bob"},
+     "message_reference": {"message_id": "1235199039897600000"}},
+    {"id": "1235199291555840000", "type": 0, "content": "v2 is out", "flags": 2,
+     "author": {"id": "500000000000000003", "username": "upstream", "bot": true},
+     "message_reference": {"message_id": "1111111111111111111", "channel_id": "999999999999999999", "guild_id": "888888888888888888"}},
+    {"id": "1235199039897600000", "type": 0, "content": "Release at <t:1714564800000:F>",
+     "author": {"id": "500000000000000001", "username": "alice", "global_name": "Alice"}}
+  ]],
   "/channels/200000000000000002/threads/archived/public": [200, {"has_more": false, "threads": []}],
   "/channels/200000000000000005": [403, {"message": "Missing Access", "code": 50001}],
   "/channels/200000000000000005/messages": [403, {"message": "Missing Access", "code": 50001}],

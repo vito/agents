@@ -134,6 +134,11 @@ let checkDiscordMessages(source: Workspace!): String! {
   # Threads read like channels, headed by their parent.
   let thread = discordFakeOut(fake, "messages", "{\"channel\": \"<#300000000000000001>\"}")
   assert("threads name their channel") { thread.contains("thread \"Release plans\" in #general in Test Server (channel id 300000000000000001)") and thread.contains("No messages yet.") }
+  # Markup and references that are easy to misread.
+  let feed = discordFakeOut(fake, "messages", "{\"channel\": \"200000000000000007\"}")
+  assert("out-of-range timestamps stay as markup") { feed.contains("Release at <t:1714564800000:F>") }
+  assert("crossposts are not replies") { feed.contains("(crossposted from a followed announcement channel)") and !feed.contains("deleted") }
+  assert("a reply whose target was not loaded is not called deleted") { feed.contains("↪ reply to message 1235199039897600000") }
 
   # What a caller can act on.
   let both = discordFakeErr(fake, "messages", "{\"channel\": \"#general\", \"before\": \"1235199039897600000\", \"after\": \"2024-05-01\"}")
@@ -143,7 +148,7 @@ let checkDiscordMessages(source: Workspace!): String! {
   let zero = discordFakeErr(fake, "messages", "{\"channel\": \"#general\", \"limit\": 0}")
   assert("limit is 1 to 100") { zero.contains("between 1 and 100") }
   let secret = discordFakeErr(fake, "messages", "{\"channel\": \"#secret\"}")
-  assert("missing permissions are named") { secret.contains("not allowed to read the messages in #secret") and secret.contains("Read Message History") }
+  assert("missing permissions are named") { secret.contains("not allowed to read the messages in #secret") and secret.contains("Read Message History") and secret.contains("not in that server") }
   let forum = discordFakeErr(fake, "messages", "{\"channel\": \"#help\"}")
   assert("forums point at their threads") { forum.contains("#help is a forum") and forum.contains("discordThreads(channel: \"200000000000000003\")") }
   let nope = discordFakeErr(fake, "messages", "{\"channel\": \"#nope\"}")

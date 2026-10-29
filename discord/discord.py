@@ -73,7 +73,9 @@ SYSTEM_MESSAGES = {
     18: "started a thread",
 }
 THREAD_STARTER = 21
+REPLY = 19
 FORWARD = 1  # message_reference.type
+IS_CROSSPOST = 1 << 1  # message flags
 
 SNOWFLAKE = re.compile(r"^\d{15,21}$")
 LINK = re.compile(
@@ -160,9 +162,11 @@ def http_error(code, data, what):
         )
     if code == 403:
         return (
-            f"The bot is not allowed to read {what}{detail}. It needs the View Channels "
-            "permission there, plus Read Message History for past messages: a server admin "
-            "can grant them to the bot's role, or to the bot on that channel."
+            f"The bot is not allowed to read {what}{detail}. Either the bot is not in that "
+            "server (discordServers lists the servers it is in, and the link that adds it), "
+            "or it lacks the View Channels permission there, plus Read Message History for "
+            "past messages: a server admin can grant them to the bot's role, or to the bot "
+            "on that channel."
         )
     if code == 404:
         return (
@@ -462,12 +466,16 @@ def render_content(text, names):
     text = sub(r"<#(\d+)>", lambda m: names.channel(m.group(1)), text)
     text = re.sub(r"<a?:(\w+):\d+>", r":\1:", text)
     text = re.sub(r"</([\w -]+):\d+>", r"/\1", text)
-    text = sub(
-        r"<t:(-?\d+)(?::[tTdDfFR])?>",
-        lambda m: fmt_time(datetime.fromtimestamp(int(m.group(1)), tz=timezone.utc)),
-        text,
-    )
+    text = sub(r"<t:(-?\d+)(?::[tTdDfFR])?>", lambda m: unix_time(m.group(1)), text)
     return text
+
+
+def unix_time(seconds):
+    """A <t:…> timestamp, or None (keeping the markup) when it is out of range."""
+    try:
+        return fmt_time(datetime.fromtimestamp(int(seconds), tz=timezone.utc))
+    except (ValueError, OverflowError, OSError):
+        return None
 
 
 def render_extras(m, names):
@@ -535,13 +543,17 @@ def render_message(m, names):
                 if msg.get("content"):
                     body.append(indent(render_content(msg["content"], names), "> "))
                 body += [indent(x, "> ") for x in render_extras(msg, names)]
-        elif ref.get("message_id"):
+        elif t == REPLY:
             if replied:
                 who = short_name(replied.get("author") or {})
                 snippet = one_line(render_content(replied.get("content") or "", names))
                 body.append(f'↪ reply to {who} (id {replied["id"]}): "{snippet}"')
+            elif "referenced_message" in m:
+                body.append(f"↪ reply to a deleted message (id {ref.get('message_id')})")
             else:
-                body.append(f"↪ reply to a deleted message (id {ref['message_id']})")
+                body.append(f"↪ reply to message {ref.get('message_id')}")
+        elif int(m.get("flags") or 0) & IS_CROSSPOST:
+            body.append("(crossposted from a followed announcement channel)")
         if m.get("content"):
             body.append(render_content(m["content"], names))
         body += render_extras(m, names)
