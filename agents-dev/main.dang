@@ -145,6 +145,36 @@ type AgentsDev {
     null
   }
 
+  """Check the Discord tools compose, and without a token explain how to set one up."""
+  discordTools: Void @check {
+    print(checkDiscordTools)
+    null
+  }
+
+  """Check Discord servers against a fake API: the bot's servers, its invite link, the content intent, a rejected token."""
+  discordServers(source: Workspace!): Void @check {
+    print(checkDiscordServers(source))
+    null
+  }
+
+  """Check Discord channels against a fake API: categories, nested threads, unreadable channels, servers by name."""
+  discordChannels(source: Workspace!): Void @check {
+    print(checkDiscordChannels(source))
+    null
+  }
+
+  """Check Discord messages against a fake API: rendering, name resolution, links, dates, paging and actionable failures."""
+  discordMessages(source: Workspace!): Void @check {
+    print(checkDiscordMessages(source))
+    null
+  }
+
+  """Check Discord threads against a fake API: active and archived threads, forum tags, archive paging."""
+  discordThreads(source: Workspace!): Void @check {
+    print(checkDiscordThreads(source))
+    null
+  }
+
   """Check the read-only contributor role: exactly the read tools, sticky through recomposition and reload, gh write verbs refused, no agent adoption on checkout."""
   contributorReadonly(source: Workspace!): Void @check {
     print(testContributorReadonly(source: source))

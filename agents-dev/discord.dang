@@ -1,0 +1,168 @@
+# discord.py, the REST client and renderer behind every Discord tool, run
+# against a fake Discord API (agents-dev/discord): canned routes on
+# localhost, every request logged. No network, no real token.
+let discordFake(source: Workspace!): Container! {
+  container
+    .from("python:3.13-alpine")
+    .withEnvVariable("PYTHONIOENCODING", "utf-8")
+    .withFile("/opt/discord/discord.py", source.file("discord/discord.py"))
+    .withFile("/fake.py", source.file("agents-dev/discord/fake-api.py"))
+    .withFile("/routes.json", source.file("agents-dev/discord/routes.json"))
+    .withEnvVariable("DISCORD_API_URL", "http://127.0.0.1:8080")
+    # With its header scheme and a trailing newline, as pasted secrets are.
+    .withEnvVariable("DISCORD_TOKEN", "Bot test-token\n")
+}
+
+# Start the fake, wait for it to listen, run one discord.py command.
+let discordFakeSh: String! = """
+  : > /requests.log
+  python3 /fake.py &
+  i=0
+  until python3 -c 'import socket; socket.create_connection(("127.0.0.1", 8080), 1)' 2>/dev/null; do
+    i=$((i + 1))
+    if [ "$i" -ge 100 ]; then echo "the fake Discord API did not start" >&2; exit 99; fi
+    sleep 0.1
+  done
+  python3 /opt/discord/discord.py "$1" /input.json
+  code=$?
+  kill %1 2>/dev/null
+  exit $code
+"""
+
+let discordFakeRun(fake: Container!, command: String!, input: String!): Container! {
+  fake
+    .withNewFile("/input.json", input)
+    .withExec(["sh", "-c", discordFakeSh, "sh", command], expect: ReturnType.ANY)
+}
+
+# A command's stdout, asserting it succeeded.
+let discordFakeOut(fake: Container!, command: String!, input: String!): String! {
+  let ran = discordFakeRun(fake, command, input).{{exitCode, stdout, stderr}}
+  assert(`discord.py ${command} ${input} succeeds: ${ran.stderr}`) { ran.exitCode == 0 }
+  print(`--- ${command} ${input}\n${ran.stdout}`)
+  ran.stdout
+}
+
+# A command's error, asserting it failed the way a caller can act on.
+let discordFakeErr(fake: Container!, command: String!, input: String!): String! {
+  let ran = discordFakeRun(fake, command, input).{{exitCode, stdout, stderr}}
+  assert(`discord.py ${command} ${input} fails with exit 3: ${ran.stdout}${ran.stderr}`) { ran.exitCode == 3 }
+  ran.stderr
+}
+
+let discordFakeRequests(fake: Container!, command: String!, input: String!): String! {
+  discordFakeRun(fake, command, input).file("/requests.log").contents
+}
+
+let checkDiscordTools: String! {
+  # Without a token every tool is still there, and explains the setup.
+  let unconfigured = discord.discordServers rescue { e: Error => e.message }
+  assert("no token: the error is the setup guide") {
+    unconfigured.contains("No Discord bot token is configured") and unconfigured.contains("Content Intent") and unconfigured.contains("permissions=66560") and unconfigured.contains("dagger settings --global discord botToken")
+  }
+  let messages = discord.discordMessages(channel: "#general") rescue { e: Error => e.message }
+  assert("no token: messages too") { messages.contains("No Discord bot token is configured") }
+  let names = toolNames(discord.agent(llm).tools)
+  print("tools: " + names.join(", "))
+  ["discordServers", "discordChannels", "discordMessages", "discordThreads"].each { n =>
+    assert(`composes ${n}`) { names.contains(n) }
+  }
+  assert("composes nothing else") { names.filter { n => n.hasPrefix("discord") }.length == 4 }
+  "the four tools compose, and each explains the setup without a token"
+}
+
+let checkDiscordServers(source: Workspace!): String! {
+  let fake = discordFake(source)
+  let out = discordFakeOut(fake, "servers", "{}")
+  assert("names the bot") { out.contains("Bot: @reader-bot (user id 400000000000000001)") }
+  assert("lists its servers") { out.contains("- Test Server (id 100000000000000001, ~42 members)") }
+  assert("links the read-only invite") { out.contains("https://discord.com/oauth2/authorize?client_id=700000000000000001&scope=bot&permissions=66560") }
+  assert("warns the content intent is off") { out.contains("Message Content Intent is off") }
+  let bad = discordFakeErr(fake.withEnvVariable("DISCORD_TOKEN", "not-the-token"), "servers", "{}")
+  assert("a rejected token says so") { bad.contains("Discord rejected the bot token") }
+  "servers lists the bot's servers, its invite link and the intent, and a bad token is named"
+}
+
+let checkDiscordChannels(source: Workspace!): String! {
+  let fake = discordFake(source)
+  # No server configured or passed: the bot's only server.
+  let out = discordFakeOut(fake, "channels", "{\"server\": \"\"}")
+  assert("headed by the server") { out.contains("Channels in Test Server (server id 100000000000000001):") }
+  assert("uncategorized channels first") { (out.split("General:")[0] ?? "").contains("#welcome (id 200000000000000006)") }
+  assert("text channels with topics") { out.contains("  #general (id 200000000000000002) — Talk about anything\n") }
+  assert("active threads under their channel") { out.contains("    thread \"Release plans\" (id 300000000000000001, 3 messages)") }
+  assert("forums point at their threads") { out.contains("  #help [forum] (id 200000000000000003) — posts are threads") }
+  assert("unreadable channels are marked") { out.contains("  #secret (id 200000000000000005) — the bot cannot read this") }
+  assert("voice after text") { (out.split("#secret")[1] ?? "").contains("#Lounge [voice]") }
+  let named = discordFakeOut(fake, "channels", "{\"server\": \"test server\"}")
+  assert("servers resolve by name") { named.contains("Channels in Test Server") }
+  let missing = discordFakeErr(fake, "channels", "{\"server\": \"Elsewhere\"}")
+  assert("an unknown server name lists the real ones") { missing.contains("no server named 'Elsewhere'") and missing.contains("Test Server (id 100000000000000001)") }
+  "channels group by category, nest active threads, mark unreadable channels, and resolve servers by name"
+}
+
+let checkDiscordMessages(source: Workspace!): String! {
+  let fake = discordFake(source)
+  let input = "{\"channel\": \"#general\", \"server\": \"\", \"before\": \"\", \"after\": \"\", \"around\": \"\", \"limit\": 50}"
+  let out = discordFakeOut(fake, "messages", input)
+  assert("headed by the channel and server") { out.contains("#general in Test Server (channel id 200000000000000002): 4 messages, oldest first") }
+  assert("oldest first") { !(out.split("· id 1235199039897600000")[0] ?? "Thanks!").contains("Thanks!") }
+  assert("author, time and id") { out.contains("[2024-05-01 12:00 UTC] Alice (@alice) · id 1235199039897600000") }
+  assert("markup resolved to names") { out.contains("Hello @bob, see thread \"Release plans\" and ping @Maintainers :party: at 2024-05-01 12:00 UTC") }
+  assert("attachments") { out.contains("attachment: log.txt (text/plain, 2 KB) https://cdn.example/log.txt") }
+  assert("embeds") { out.contains("embed: Build passed") and out.contains("All green") and out.contains("Duration: 3m") }
+  assert("reactions") { out.contains("reactions: 👍 2") }
+  assert("threads started from a message") { out.contains("thread: \"Release plans\" (id 300000000000000001, 3 messages)") }
+  assert("system messages") { out.contains("* bob joined the server") }
+  assert("edits and replies") {
+    out.contains("[2024-05-01 12:02 UTC] @bob (edited) · id 1235199543214080000") and out.contains("↪ reply to Alice (id 1235199039897600000): \"Hello @bob, the release is out\"")
+  }
+  assert("the whole channel fit") { out.contains("(This is the beginning of the channel.)") and out.contains("(These are the latest messages.)") }
+  assert("blank text with the intent off warns") { out.contains("[2024-05-01 12:03 UTC] @bob · id 1235199794872320000\n  (no text)") and out.contains("Message Content Intent is off") }
+  assert("asks for the latest page") { discordFakeRequests(fake, "messages", input).contains("/channels/200000000000000002/messages?limit=50\n") }
+
+  # A message link reads around the message.
+  let link = "{\"channel\": \"https://discord.com/channels/100000000000000001/200000000000000002/1235199291555840000\"}"
+  assert("a message link reads around it") { discordFakeRequests(fake, "messages", link).contains("around=1235199291555840000") }
+  let around = discordFakeOut(fake, "messages", link)
+  assert("around pages both ways") {
+    around.contains("Older: discordMessages(channel: \"200000000000000002\", before: \"1235199039897600000\")") and around.contains("Newer: discordMessages(channel: \"200000000000000002\", after: \"1235199794872320000\")")
+  }
+  # Dates page by time.
+  let since = "{\"channel\": \"200000000000000002\", \"after\": \"2024-05-01\", \"limit\": 4}"
+  assert("a date becomes a snowflake") { discordFakeRequests(fake, "messages", since).contains("limit=4&after=1235017845964800000") }
+  # Threads read like channels, headed by their parent.
+  let thread = discordFakeOut(fake, "messages", "{\"channel\": \"<#300000000000000001>\"}")
+  assert("threads name their channel") { thread.contains("thread \"Release plans\" in #general in Test Server (channel id 300000000000000001)") and thread.contains("No messages yet.") }
+
+  # What a caller can act on.
+  let both = discordFakeErr(fake, "messages", "{\"channel\": \"#general\", \"before\": \"1235199039897600000\", \"after\": \"2024-05-01\"}")
+  assert("one anchor at a time") { both.contains("Pass only one of") }
+  let vague = discordFakeErr(fake, "messages", "{\"channel\": \"#general\", \"after\": \"yesterday\"}")
+  assert("anchors must be ids, links or dates") { vague.contains("must be a message id, a message link, or a date/time") }
+  let zero = discordFakeErr(fake, "messages", "{\"channel\": \"#general\", \"limit\": 0}")
+  assert("limit is 1 to 100") { zero.contains("between 1 and 100") }
+  let secret = discordFakeErr(fake, "messages", "{\"channel\": \"#secret\"}")
+  assert("missing permissions are named") { secret.contains("not allowed to read the messages in #secret") and secret.contains("Read Message History") }
+  let forum = discordFakeErr(fake, "messages", "{\"channel\": \"#help\"}")
+  assert("forums point at their threads") { forum.contains("#help is a forum") and forum.contains("discordThreads(channel: \"200000000000000003\")") }
+  let nope = discordFakeErr(fake, "messages", "{\"channel\": \"#nope\"}")
+  assert("unknown names point at discordChannels") { nope.contains("No channel or active thread named 'nope' in Test Server") }
+  "messages render oldest first with names, replies, extras and paging, and failures say what to do"
+}
+
+let checkDiscordThreads(source: Workspace!): String! {
+  let fake = discordFake(source)
+  let out = discordFakeOut(fake, "threads", "{\"channel\": \"#help\", \"server\": \"\", \"before\": \"\"}")
+  assert("headed by the forum") { out.contains("Threads in #help in Test Server (channel id 200000000000000003):") }
+  assert("active threads first") { out.contains("Active (0):\n(none)") }
+  assert("archived threads with counts, dates and tags") {
+    out.contains("Archived (2+):") and out.contains("- \"Crash on start\" (id 1213410469478400000, 4 messages, started 2024-03-02, last message 2024-03-02) [bug]") and out.contains("- \"Old question\" (id 1213048081612800000, 1 messages, started 2024-03-01, locked)")
+  }
+  assert("pages archived threads") { out.contains("Older archived threads: discordThreads(channel: \"200000000000000003\", before: \"2024-03-03T09:00:00+00:00\")") }
+  let page = discordFakeRequests(fake, "threads", "{\"channel\": \"200000000000000003\", \"before\": \"2024-03-03T09:00:00+00:00\"}")
+  assert("before reaches the API") { page.contains("before=2024-03-03T09%3A00%3A00%2B00%3A00") }
+  let general = discordFakeOut(fake, "threads", "{\"channel\": \"#general\"}")
+  assert("a text channel's active threads") { general.contains("Active (1):\n- \"Release plans\" (id 300000000000000001, 3 messages") }
+  "threads lists active and archived threads with tags, and pages the archive"
+}

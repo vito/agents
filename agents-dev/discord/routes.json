@@ -1,0 +1,74 @@
+{
+  "/users/@me": [200, {"id": "400000000000000001", "username": "reader-bot", "bot": true}],
+  "/users/@me/guilds": [200, [
+    {"id": "100000000000000001", "name": "Test Server", "approximate_member_count": 42}
+  ]],
+  "/applications/@me": [200, {"id": "700000000000000001", "name": "reader", "flags": 0}],
+  "/guilds/100000000000000001": [200, {
+    "id": "100000000000000001",
+    "name": "Test Server",
+    "owner_id": "900000000000000001",
+    "roles": [
+      {"id": "100000000000000001", "name": "@everyone", "permissions": "66560"},
+      {"id": "600000000000000001", "name": "Maintainers", "permissions": "8"}
+    ]
+  }],
+  "/guilds/100000000000000001/roles": [200, [
+    {"id": "100000000000000001", "name": "@everyone", "permissions": "66560"},
+    {"id": "600000000000000001", "name": "Maintainers", "permissions": "8"}
+  ]],
+  "/guilds/100000000000000001/members/400000000000000001": [200, {
+    "user": {"id": "400000000000000001", "username": "reader-bot", "bot": true},
+    "roles": []
+  }],
+  "/guilds/100000000000000001/channels": [200, [
+    {"id": "200000000000000006", "type": 0, "name": "welcome", "position": 0, "guild_id": "100000000000000001"},
+    {"id": "200000000000000001", "type": 4, "name": "General", "position": 0, "guild_id": "100000000000000001"},
+    {"id": "200000000000000004", "type": 2, "name": "Lounge", "position": 2, "parent_id": "200000000000000001", "guild_id": "100000000000000001"},
+    {"id": "200000000000000002", "type": 0, "name": "general", "position": 0, "parent_id": "200000000000000001", "topic": "Talk about anything", "guild_id": "100000000000000001"},
+    {"id": "200000000000000003", "type": 15, "name": "help", "position": 1, "parent_id": "200000000000000001", "guild_id": "100000000000000001",
+     "available_tags": [{"id": "800000000000000001", "name": "bug"}]},
+    {"id": "200000000000000005", "type": 0, "name": "secret", "position": 3, "parent_id": "200000000000000001", "guild_id": "100000000000000001",
+     "permission_overwrites": [{"id": "100000000000000001", "type": 0, "allow": "0", "deny": "1024"}]}
+  ]],
+  "/guilds/100000000000000001/threads/active": [200, {"threads": [
+    {"id": "300000000000000001", "type": 11, "name": "Release plans", "parent_id": "200000000000000002", "guild_id": "100000000000000001",
+     "message_count": 3, "thread_metadata": {"archived": false}}
+  ]}],
+  "/channels/200000000000000002": [200, {"id": "200000000000000002", "type": 0, "name": "general", "guild_id": "100000000000000001"}],
+  "/channels/200000000000000002/messages": [200, [
+    {"id": "1235199794872320000", "type": 0, "content": "",
+     "author": {"id": "500000000000000002", "username": "bob"}},
+    {"id": "1235199543214080000", "type": 19, "content": "Thanks!", "edited_timestamp": "2024-05-01T12:05:00+00:00",
+     "author": {"id": "500000000000000002", "username": "bob"},
+     "message_reference": {"message_id": "1235199039897600000", "channel_id": "200000000000000002"},
+     "referenced_message": {"id": "1235199039897600000", "type": 0, "content": "Hello <@500000000000000002>, the release is out",
+       "author": {"id": "500000000000000001", "username": "alice", "global_name": "Alice"},
+       "mentions": [{"id": "500000000000000002", "username": "bob"}]}},
+    {"id": "1235199291555840000", "type": 7, "content": "",
+     "author": {"id": "500000000000000002", "username": "bob"}},
+    {"id": "1235199039897600000", "type": 0,
+     "content": "Hello <@500000000000000002>, see <#300000000000000001> and ping <@&600000000000000001> <:party:777777777777777777> at <t:1714564800:R>",
+     "author": {"id": "500000000000000001", "username": "alice", "global_name": "Alice"},
+     "mentions": [{"id": "500000000000000002", "username": "bob"}],
+     "attachments": [{"filename": "log.txt", "size": 2048, "content_type": "text/plain", "url": "https://cdn.example/log.txt"}],
+     "embeds": [{"type": "rich", "title": "Build passed", "description": "All green", "fields": [{"name": "Duration", "value": "3m"}]}],
+     "reactions": [{"count": 2, "emoji": {"id": null, "name": "👍"}}],
+     "thread": {"id": "300000000000000001", "name": "Release plans", "message_count": 3}}
+  ]],
+  "/channels/200000000000000002/threads/archived/public": [200, {"has_more": false, "threads": []}],
+  "/channels/200000000000000005": [403, {"message": "Missing Access", "code": 50001}],
+  "/channels/200000000000000005/messages": [403, {"message": "Missing Access", "code": 50001}],
+  "/channels/200000000000000003": [200, {"id": "200000000000000003", "type": 15, "name": "help", "guild_id": "100000000000000001",
+    "available_tags": [{"id": "800000000000000001", "name": "bug"}]}],
+  "/channels/200000000000000003/threads/archived/public": [200, {"has_more": true, "threads": [
+    {"id": "1213410469478400000", "type": 11, "name": "Crash on start", "parent_id": "200000000000000003",
+     "message_count": 4, "last_message_id": "1213410469478400000", "applied_tags": ["800000000000000001"],
+     "thread_metadata": {"archived": true, "archive_timestamp": "2024-03-05T09:00:00+00:00"}},
+    {"id": "1213048081612800000", "type": 11, "name": "Old question", "parent_id": "200000000000000003",
+     "message_count": 1, "thread_metadata": {"archived": true, "archive_timestamp": "2024-03-03T09:00:00+00:00", "locked": true}}
+  ]}],
+  "/channels/300000000000000001": [200, {"id": "300000000000000001", "type": 11, "name": "Release plans",
+    "parent_id": "200000000000000002", "guild_id": "100000000000000001"}],
+  "/channels/300000000000000001/messages": [200, []]
+}
