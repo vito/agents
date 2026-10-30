@@ -21,11 +21,15 @@
 # `before`/`after` take dates as well as message ids, so "what happened
 # since Monday" is one call.
 #
-# Configuration lives in module settings, not tool arguments:
-# `botToken` is personal, so it belongs in user-level configuration, and
-# reaches the container only as a secret env var. `server` is the project's
-# Discord server, so it belongs in dagger.toml; with it, channel names
-# resolve without the agent having to ask which server.
+# Configuration lives in module settings, not tool arguments. Unlike a
+# GitHub token, `botToken` is not personal: the bot is the team's. So the
+# intended setup is one bot per team, its token in a shared secret manager,
+# and the secret's reference (op://…, never the token) committed to
+# dagger.toml, so every teammate with vault access gets working tools with
+# no setup of their own. The token reaches the container only as a secret
+# env var. `server` is the project's Discord server, also in dagger.toml;
+# with it, channel names resolve without the agent having to ask which
+# server.
 
 # Raised by every tool when no token is configured. It is also the setup
 # guide, since it is what the user sees first.
@@ -42,12 +46,16 @@ let noTokenError: String! = """
      https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&scope=bot&permissions=66560
      with APPLICATION_ID from the application's General Information page.
      That asks for View Channels and Read Message History, nothing else.
-  4. Hand the token to this module in your user-level configuration, e.g.
-     from an environment variable:
+  4. Store the token in your team's secret manager, and commit a reference
+     to it (never the token itself) in the project's dagger.toml, so every
+     teammate with access gets it, e.g. from 1Password:
+
+         [modules.discord.settings]
+         botToken = "op://Engineering/Discord bot/credential"
+
+     For a bot of your own, set it in user-level configuration instead:
 
          dagger settings --global discord botToken 'env://DISCORD_BOT_TOKEN'
-
-     (or 'op://vault/item/field' from 1Password, 'file:///path/to/token').
   """
 
 """
@@ -64,8 +72,14 @@ type Discord {
   new(
     """
     The token of the Discord bot to read as (Developer Portal → your
-    application → Bot → Reset Token). It is personal, so set it in your
-    user-level configuration rather than the project's dagger.toml:
+    application → Bot → Reset Token). The bot is the team's, so keep the
+    token in a shared secret manager and commit only its reference to the
+    project's dagger.toml; everyone with access to the secret is set up:
+
+        [modules.discord.settings]
+        botToken = "op://Engineering/Discord bot/credential"
+
+    For a bot of your own, use user-level configuration instead:
 
         dagger settings --global discord botToken 'env://DISCORD_BOT_TOKEN'
 

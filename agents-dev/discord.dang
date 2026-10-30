@@ -58,7 +58,7 @@ let checkDiscordTools: String! {
   # Without a token every tool is still there, and explains the setup.
   let unconfigured = discord.discordServers rescue { e: Error => e.message }
   assert("no token: the error is the setup guide") {
-    unconfigured.contains("No Discord bot token is configured") and unconfigured.contains("Content Intent") and unconfigured.contains("permissions=66560") and unconfigured.contains("dagger settings --global discord botToken")
+    unconfigured.contains("No Discord bot token is configured") and unconfigured.contains("Content Intent") and unconfigured.contains("permissions=66560") and unconfigured.contains("botToken = \"op://") and unconfigured.contains("dagger settings --global discord botToken")
   }
   let messages = discord.discordMessages(channel: "#general") rescue { e: Error => e.message }
   assert("no token: messages too") { messages.contains("No Discord bot token is configured") }
