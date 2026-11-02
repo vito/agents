@@ -103,9 +103,15 @@ type AgentsDev {
     null
   }
 
-  """Check the exported HTML's curated sections: lead order, open questions (blockers, then pinned), anchorless featured copies, and lead validation."""
+  """Check the exported HTML's curated sections: lead order, open questions (by priority, then blockers, then pinned; unprioritized last), anchorless featured copies, and lead validation."""
   contextHtmlCurated(source: Workspace!): Void @check {
     print(testContextHtmlCurated(source: source))
+    null
+  }
+
+  """Check structured questions: blockWrite's required priority and summary, ordering by priority, exact round trips of their fields, older exports' defaults, and questions.html."""
+  contextQuestions(source: Workspace!): Void @check {
+    print(testContextQuestions(source: source))
     null
   }
 
