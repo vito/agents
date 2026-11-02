@@ -8,10 +8,19 @@
 #
 # Above the fold sit two curated sections made of Blocks, never of separate
 # content: "At a glance" features the Blocks the caller names (lead), and
-# "Open questions" gathers every active QUESTION, those tagged #blocker
-# first. Featured cards are copies; the Blocks list below stays complete.
+# "Open questions" gathers every active QUESTION by priority, linking to
+# questions.html. Featured cards are copies; the Blocks list below stays
+# complete.
+#
+# questions.html (questionsHtml) is the page to answer them from: each open
+# question with its priority, what it blocks, its summary, its text folded
+# away, its options as radio buttons, a notes box, and buttons that build a
+# prompt citing Q-numbers to paste back to the agent. Answers are kept in
+# the browser's localStorage; the page itself stays static.
 
-# The tag that marks a QUESTION as blocking: badged and listed first.
+# The tag that marked a QUESTION as blocking before priorities existed:
+# still badged, and listed first among questions of the same priority (in
+# practice, among the unprioritized ones a priority-less export carries).
 let blockerTag: String! = "blocker"
 
 let escHtml(s: String!): String! {
@@ -253,6 +262,50 @@ let markdownHtml(text: String!, known: Map[Block!]!, repo: String!): String! {
   out + flushHtml(mode, para, items, rows, known, repo)
 }
 
+# A question's priority badge; an open question recorded without one says so.
+let prioHtml(b: Block!): String! {
+  let p = priorityLabel(b)
+  if (p != null) {
+    `<span class="prio ${p.toLower}">${p}</span>`
+  } else if (isActive(b)) {
+    `<span class="prio pn">unprioritized</span>`
+  } else {
+    ""
+  }
+}
+
+# What a question holds up, as a badge; nothing when nothing waits on it.
+let holdsHtml(b: Block!, known: Map[Block!]!, repo: String!): String! {
+  if (b.blocks == "") { "" } else { `<span class="holds">blocks: ${inlineHtml(b.blocks, known, repo)}</span>` }
+}
+
+let summaryHtml(b: Block!, known: Map[Block!]!, repo: String!): String! {
+  if (b.summary == "") { "" } else { `<p class="tldr">${inlineHtml(b.summary, known, repo)}</p>` }
+}
+
+let recHtml: String! = `<span class="rec">RECOMMENDED</span>`
+
+let optionsHtml(b: Block!, known: Map[Block!]!, repo: String!): String! {
+  if (b.options.isEmpty) {
+    return ""
+  }
+  `<ul class="opts">` + b.options.map { o =>
+    `<li><b>${escLit(o.key)}.</b> ${inlineHtml(o.text, known, repo)}` + (if (o.recommended) { recHtml } else { "" }) + "</li>"
+  }.join("") + "</ul>"
+}
+
+# Open questions in page order: by priority (questionRank, unprioritized
+# last), each rank #blocker ones first, then pinned, then the rest, each
+# group in composition order.
+let byUrgency(qs: [Block!]!): [Block!]! {
+  questionRanks.reduce(([] :: [Block!]!)) { acc, r =>
+    let rank = qs.filter { b => questionRank(b) == r }
+    acc + rank.filter { b => b.tags.contains(blockerTag) } +
+      rank.filter { b => b.pin and !b.tags.contains(blockerTag) } +
+      rank.filter { b => !b.pin and !b.tags.contains(blockerTag) }
+  }
+}
+
 let contextCss: String! = """
   :root{--bg:#fbfbfa;--fg:#1d1f21;--mut:#6b7075;--line:#e3e4e2;--card:#fff;
   --k-glossary:#7a7f86;--k-fact:#2f6fdb;--k-decision:#1f8a4c;--k-design:#7b4fd6;--k-result:#0f8b8d;--k-question:#d9822b;--k-note:#5d6b7a}
@@ -308,6 +361,14 @@ let contextCss: String! = """
   .matrix td{text-align:center;font:12px ui-monospace,Menlo,monospace}
   .matrix td.l{text-align:left}
   .matrix td.x{background:#fff4e6;color:#d9822b;font-weight:700}
+  .prio{font:700 10.5px/1 ui-monospace,Menlo,monospace;letter-spacing:.05em;color:#fff;background:#8a8f96;border-radius:4px;padding:4px 6px}
+  .prio.p0{background:#c0392b}.prio.p1{background:#d9822b}.prio.p2{background:#2f6fdb}.prio.p3{background:#7a7f86}
+  .prio.pn{background:#fff;color:var(--mut);border:1px dashed var(--mut);padding:3px 5px}
+  .holds{font-size:12px;font-weight:600;color:#8a2a1c;background:#fbe9e5;border-radius:4px;padding:2px 6px}
+  .blk p.tldr{font-weight:600;margin:8px 0}
+  .blk ul.opts{list-style:none;padding-left:0}
+  .blk ul.opts li{border:1px solid var(--line);border-radius:6px;padding:4px 8px;margin:4px 0}
+  .rec{color:#1f8a4c;font:700 10.5px ui-monospace,Menlo,monospace;letter-spacing:.05em;margin-left:8px}
   footer{margin-top:50px;color:var(--mut);font-size:13px}
 """
 
@@ -396,8 +457,11 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     }
     let short = shortId(b)
     let qn = if (short == null) { "" } else { `<span class="qn">${short}</span>` }
+    let asks = b.kind == BlockKind.QUESTION
+    let prio = if (asks) { prioHtml(b) } else { "" }
+    let holds = if (asks and isActive(b)) { holdsHtml(b, known, repo) } else { "" }
     let head = open +
-      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${qn}${bid}${blocker}` +
+      `<div class="h"><span class="kind k-${k}">${k.toUpper}</span>${qn}${prio}${bid}${blocker}${holds}` +
       (if (b.pin) { `<span class="pin">📌 pinned</span>` } else { "" }) +
       b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") +
       "</div>"
@@ -426,7 +490,7 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
       links += ["<div>Referenced by ← " + back.map { x => chipHtml(x, known) }.join(" ") + "</div>"]
     }
     let foot = if (links.isEmpty) { "" } else { `<div class="links">` + links.join("") + "</div>" }
-    head + markdownHtml(b.text, known, repo) + foot + "</div>\n"
+    head + summaryHtml(b, known, repo) + markdownHtml(b.text, known, repo) + optionsHtml(b, known, repo) + foot + "</div>\n"
   }
 
   let page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)}</title><style>` +
@@ -442,26 +506,26 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     let b = known[id]
     if (b == null) { acc } else { acc + [b] }
   }
-  # Open questions: every active QUESTION not already featured, blockers
-  # (#blocker) first, then pinned, each group in composition order.
+  # Open questions: every active QUESTION not already featured, by priority
+  # (unprioritized last), each priority blockers (#blocker) first, then
+  # pinned (byUrgency).
   let asked = active.filter { b => b.kind == BlockKind.QUESTION and !lead.contains(b.address) }
   let blockers = asked.filter { b => b.tags.contains(blockerTag) }
-  let questions = blockers +
-    asked.filter { b => b.pin and !b.tags.contains(blockerTag) } +
-    asked.filter { b => !b.pin and !b.tags.contains(blockerTag) }
+  let questions = byUrgency(asked)
 
   let goneNav = if (gone.isEmpty) { "" } else { `<a href="#superseded">Superseded</a>` }
   let droppedNav = if (dropped.isEmpty) { "" } else { `<a href="#dropped">Dropped</a>` }
   let leadNav = if (leading.isEmpty) { "" } else { `<a href="#glance">At a glance</a>` }
   let askedNav = if (questions.isEmpty) { "" } else { `<a href="#questions">Open questions</a>` }
-  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}${droppedNav}<a href="#about">About</a></nav>` + "\n"
+  let answerNav = if (active.any { b => b.kind == BlockKind.QUESTION }) { `<a href="questions.html">Answer questions ↗</a>` } else { "" }
+  page += `<nav>${leadNav}${askedNav}<a href="#overview">Overview</a><a href="#blocks">Blocks</a>${goneNav}${droppedNav}<a href="#about">About</a>${answerNav}</nav>` + "\n"
 
   if (!leading.isEmpty) {
     page += `<h2 id="glance">At a glance</h2>` + "\n" + leading.map { b => card(b, true) }.join("")
   }
   if (!questions.isEmpty) {
     let blockerNote = if (blockers.isEmpty) { "" } else { `, ${toString(blockers.length)} blocking` }
-    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}: blockers (tagged #${blockerTag}) first, then pinned. Cite one by its Q-number; answering it means writing the decision that supersedes it.</div>` + "\n" +
+    page += `<h2 id="questions">Open questions</h2><div class="sub">Every active QUESTION block${blockerNote}, by priority: P0 first, unprioritized last, and within each, those tagged #${blockerTag} first, then pinned. Cite one by its Q-number; answering it means writing the decision that supersedes it. <a href="questions.html">Answer them in questions.html</a>.</div>` + "\n" +
       questions.map { b => card(b, true) }.join("")
   }
 
@@ -509,4 +573,134 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     "<li>Links between blocks are inferred from block ids mentioned in block text (references → and referenced by ←), plus each block's <code>supersedes</code> list.</li>" +
     "</ul>\n"
   page + "</main><script>" + contextJs + "</script></body></html>\n"
+}
+
+let questionsCss: String! = """
+  main.qs{padding-bottom:240px}
+  .q .answer label{display:block;padding:6px 10px;margin:4px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer}
+  .q .answer label:hover{border-color:#1a5fb4}
+  .q .answer input{margin-right:8px}
+  .blk.q.answered{border-top-color:var(--k-decision)}
+  .q details summary{cursor:pointer;color:#1a5fb4;margin:6px 0}
+  .q textarea{width:100%;min-height:56px;font:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin-top:6px}
+  .q .row{margin-top:6px}
+  button{font:600 13px -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;border:1px solid #1d1f21;background:#1d1f21;color:#fff;border-radius:6px;padding:5px 10px;cursor:pointer}
+  button.secondary{background:#fff;color:#1d1f21}
+  #dock{position:fixed;left:0;right:0;bottom:0;background:rgba(251,251,250,.97);border-top:1px solid var(--line);padding:10px 0;z-index:5}
+  #dock .inner{max-width:1180px;margin:0 auto;padding:0 28px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  #prompt{display:none;width:100%;min-height:120px;font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+  .toast{color:var(--k-decision);font-size:13px}
+"""
+
+# The answering page's script: each question's picked option and notes,
+# kept in localStorage by question id (one store per page title), and the
+# prompts built from them.
+let questionsJs: String! = """
+  (function(){
+    var body=document.body,KEY='context-answers:'+body.dataset.title,state={};
+    try{state=JSON.parse(localStorage.getItem(KEY)||'{}')||{};}catch(e){state={};}
+    function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
+    function entry(id){return state[id]||(state[id]={});}
+    var cards=[].slice.call(document.querySelectorAll('section.q'));
+    function radios(c){return [].slice.call(c.querySelectorAll('input[type=radio]'));}
+    function picked(c){var s=state[c.dataset.id]||{};return radios(c).filter(function(r){return r.value===s.choice;})[0]||null;}
+    function notes(c){return ((state[c.dataset.id]||{}).notes||'').trim();}
+    function answered(c){return !!(picked(c)||notes(c));}
+    function mark(c){c.classList.toggle('answered',answered(c));}
+    function line(c){
+      var r=picked(c),n=notes(c),out='- '+c.dataset.q+' ('+c.dataset.id+') → ';
+      out+=r?r.value+' — '+r.dataset.text:'no option picked';
+      if(n)out+='. Notes: '+n.replace(/\s+/g,' ');
+      return out+'\n';
+    }
+    function preamble(){
+      return 'Answers to open questions (context export "'+body.dataset.title+'"). '+
+        'Answer each one by writing the DECISION that settles it with blockWrite, superseding the question by its Q-number '+
+        '(supersedes: ["Q-<n>"]). Where the notes push back or ask something, reply first instead of deciding.\n\n';
+    }
+    function prompt(){var a=cards.filter(answered);return a.length?preamble()+a.map(line).join(''):'';}
+    function show(t){var p=document.getElementById('prompt');p.style.display='block';p.value=t;}
+    function toast(t){var el=document.getElementById('toast');el.textContent=t;setTimeout(function(){el.textContent='';},2000);}
+    function fallback(t){
+      var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();
+      try{document.execCommand('copy');toast('Copied.');}catch(e){toast('Copy failed: select the prompt and copy it.');}
+      ta.remove();
+    }
+    function copy(t){
+      if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(function(){toast('Copied.');},function(){fallback(t);});}
+      else{fallback(t);}
+    }
+    cards.forEach(function(c){
+      var id=c.dataset.id,s=state[id]||{},ta=c.querySelector('textarea');
+      radios(c).forEach(function(r){
+        r.checked=r.value===s.choice;
+        r.addEventListener('change',function(){entry(id).choice=r.value;save();mark(c);});
+      });
+      ta.value=s.notes||'';
+      ta.addEventListener('input',function(){entry(id).notes=ta.value;save();mark(c);});
+      c.querySelector('button.copy').addEventListener('click',function(){
+        if(!answered(c)){toast('Pick an option or write a note first.');return;}
+        var t=preamble()+line(c);show(t);copy(t);
+      });
+      mark(c);
+    });
+    document.getElementById('gen').addEventListener('click',function(){show(prompt()||'Pick an option or write a note first.');});
+    document.getElementById('copy-all').addEventListener('click',function(){
+      var t=prompt();if(!t){toast('Nothing answered yet.');return;}show(t);copy(t);
+    });
+    document.getElementById('clear').addEventListener('click',function(){
+      if(!confirm('Clear every answer on this page?'))return;
+      state={};save();
+      cards.forEach(function(c){radios(c).forEach(function(r){r.checked=false;});c.querySelector('textarea').value='';mark(c);});
+      var p=document.getElementById('prompt');p.value='';p.style.display='none';
+    });
+  })();
+"""
+
+# questions.html: every active QUESTION by priority (byUrgency), to answer
+# from. The text folds away under the summary (shown open for a question
+# recorded without one, whose text is all there is); options become radio
+# buttons. Block chips link into index.html, written beside it.
+let questionsHtml(all: [Block!]!, title: String!, repo: String!): String! {
+  let known: Map[Block!]! = all.reduce(([:] :: Map[Block!]!)) { acc, b => acc.with(b.address, b) }
+  let asked = byUrgency(all.filter { b => isActive(b) and b.kind == BlockKind.QUESTION })
+  let urgent = asked.filter { b => b.priority == QuestionPriority.P0 }.length
+  let loose = asked.filter { b => b.priority == null }.length
+
+  let card(b: Block!): String! {
+    let id = escLit(b.address)
+    let short = shortId(b) ?? ""
+    let blocker = if (b.tags.contains(blockerTag)) { `<span class="badge">BLOCKER</span>` } else { "" }
+    let head = `<section class="blk k-question q" id="q-${id}" data-id="${id}" data-q="${short}">` +
+      `<div class="h"><span class="qn">${short}</span>${prioHtml(b)}<a class="bid" href="index.html#b-${id}">${id}</a>${blocker}${holdsHtml(b, known, repo)}` +
+      b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") + "</div>"
+    let folded = if (b.summary == "") { "<details open>" } else { "<details>" }
+    let body = summaryHtml(b, known, repo) + folded + "<summary>Background, blast radius and shipping</summary>" +
+      markdownHtml(b.text, known, repo) + "</details>"
+    let choices = `<div class="answer">` + b.options.map { o =>
+      let rec = if (o.recommended) { recHtml } else { "" }
+      `<label><input type="radio" name="q-${id}" value="${escHtml(o.key)}" data-text="${escHtml(o.text)}"><b>${escLit(o.key)}.</b> ${inlineHtml(o.text, known, repo)}${rec}</label>`
+    }.join("") + "</div>"
+    let answer = choices + `<textarea placeholder="Notes, another answer, or a question back…"></textarea>` +
+      `<div class="row"><button class="secondary copy">Copy this answer</button></div>`
+    (head + body + answer + "</section>\n").replace(`href="#b-`, `href="index.html#b-`)
+  }
+
+  let page = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(title)} — open questions</title><style>` +
+    contextCss + questionsCss + `</style></head><body data-title="${escHtml(title)}"><main class="qs">` + "\n"
+  page += `<h1>${escHtml(title)} — open questions</h1>`
+  if (asked.isEmpty) {
+    page += `<div class="sub">No open questions. <a href="index.html">The whole Context</a>.</div>` + "\n"
+  } else {
+    let urgentNote = if (urgent == 0) { "" } else { `, ${toString(urgent)} P0` }
+    let looseNote = if (loose == 0) { "" } else { `, ${toString(loose)} unprioritized` }
+    page += `<div class="sub">${toString(asked.length)} open question(s)${urgentNote}${looseNote}, by priority: P0 first, unprioritized last. ` +
+      "Pick an option for each one you can answer, add notes, then copy the generated prompt back to the agent. " +
+      `Answers stay in this browser only. <a href="index.html">The whole Context</a>.</div>` + "\n"
+    page += asked.map { b => card(b) }.join("")
+  }
+  page += "</main>\n" + `<div id="dock"><div class="inner"><button id="gen">Generate prompt</button><button id="copy-all">Copy prompt</button>` +
+    `<button class="secondary" id="clear">Clear answers</button><span class="toast" id="toast"></span>` +
+    `<textarea id="prompt" readonly></textarea></div></div>` + "\n"
+  page + "<script>" + questionsJs + "</script></body></html>\n"
 }

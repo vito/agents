@@ -24,9 +24,10 @@ let statusLabel(b: Block!): String {
 }
 
 # The front matter of an exported Block. superseded_by is derived
-# (see Context.supersededBy), written for readers and ignored on import.
+# (see Context.supersededBy), written for readers and ignored on import. A
+# QUESTION's own fields follow, only on questions.
 let frontMatter(b: Block!, supersededBy: [String!]!): String! {
-  YAML.encode({{
+  let common = YAML.encode({{
     id: b.address,
     kind: kindLabel(b.kind),
     tags: b.tags,
@@ -35,6 +36,15 @@ let frontMatter(b: Block!, supersededBy: [String!]!): String! {
     superseded_by: supersededBy,
     status: statusLabel(b),
     number: b.number,
+  }})
+  if (b.kind != BlockKind.QUESTION) {
+    return common
+  }
+  common.trimSuffix("\n") + "\n" + YAML.encode({{
+    priority: priorityLabel(b),
+    blocks: b.blocks,
+    summary: b.summary,
+    options: b.options.map { o => {{key: o.key, text: o.text, recommended: o.recommended}} },
   }})
 }
 
@@ -54,6 +64,10 @@ let importedBlock(
   supersedes: [String!]!,
   status: String!,
   number: Int,
+  priority: String!,
+  blocks: String!,
+  summary: String!,
+  options: [{{key: String, text: String, recommended: Boolean}}!]!,
 ): Block! {
   if (!id.containsMatch(idShape)) {
     raise `${origin}: block id "${id}" is not an address — ids are lowercase and path-shaped, like "facts/engine-caches-by-id"`
@@ -78,6 +92,29 @@ let importedBlock(
   if (st != "" and st != "superseded" and st != "dropped" and st != "active") {
     raise `${origin}: unknown status "${status}" — "superseded", "dropped", or null for an active block`
   }
+  # Question fields: absent ones default (an export from before they
+  # existed), and are taken as recorded, without blockWrite's
+  # requirements, so older questions keep loading.
+  let plabel = priority.trimSpace.toUpper
+  let prio = if (plabel == "") { null } else { priorityOrder.find { p => toString(p) == plabel } }
+  if (plabel != "" and prio == null) {
+    raise `${origin}: block "${id}" has unknown priority "${priority}" — one of ${priorityOrder.map { p => toString(p) }.join(", ")}`
+  }
+  let offered = options.map { o, i =>
+    let key = o.key ?? ""
+    let otext = o.text ?? ""
+    if (key.trimSpace == "" or otext.trimSpace == "") {
+      raise `${origin}: option ${toString(i + 1)} of block "${id}" needs a key and a text`
+    }
+    QuestionOption(key: key, text: otext, recommended: o.recommended ?? false)
+  }
+  let keys = offered.map { o => o.key }
+  if (keys.uniq.length != keys.length) {
+    raise `${origin}: block "${id}" has two options with the same key`
+  }
+  if (k != BlockKind.QUESTION and (prio != null or blocks.trimSpace != "" or summary.trimSpace != "" or !offered.isEmpty)) {
+    raise `${origin}: block "${id}" is a ${kindLabel(k)}, but priority, blocks, summary and options belong to a question`
+  }
   Block(
     address: id,
     kind: k,
@@ -88,6 +125,10 @@ let importedBlock(
     supersedes: supersedes,
     number: number,
     dropped: st == "dropped",
+    priority: prio,
+    blocks: blocks,
+    summary: summary,
+    options: offered,
   )
 }
 
@@ -106,7 +147,7 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
   }
   let front = parts[0] ?? ""
   let body = (parts[1] ?? "").trimPrefix("\n").trimSuffix("\n")
-  let meta: {{id: String, kind: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}} = YAML.decode(front) rescue {
+  let meta: {{id: String, kind: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int, priority: String, blocks: String, summary: String, options: [{{key: String, text: String, recommended: Boolean}}!]}} = YAML.decode(front) rescue {
     e: Error => raise `${origin}: front matter is not valid YAML: ${e.message}`
   }
   if (meta == null) {
@@ -126,6 +167,10 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
     meta.supersedes ?? [],
     meta.status ?? "",
     meta.number,
+    meta.priority ?? "",
+    meta.blocks ?? "",
+    meta.summary ?? "",
+    meta.options ?? [],
   )
 }
 
@@ -133,7 +178,7 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
 # its Context ever assigned (question_count), so numbers a forgotten
 # question held stay retired in the importing session.
 let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
-  let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int}}!]}}! = JSON.decode(raw) rescue {
+  let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int, priority: String, blocks: String, summary: String, options: [{{key: String, text: String, recommended: Boolean}}!]}}!]}}! = JSON.decode(raw) rescue {
     e: Error => raise `${origin}: not a Context export (context.json): ${e.message}`
   }
   let version = doc.version ?? exportVersion
@@ -154,7 +199,8 @@ let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questio
     if (kind == null) {
       raise `${at}: missing kind`
     }
-    importedBlock(at, id, kind, e.text ?? "", e.tags ?? [], e.pin ?? false, e.supersedes ?? [], e.status ?? "", e.number)
+    importedBlock(at, id, kind, e.text ?? "", e.tags ?? [], e.pin ?? false, e.supersedes ?? [], e.status ?? "", e.number,
+      e.priority ?? "", e.blocks ?? "", e.summary ?? "", e.options ?? [])
   }
   {{blocks: parsed, questions: doc.question_count ?? 0}}
 }
@@ -246,26 +292,35 @@ let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [
   readBlocksDir(origin, dir)
 }
 
-# Rewrite Q-number citations in a Block's text after an import renumbered
-# questions: renames pairs an old number with its new one.
+# Rewrite Q-number citations in a Block's text, summary and options after
+# an import renumbered questions: renames pairs an old number with its new
+# one.
 let renumberCitations(b: Block!, renames: [{{was: String!, now: String!}}!]!): Block! {
-  if (renames.isEmpty or !b.text.containsMatch(`\bQ-[0-9]+\b`)) {
+  let cites(s: String!): Boolean! { s.containsMatch(`\bQ-[0-9]+\b`) }
+  if (renames.isEmpty or !(cites(b.text) or cites(b.summary) or b.options.any { o => cites(o.text) })) {
     return b
-  }
-  let text = b.text.rewriteMatches(`\bQ-([0-9]+)\b`) { m =>
-    let n = m.captures[0] ?? ""
-    let hit = renames.filter { r => r.was == n }.map { r => "Q-" + r.now }
-    hit[0] ?? m.string
   }
   Block(
     address: b.address,
     kind: b.kind,
-    text: text,
+    text: renumberText(b.text, renames),
     tags: b.tags,
     pin: b.pin,
     superseded: b.superseded,
     supersedes: b.supersedes,
     number: b.number,
     dropped: b.dropped,
+    priority: b.priority,
+    blocks: b.blocks,
+    summary: renumberText(b.summary, renames),
+    options: b.options.map { o => QuestionOption(key: o.key, text: renumberText(o.text, renames), recommended: o.recommended) },
   )
+}
+
+let renumberText(s: String!, renames: [{{was: String!, now: String!}}!]!): String! {
+  s.rewriteMatches(`\bQ-([0-9]+)\b`) { m =>
+    let n = m.captures[0] ?? ""
+    let hit = renames.filter { r => r.was == n }.map { r => "Q-" + r.now }
+    hit[0] ?? m.string
+  }
 }

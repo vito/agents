@@ -87,6 +87,36 @@ enum ExportFormat {
   HTML
 }
 
+"""
+How urgently an open QUESTION needs its answer, P0 first.
+"""
+enum QuestionPriority {
+  P0
+  P1
+  P2
+  P3
+}
+
+"""
+One answer a QUESTION offers.
+"""
+type QuestionOption {
+  """
+  Short key cited in answers: "A", "B", ...
+  """
+  key: String!
+
+  """
+  The answer, in one line.
+  """
+  text: String!
+
+  """
+  The answer the writer would pick.
+  """
+  recommended: Boolean! = false
+}
+
 # Composition order: definitions land before the things that use them; loose
 # ends (questions, notes) last.
 let kindOrder: [BlockKind!]! = [
@@ -101,6 +131,50 @@ let kindOrder: [BlockKind!]! = [
 
 let kindLabel(kind: BlockKind!): String! {
   toString(kind).toLower
+}
+
+let priorityOrder: [QuestionPriority!]! = [
+  QuestionPriority.P0,
+  QuestionPriority.P1,
+  QuestionPriority.P2,
+  QuestionPriority.P3,
+]
+
+let priorityLabel(b: Block!): String {
+  let p = b.priority
+  if (p == null) { null } else { toString(p) }
+}
+
+# Where a question sorts: open ones by priority, P0 (0) to P3 (3), then open
+# ones without a priority (4: recorded before priorities existed), then
+# superseded and dropped ones (5).
+let questionRank(b: Block!): Int! {
+  if (!isActive(b)) {
+    return 5
+  }
+  let p = b.priority
+  if (p == null) {
+    return 4
+  }
+  case (p) {
+    QuestionPriority.P0 => 0
+    QuestionPriority.P1 => 1
+    QuestionPriority.P2 => 2
+    else => 3
+  }
+}
+
+let questionRanks: [Int!]! = [0, 1, 2, 3, 4, 5]
+
+# A question's options are keyed by position: A, B, C, ...
+let optionKey(i: Int!): String! {
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")[i] ?? toString(i + 1)
+}
+
+# One-line fields (summary, blocks, option texts) as written: whitespace
+# runs collapsed, ends trimmed.
+let oneLine(s: String!): String! {
+  s.replaceMatches(`\s+`, with: " ").trimSpace
 }
 
 # Block ids are addresses: lowercase path-shaped segments.
@@ -138,6 +212,10 @@ let asSuperseded(b: Block!): Block! {
     supersedes: b.supersedes,
     number: b.number,
     dropped: false,
+    priority: b.priority,
+    blocks: b.blocks,
+    summary: b.summary,
+    options: b.options,
   )
 }
 
@@ -153,6 +231,10 @@ let asDropped(b: Block!): Block! {
     supersedes: b.supersedes,
     number: b.number,
     dropped: true,
+    priority: b.priority,
+    blocks: b.blocks,
+    summary: b.summary,
+    options: b.options,
   )
 }
 
@@ -167,6 +249,10 @@ let withNumber(b: Block!, n: Int!): Block! {
     supersedes: b.supersedes,
     number: n,
     dropped: b.dropped,
+    priority: b.priority,
+    blocks: b.blocks,
+    summary: b.summary,
+    options: b.options,
   )
 }
 
@@ -236,6 +322,29 @@ type Block {
   and exported, but never composed.
   """
   dropped: Boolean! = false
+
+  """
+  A QUESTION's priority, P0 most urgent. Null for every other Block, and
+  for questions recorded before priorities existed: those count as
+  unprioritized and are listed after every prioritized one.
+  """
+  priority: QuestionPriority = null
+
+  """
+  What a QUESTION holds up, in a few words; empty when nothing waits on it.
+  """
+  blocks: String! = ""
+
+  """
+  A QUESTION's one-line TL;DR.
+  """
+  summary: String! = ""
+
+  """
+  The answers a QUESTION offers, keyed A, B, C, ... in order; at most one
+  is recommended when written by blockWrite.
+  """
+  options: [QuestionOption!]! = []
 }
 
 """
@@ -271,6 +380,14 @@ type Context {
 
   Write the moment you resolve something worth keeping; distill the
   established truth, never the play-by-play that led to it.
+
+  A QUESTION also takes a priority and a one-line summary (both required),
+  what it blocks, and the options on offer with the one you recommend. Its
+  text carries the rest, by convention under these headings: "## Background"
+  (what a reader who forgot everything needs), "## Blast radius" (who or
+  what the answer affects) and "## Shipping" (how it relates to what ships
+  next). exportContext's HTML renders open questions as questions.html, a
+  page to answer them from.
   """
   blockWrite(
     """
@@ -309,6 +426,29 @@ type Context {
     it, superseding the question.
     """
     supersedes: [String!]! = [],
+    """
+    QUESTION only, required for one: how urgently it needs an answer, P0
+    (decide first) to P3 (whenever).
+    """
+    priority: QuestionPriority = null,
+    """
+    QUESTION only: what it holds up, in a few words ("the beta.25 release").
+    Empty when nothing waits on it.
+    """
+    blocks: String! = "",
+    """
+    QUESTION only, required for one: its one-line TL;DR.
+    """
+    summary: String! = "",
+    """
+    QUESTION only: the answers on offer, one line each. They are keyed A, B,
+    C, ... in this order, so do not prefix keys yourself.
+    """
+    options: [String!]! = [],
+    """
+    QUESTION only: the key of the option you would pick ("B").
+    """
+    recommended: String! = "",
   ): Context! {
     let addr = resolveId(id)
     if (!addr.containsMatch(idShape)) {
@@ -317,34 +457,77 @@ type Context {
     if (text.trimSpace == "") {
       raise `block "${addr}" needs a text payload — a Block is text plus metadata, not metadata alone`
     }
+    # The `blocks` argument shadows the field of the same name here, so the
+    # Map is read as self.blocks.
     let targets = supersedes.map { target => resolveId(target) }.uniq
     targets.each { target =>
       if (target == addr) {
         raise `block "${addr}" cannot supersede itself`
       }
-      if (!blocks.has(target)) {
+      if (!self.blocks.has(target)) {
         raise `cannot supersede "${target}": no such block — blockIndex lists what is there`
       }
     }
 
+    # Question fields: only on a QUESTION, where priority and summary are
+    # required. Enforced on every write, a rewrite of an older question
+    # included: a write replaces the whole Block, so it states them anyway.
+    let isQuestion = kind == BlockKind.QUESTION
+    let brief = oneLine(summary)
+    let holds = oneLine(blocks)
+    let pick = recommended.trimSpace.toUpper
+    let offered = options.map { o, i =>
+      let t = oneLine(o)
+      if (t == "") {
+        raise `option ${optionKey(i)} of "${addr}" is empty — every option needs its text`
+      }
+      QuestionOption(key: optionKey(i), text: t, recommended: optionKey(i) == pick)
+    }
+    if (!isQuestion) {
+      let given: [String!]! = []
+      if (priority != null) { given += ["priority"] }
+      if (holds != "") { given += ["blocks"] }
+      if (brief != "") { given += ["summary"] }
+      if (!options.isEmpty) { given += ["options"] }
+      if (pick != "") { given += ["recommended"] }
+      if (!given.isEmpty) {
+        raise `${given.join(", ")}: only a QUESTION takes these, and "${addr}" is a ${kindLabel(kind)} — leave them out, or write it as a QUESTION`
+      }
+    } else {
+      let missing: [String!]! = []
+      if (priority == null) { missing += ["a priority (P0, P1, P2 or P3)"] }
+      if (brief == "") { missing += ["a summary (its one-line TL;DR)"] }
+      if (!missing.isEmpty) {
+        raise `question "${addr}" needs ${missing.join(" and ")}, so blockIndex and questions.html can rank and list it`
+      }
+      if (pick != "" and !offered.any { o => o.recommended }) {
+        let keys = if (offered.isEmpty) { "it has no options" } else { "its options are " + offered.map { o => o.key }.join(", ") }
+        raise `recommended "${recommended}" names no option of "${addr}": ${keys}`
+      }
+    }
+    let warnings: [String!]! = []
+    if (!offered.isEmpty and pick == "") {
+      warnings += [`warning: "${addr}" offers options but recommends none — pass recommended: "<key>" with the one you would pick`]
+    }
+
     # A Block keeps its number across rewrites; a new QUESTION takes the
     # next one.
-    let prior = blocks[addr]
+    let prior = self.blocks[addr]
     let kept = if (prior == null) { null } else { prior.number }
-    let next = maxNumber(blocks.values, questionCount) + 1
+    let next = maxNumber(self.blocks.values, questionCount) + 1
     let number = if (kept != null) {
       kept
-    } else if (kind == BlockKind.QUESTION) {
+    } else if (isQuestion) {
       next
     } else {
       null
     }
-    if (kept == null and kind == BlockKind.QUESTION) {
+    if (kept == null and isQuestion) {
       self.questionCount = next
     }
 
     let cleaned = tags.map { t => t.trimSpace }.reject { t => t == "" }.uniq
-    self.blocks = blocks
+    self.blocks = self.blocks
       .map { bid, b =>
         if (targets.contains(bid)) { asSuperseded(b) } else { b }
       }
@@ -357,10 +540,15 @@ type Context {
         superseded: false,
         supersedes: targets,
         number: number,
+        priority: priority,
+        blocks: holds,
+        summary: brief,
+        options: offered,
       ))
     let short = if (number == null) { "" } else { ` (Q-${toString(number)})` }
     let note = if (targets.isEmpty) { "" } else { `, superseding ${targets.join(", ")}` }
-    print(`wrote ${addr}${short}${note}` + "\n\n" + blockIndex)
+    let warned = if (warnings.isEmpty) { "" } else { "\n" + warnings.join("\n") }
+    print(`wrote ${addr}${short}${note}${warned}` + "\n\n" + blockIndex)
     self
   }
 
@@ -380,9 +568,19 @@ type Context {
     let superseded = all.filter { b => b.superseded }.length
     let dropped = all.filter { b => b.dropped }.length
     let droppedNote = if (dropped == 0) { "" } else { `, ${toString(dropped)} dropped` }
+    let asked = active.filter { b => b.kind == BlockKind.QUESTION }
+    let urgent = asked.filter { b => b.priority == QuestionPriority.P0 }.length
+    let loose = asked.filter { b => b.priority == null }.length
+    let askedNote = if (asked.isEmpty) {
+      ""
+    } else {
+      `; ${toString(asked.length)} open question(s)` +
+        (if (urgent == 0) { "" } else { `, ${toString(urgent)} P0` }) +
+        (if (loose == 0) { "" } else { `, ${toString(loose)} unprioritized` })
+    }
     let headline = `${toString(all.length)} block(s) — ${toString(active.length)} active ` +
       `(${toString(total)} text line(s), ${toString(pinned.length)} pinned), ` +
-      `${toString(superseded)} superseded${droppedNote}`
+      `${toString(superseded)} superseded${droppedNote}${askedNote}`
     headline + "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
   }
 
@@ -442,7 +640,8 @@ type Context {
   Compose the Context into one document: a manifest of what went in (and
   what was left out, and why), then the selected Blocks in kind order —
   glossary → fact → decision → design → result → question → note, ties
-  broken by id — so definitions land before the things that use them.
+  broken by id — so definitions land before the things that use them. Open
+  questions come first among questions, by priority (P0 first).
 
   With no selectors this composes every active Block. Selectors union: a
   Block is included when its id, its kind, or any of its tags matches.
@@ -550,7 +749,8 @@ type Context {
     mark. The lossless form.
   - HTML: <path>/index.html, the Context as one self-contained page —
     "At a glance" (the lead Blocks), open questions, kind and tag filters,
-    every Block as a card.
+    every Block as a card — and <path>/questions.html, the open questions
+    by priority, with options to pick, notes, and a prompt to copy back.
 
   Every Block of every status is exported unless ids, tags or kinds narrow
   it, e.g. to the decisions a pull request motivated. What path already
@@ -704,7 +904,8 @@ type Context {
     }
     if (wantHtml) {
       out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
-      written += ["index.html"]
+      out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, title, repo))
+      written += ["index.html", "questions.html"]
     }
     let notes: [String!]! = []
     if (!refreshed.isEmpty) {
@@ -875,6 +1076,11 @@ type Context {
     if (!read.skipped.isEmpty) {
       notes += ["skipped files without front matter: " + read.skipped.join(", ")]
     }
+    # blockWrite recommends at most one option; a hand-edited file may not.
+    let torn = taken.filter { b => b.options.filter { o => o.recommended }.length > 1 }.map { b => b.address }
+    if (!torn.isEmpty) {
+      notes += ["warning: more than one option recommended in " + torn.join(", ") + " — rewrite them recommending one"]
+    }
     let detail = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
     print(`imported ${toString(taken.length)} block(s)${detail}` + "\n\n" + blockIndex)
     self
@@ -906,10 +1112,16 @@ type Context {
   }
 
   # Every Block in composition order: kind rank, ties broken by address
-  # (Map iteration is key-ordered).
+  # (Map iteration is key-ordered) — except questions, open ones first by
+  # priority (questionRank), each rank by address.
   let ordered: [Block!]! {
     kindOrder.reduce(([] :: [Block!]!)) { acc, k =>
-      acc + blocks.values.filter { b => b.kind == k }
+      let ofKind = blocks.values.filter { b => b.kind == k }
+      if (k == BlockKind.QUESTION) {
+        questionRanks.reduce(acc) { sorted, r => sorted + ofKind.filter { b => questionRank(b) == r } }
+      } else {
+        acc + ofKind
+      }
     }
   }
 
@@ -958,7 +1170,20 @@ type Context {
     }
     let short = shortId(b)
     let number = if (short == null) { "" } else { "  " + short }
-    `${b.address}  ${kindLabel(b.kind)}${number}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
+    `${b.address}  ${kindLabel(b.kind)}${number}${questionFlags(b, "  ")}  ${toString(blockLines(b))} line(s)${tags}${pin}${superseded}`
+  }
+
+  # A question's priority and what it blocks, each after sep: an open
+  # question without a priority says so; a superseded or dropped one shows
+  # only the priority it was recorded with.
+  let questionFlags(b: Block!, sep: String!): String! {
+    if (b.kind != BlockKind.QUESTION) {
+      return ""
+    }
+    let p = priorityLabel(b)
+    let prio = if (p != null) { sep + p } else if (isActive(b)) { sep + "unprioritized" } else { "" }
+    let holds = if (b.blocks == "" or !isActive(b)) { "" } else { sep + "blocks: " + b.blocks }
+    prio + holds
   }
 
   let headerOf(b: Block!): String! {
@@ -966,11 +1191,20 @@ type Context {
     let pin = if (b.pin) { " · pinned" } else { "" }
     let short = shortId(b)
     let number = if (short == null) { "" } else { " · " + short }
-    `── ${b.address} · ${kindLabel(b.kind)}${number}${tags}${pin} ──`
+    `── ${b.address} · ${kindLabel(b.kind)}${number}${questionFlags(b, " · ")}${tags}${pin} ──`
   }
 
+  # A question's summary leads its text, and its options follow.
   let renderBlock(b: Block!): String! {
-    headerOf(b) + "\n" + b.text
+    let brief = if (b.summary == "") { "" } else { "TL;DR: " + b.summary + "\n\n" }
+    let offered = if (b.options.isEmpty) {
+      ""
+    } else {
+      "\n\nOptions:\n" + b.options.map { o =>
+        `  ${o.key}. ${o.text}` + (if (o.recommended) { "  (recommended)" } else { "" })
+      }.join("\n")
+    }
+    headerOf(b) + "\n" + brief + b.text + offered
   }
 
   # What compose appends to a superseded or dropped Block named by id.
@@ -1011,6 +1245,10 @@ type Context {
           supersedes: b.supersedes,
           superseded_by: supersededBy(b),
           number: b.number,
+          priority: priorityLabel(b),
+          blocks: b.blocks,
+          summary: b.summary,
+          options: b.options.map { o => {{key: o.key, text: o.text, recommended: o.recommended}} },
         }}
       },
     }}
@@ -1052,9 +1290,11 @@ type Context {
     reader.
 
     QUESTIONS get a stable short id, Q-<n>, shown in blockIndex and
-    accepted wherever an id is: cite open questions by it. Answer one by
-    writing the DECISION or FACT that settles it with supersedes: naming
-    the question.
+    accepted wherever an id is: cite open questions by it. Write one with
+    a priority (P0-P3), a one-line summary, what it blocks, and the options
+    you see with the one you recommend, so it ranks and can be answered at
+    a glance. Answer one by writing the DECISION or FACT that settles it
+    with supersedes: naming the question.
 
     EXPORT what should outlive this session: exportContext writes the
     Context into your pending changes — markdown under context/ to commit
