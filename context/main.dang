@@ -79,7 +79,8 @@ enum ImportConflict {
 """
 What exportContext writes: MARKDOWN, one front-matter file per Block (what
 a repo commits); JSON, context.json, lossless; HTML, index.html, the
-Context as one self-contained page.
+Context as one self-contained page, and questions.html, the open questions
+to answer.
 """
 enum ExportFormat {
   MARKDOWN
@@ -188,9 +189,13 @@ let shortId(b: Block!): String {
   if (n == null) { null } else { `Q-${toString(n)}` }
 }
 
-# Size in text lines — the unit the composition budget is counted in.
+# Size in text lines — the unit the composition budget is counted in: the
+# lines compose prints below the Block's header, so a question's summary
+# and options count too (see renderBlock).
 let blockLines(b: Block!): Int! {
-  b.text.split("\n").length
+  let brief = if (b.summary == "") { 0 } else { 2 }
+  let offered = if (b.options.isEmpty) { 0 } else { 2 + b.options.length }
+  b.text.split("\n").length + brief + offered
 }
 
 # Active Blocks are the ones composed: neither superseded nor dropped.
@@ -905,7 +910,7 @@ type Context {
     }
     if (wantHtml) {
       out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
-      out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, title, repo))
+      out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, title, repo))
       written += ["index.html", "questions.html"]
     }
     let notes: [String!]! = []

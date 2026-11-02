@@ -62,10 +62,11 @@ let tokenId(token: String!, known: Map[Block!]!): String {
   if (core != token and known.has(core)) { core } else { null }
 }
 
-# Ids a Block's text mentions: path-shaped tokens and `code` spans naming a
-# Block, itself excluded. These are the "references →" edges.
+# Ids a Block's text (and a question's summary, blocks and options)
+# mentions: path-shaped tokens and `code` spans naming a Block, itself
+# excluded. These are the "references →" edges.
 let refsOf(b: Block!, known: Map[Block!]!): [String!]! {
-  b.text.matchAll(inlineToken)
+  ([b.text, b.summary, b.blocks] + b.options.map { o => o.text }).join("\n").matchAll(inlineToken)
     .map { m =>
       let code = cap(m.captures, 0)
       let q = cap(m.captures, 9)
@@ -672,13 +673,16 @@ let questionsJs: String! = """
   })();
 """
 
-# questions.html: every active QUESTION by priority (byUrgency), to answer
-# from. The text folds away under the summary (shown open for a question
-# recorded without one, whose text is all there is); options become radio
-# buttons. Block chips link into index.html, written beside it.
-let questionsHtml(all: [Block!]!, title: String!, repo: String!): String! {
+# questions.html: every active QUESTION of own — the session's Blocks, so
+# that every question listed can be answered by superseding it; all also
+# holds the other Blocks the copy carries, for links — by priority
+# (byUrgency), to answer from. The text folds away under the summary
+# (shown open for a question recorded without one, whose text is all there
+# is); options become radio buttons. Block chips link into index.html,
+# written beside it.
+let questionsHtml(all: [Block!]!, own: [Block!]!, title: String!, repo: String!): String! {
   let known: Map[Block!]! = all.reduce(([:] :: Map[Block!]!)) { acc, b => acc.with(b.address, b) }
-  let asked = byUrgency(all.filter { b => isActive(b) and b.kind == BlockKind.QUESTION })
+  let asked = byUrgency(own.filter { b => isActive(b) and b.kind == BlockKind.QUESTION })
   let urgent = asked.filter { b => b.priority == QuestionPriority.P0 }.length
   let loose = asked.filter { b => b.priority == null }.length
 
