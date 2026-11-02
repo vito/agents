@@ -382,8 +382,8 @@ let testContextShortIds(source: Workspace!): String! {
     .blockWrite("facts/a", ContextBlockKind.FACT, "not a question")
     .blockWrite("questions/one", ContextBlockKind.QUESTION, "first?", priority: p2, summary: "q")
     .blockWrite("questions/two", ContextBlockKind.QUESTION, "second? see Q-1", priority: p2, summary: "q")
-  assert { ctx.blockIndex.contains("questions/one  question  Q-1  P2  1 line(s)") }
-  assert { ctx.blockIndex.contains("questions/two  question  Q-2  P2  1 line(s)") }
+  assert { ctx.blockIndex.contains("questions/one  question  Q-1  P2  3 line(s)") }
+  assert { ctx.blockIndex.contains("questions/two  question  Q-2  P2  3 line(s)") }
   assert { ctx.blockIndex.contains("facts/a  fact  1 line(s)") }
   assert { readBlock(ctx, "Q-2").contains("── questions/two · question · Q-2 · P2 ──") }
   assert { ctx.compose(ids: ["Q-1"]).contains("first?") }
@@ -396,7 +396,7 @@ let testContextShortIds(source: Workspace!): String! {
 
   # Answering supersedes the question by its number; the number stays.
   let answered = pruned.blockWrite("decisions/one", ContextBlockKind.DECISION, "answered", supersedes: ["Q-1"])
-  assert { answered.blockIndex.contains("questions/one  question  Q-1  P2  1 line(s)  superseded by decisions/one") }
+  assert { answered.blockIndex.contains("questions/one  question  Q-1  P2  3 line(s)  superseded by decisions/one") }
   assert { readBlock(answered, "Q-1").contains("superseded by decisions/one") }
   let unknown = readBlock(answered, "Q-9") rescue { e: Error => e.message }
   assert { unknown.contains("no question Q-9") }
@@ -489,7 +489,7 @@ let testContextDrop(source: Workspace!): String! {
   let index = dropped.blockIndex
   assert { index.contains("3 block(s) — 1 active (1 text line(s), 0 pinned), 0 superseded, 2 dropped") }
   assert { index.contains("results/served  result  1 line(s)  dropped") }
-  assert { index.contains("questions/moot  question  Q-1  P2  1 line(s)  #blocker  dropped") }
+  assert { index.contains("questions/moot  question  Q-1  P2  3 line(s)  #blocker  dropped") }
   assert { !dropped.compose.contains("served its purpose") }
   assert { dropped.compose.contains("2 superseded or dropped block(s) held out") }
   let named = readBlock(dropped, "results/served")
@@ -526,7 +526,7 @@ let testContextDrop(source: Workspace!): String! {
   let revived = dropped.blockWrite("results/served", ContextBlockKind.RESULT, "useful again")
   assert { revived.blockIndex.contains("results/served  result  1 line(s)\n") }
   let replaced = dropped.blockWrite("decisions/settled", ContextBlockKind.DECISION, "answered after all", supersedes: ["Q-1"])
-  assert { replaced.blockIndex.contains("questions/moot  question  Q-1  P2  1 line(s)  #blocker  superseded by decisions/settled") }
+  assert { replaced.blockIndex.contains("questions/moot  question  Q-1  P2  3 line(s)  #blocker  superseded by decisions/settled") }
   assert { replaced.blockIndex.contains("1 superseded, 1 dropped") }
 
   # A superseded Block whose replacement was dropped says so.
@@ -575,10 +575,14 @@ let testContextQuestions(source: Workspace!): String! {
       options: ["Wait for the tag, then restack", "Restack now: see Q-1", "Merge as is"], recommended: "a")
     .blockWrite("questions/mid", ContextBlockKind.QUESTION, "mid", priority: p2, summary: "Mid?", options: ["yes", "no"])
 
-  # Open questions by priority, everywhere; the headline counts them.
+  # Open questions by priority, everywhere; the headline counts them. A
+  # question's size counts its summary and options, as compose prints them.
   let index = ctx.blockIndex
   assert { index.contains("; 3 open question(s), 1 P0") }
-  assert { index.contains("questions/land  question  Q-2  P0  blocks: the beta.25 release  11 line(s)") }
+  assert { index.contains("questions/land  question  Q-2  P0  blocks: the beta.25 release  18 line(s)") }
+  assert { index.contains("questions/mid  question  Q-3  P2  7 line(s)") }
+  let budgeted = ctx.compose(budget: 4)
+  assert { budgeted.contains("composed 2 of 4 block(s), 4 text line(s)") and !budgeted.contains("Options:") }
   let listed = index.split("\n").dropFirst(1).map { l => l.trimSpace.split("  ")[0] ?? "" }
   assert { listed == ["facts/a", "questions/land", "questions/mid", "questions/later"] }
   let composed = ctx.compose
@@ -589,7 +593,7 @@ let testContextQuestions(source: Workspace!): String! {
 
   # Every format carries the fields, exactly; markdown only on questions.
   let answered = ctx.blockWrite("decisions/later", ContextBlockKind.DECISION, "Later, then.", supersedes: ["Q-1"])
-  assert { answered.blockIndex.contains("questions/later  question  Q-1  P3  1 line(s)  superseded by decisions/later") }
+  assert { answered.blockIndex.contains("questions/later  question  Q-1  P3  3 line(s)  superseded by decisions/later") }
   let same(a: Context!, b: Context!): Boolean! {
     a.blockIndex == b.blockIndex and a.compose == b.compose and readBlock(a, "Q-1") == readBlock(b, "Q-1") and
       jsonOf(a).contents == jsonOf(b).contents
@@ -652,6 +656,13 @@ let testContextQuestions(source: Workspace!): String! {
   assert { page.contains(`href="https://github.com/vito/agents/issues/12"`) }
   assert { page.contains("writing the DECISION that settles it") and page.contains("localStorage") }
   assert { questionsOf(context.blockWrite("facts/a", ContextBlockKind.FACT, "a")).contains("No open questions.") }
+  # A question only an earlier context.json at the path holds stays on
+  # index.html, but is not offered for answering: the session lacks it.
+  let elsewhere = directory.withFile("out/context.json",
+    jsonOf(context.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
+  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML]))
+  assert { mixed.file("out/index.html").contents.contains(`id="b-questions/foreign"`) }
+  assert { !mixed.file("out/questions.html").contents.contains(`id="q-questions/foreign"`) }
   "Context question checks passed."
 }
 
