@@ -454,6 +454,15 @@ let testContextShortIds(source: Workspace!): String! {
   assert { readBlock(mine, "notes/m").contains("blocked on Q-2, not Q-7") }
   assert { readBlock(mine, "Q-1").contains("mine?") }
 
+  # ... and a question's own fields along (questions/first is Q-1 there,
+  # Q-3 here).
+  let deps = jsonOf(context
+    .blockWrite("questions/first", ContextBlockKind.QUESTION, "first?", priority: p2, summary: "q")
+    .blockWrite("questions/then", ContextBlockKind.QUESTION, "then?", priority: ContextQuestionPriority.P1,
+      summary: "after Q-1", blocks: "Q-1", options: ["wait for Q-1"], recommended: "A"))
+  let followed = readBlock(importJson(context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?", priority: p2, summary: "q"), deps), "questions/then")
+  assert { followed.contains("· blocks: Q-3 ──\nTL;DR: after Q-3\n") and followed.contains("A. wait for Q-3  (recommended)") }
+
   # KEEP leaves a clashing question out; citations of it follow the
   # session's number for it (questions/theirs is Q-2 in mine, Q-1 there).
   let kept = importJson(mine, jsonOf(context
