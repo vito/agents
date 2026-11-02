@@ -372,6 +372,19 @@ let contextCss: String! = """
   footer{margin-top:50px;color:var(--mut);font-size:13px}
 """
 
+# gistpreview renders a gist's file at gistpreview.github.io/?<id>/<file>,
+# where a relative link to the page beside it would leave the gist: point
+# such links at the gist's file instead.
+let gistLinksJs: String! = """
+  (function(){
+    var m=location.hostname==='gistpreview.github.io'&&/^\?([0-9a-f]+)/.exec(location.search);
+    if(!m)return;
+    document.querySelectorAll('a[href^="index.html"],a[href^="questions.html"]').forEach(function(a){
+      a.setAttribute('href','?'+m[1]+'/'+a.getAttribute('href'));
+    });
+  })();
+"""
+
 let contextJs: String! = """
   (function(){
     var active={kind:null,tag:null};
@@ -572,7 +585,7 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
     "<li>Rendered by the context module's <code>exportContext</code> from a session's Context: a set of Blocks held beside the conversation.</li>" +
     "<li>Links between blocks are inferred from block ids mentioned in block text (references → and referenced by ←), plus each block's <code>supersedes</code> list.</li>" +
     "</ul>\n"
-  page + "</main><script>" + contextJs + "</script></body></html>\n"
+  page + "</main><script>" + contextJs + gistLinksJs + "</script></body></html>\n"
 }
 
 let questionsCss: String! = """
@@ -592,18 +605,20 @@ let questionsCss: String! = """
   .toast{color:var(--k-decision);font-size:13px}
 """
 
-# The answering page's script: each question's picked option and notes,
-# kept in localStorage by question id (one store per page title), and the
+# The answering page's script: each question's picked option (its key and
+# text, so a rewrite that reorders the options drops a stale pick) and
+# notes, kept in localStorage per page (gist, or path) and title, and the
 # prompts built from them.
 let questionsJs: String! = """
   (function(){
-    var body=document.body,KEY='context-answers:'+body.dataset.title,state={};
+    var body=document.body,gist=(/^\?([0-9a-f]+)/.exec(location.search)||[])[1];
+    var KEY='context-answers:'+(gist||location.pathname)+':'+body.dataset.title,state={};
     try{state=JSON.parse(localStorage.getItem(KEY)||'{}')||{};}catch(e){state={};}
     function save(){try{localStorage.setItem(KEY,JSON.stringify(state));}catch(e){}}
     function entry(id){return state[id]||(state[id]={});}
     var cards=[].slice.call(document.querySelectorAll('section.q'));
     function radios(c){return [].slice.call(c.querySelectorAll('input[type=radio]'));}
-    function picked(c){var s=state[c.dataset.id]||{};return radios(c).filter(function(r){return r.value===s.choice;})[0]||null;}
+    function picked(c){var s=state[c.dataset.id]||{};return radios(c).filter(function(r){return r.value===s.choice&&r.dataset.text===s.text;})[0]||null;}
     function notes(c){return ((state[c.dataset.id]||{}).notes||'').trim();}
     function answered(c){return !!(picked(c)||notes(c));}
     function mark(c){c.classList.toggle('answered',answered(c));}
@@ -615,8 +630,8 @@ let questionsJs: String! = """
     }
     function preamble(){
       return 'Answers to open questions (context export "'+body.dataset.title+'"). '+
-        'Answer each one by writing the DECISION that settles it with blockWrite, superseding the question by its Q-number '+
-        '(supersedes: ["Q-<n>"]). Where the notes push back or ask something, reply first instead of deciding.\n\n';
+        'Answer each one by writing the DECISION that settles it with blockWrite, superseding the question by its id '+
+        '(in parentheses after its Q-number, which can change across sessions). Where the notes push back or ask something, reply first instead of deciding.\n\n';
     }
     function prompt(){var a=cards.filter(answered);return a.length?preamble()+a.map(line).join(''):'';}
     function show(t){var p=document.getElementById('prompt');p.style.display='block';p.value=t;}
@@ -633,8 +648,8 @@ let questionsJs: String! = """
     cards.forEach(function(c){
       var id=c.dataset.id,s=state[id]||{},ta=c.querySelector('textarea');
       radios(c).forEach(function(r){
-        r.checked=r.value===s.choice;
-        r.addEventListener('change',function(){entry(id).choice=r.value;save();mark(c);});
+        r.checked=r===picked(c);
+        r.addEventListener('change',function(){var e=entry(id);e.choice=r.value;e.text=r.dataset.text;save();mark(c);});
       });
       ta.value=s.notes||'';
       ta.addEventListener('input',function(){entry(id).notes=ta.value;save();mark(c);});
@@ -702,5 +717,5 @@ let questionsHtml(all: [Block!]!, title: String!, repo: String!): String! {
   page += "</main>\n" + `<div id="dock"><div class="inner"><button id="gen">Generate prompt</button><button id="copy-all">Copy prompt</button>` +
     `<button class="secondary" id="clear">Clear answers</button><span class="toast" id="toast"></span>` +
     `<textarea id="prompt" readonly></textarea></div></div>` + "\n"
-  page + "<script>" + questionsJs + "</script></body></html>\n"
+  page + "<script>" + questionsJs + gistLinksJs + "</script></body></html>\n"
 }

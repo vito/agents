@@ -760,7 +760,8 @@ type Context {
   Block to a narrower export.
 
   For a gist: a path of its own, flat, formats HTML and JSON; gistpreview
-  renders its index.html, and importContext(from: "<gist id>") reads it
+  renders its index.html (gistpreview.github.io/?<id>, and ?<id>/questions.html
+  the questions page), and importContext(from: "<gist id>") reads it
   back. To curate the page, write the curated content as Blocks (a status
   table, a checklist) and name them in lead.
   """

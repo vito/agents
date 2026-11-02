@@ -292,12 +292,13 @@ let readFrom(source: Workspace!, from: String!): {{blocks: [Block!]!, skipped: [
   readBlocksDir(origin, dir)
 }
 
-# Rewrite Q-number citations in a Block's text, summary and options after
+# Rewrite Q-number citations in a Block's text and question fields after
 # an import renumbered questions: renames pairs an old number with its new
 # one.
 let renumberCitations(b: Block!, renames: [{{was: String!, now: String!}}!]!): Block! {
   let cites(s: String!): Boolean! { s.containsMatch(`\bQ-[0-9]+\b`) }
-  if (renames.isEmpty or !(cites(b.text) or cites(b.summary) or b.options.any { o => cites(o.text) })) {
+  let mentions = cites(b.text) or cites(b.summary) or cites(b.blocks) or b.options.any { o => cites(o.text) }
+  if (renames.isEmpty or !mentions) {
     return b
   }
   Block(
@@ -311,7 +312,7 @@ let renumberCitations(b: Block!, renames: [{{was: String!, now: String!}}!]!): B
     number: b.number,
     dropped: b.dropped,
     priority: b.priority,
-    blocks: b.blocks,
+    blocks: renumberText(b.blocks, renames),
     summary: renumberText(b.summary, renames),
     options: b.options.map { o => QuestionOption(key: o.key, text: renumberText(o.text, renames), recommended: o.recommended) },
   )
