@@ -566,7 +566,8 @@ let testContextQuestions(source: Workspace!): String! {
   let blank = failure(context.blockWrite("questions/q", ContextBlockKind.QUESTION, "q", priority: p2, summary: "q", options: ["a", " "]))
   assert { blank.contains("option B of \"questions/q\" is empty") }
 
-  let land = "## Background\n\nSee facts/a and #12.\n\n## Blast radius\n\nEveryone.\n\n## Shipping\n\nBefore beta.25."
+  # Question details are freeform Markdown, without prescribed headings.
+  let land = "See facts/a and #12.\n\nEveryone is affected.\n\nBefore beta.25."
   let ctx = context
     .blockWrite("facts/a", ContextBlockKind.FACT, "a fact")
     .blockWrite("questions/later", ContextBlockKind.QUESTION, "whenever", priority: ContextQuestionPriority.P3, summary: "Later?")
@@ -579,14 +580,14 @@ let testContextQuestions(source: Workspace!): String! {
   # question's size counts its summary and options, as compose prints them.
   let index = ctx.blockIndex
   assert { index.contains("; 3 open question(s), 1 P0") }
-  assert { index.contains("questions/land  question  Q-2  P0  blocks: the beta.25 release  18 line(s)") }
+  assert { index.contains("questions/land  question  Q-2  P0  blocks: the beta.25 release  12 line(s)") }
   assert { index.contains("questions/mid  question  Q-3  P2  7 line(s)") }
   let budgeted = ctx.compose(budget: 4)
   assert { budgeted.contains("composed 2 of 4 block(s), 4 text line(s)") and !budgeted.contains("Options:") }
   let listed = index.split("\n").dropFirst(1).map { l => l.trimSpace.split("  ")[0] ?? "" }
   assert { listed == ["facts/a", "questions/land", "questions/mid", "questions/later"] }
   let composed = ctx.compose
-  assert { composed.contains("── questions/land · question · Q-2 · P0 · blocks: the beta.25 release ──\nTL;DR: How do we land it?\n\n## Background") }
+  assert { composed.contains("── questions/land · question · Q-2 · P0 · blocks: the beta.25 release ──\nTL;DR: How do we land it?\n\nSee facts/a and #12.") }
   assert { composed.contains("Before beta.25.\n\nOptions:\n  A. Wait for the tag, then restack  (recommended)\n  B. Restack now: see Q-1\n  C. Merge as is") }
   let afterLand = composed.split("── questions/land ")[1] ?? ""
   assert { afterLand.contains("── questions/mid ") and (afterLand.split("── questions/mid ")[1] ?? "").contains("── questions/later ") }
@@ -648,7 +649,9 @@ let testContextQuestions(source: Workspace!): String! {
   let cards = page.split(`<section class="blk k-question q" id="q-`).dropFirst(1).map { s => s.split(`"`)[0] ?? "" }
   assert { cards == ["questions/land", "questions/mid"] }
   assert { page.contains(`data-id="questions/land" data-q="Q-2"`) and page.contains(`<span class="prio p0">P0</span>`) }
-  assert { page.contains(`<p class="tldr">How do we land it?</p><details><summary>Background, blast radius and shipping</summary>`) }
+  assert { page.contains(`<p class="tldr">How do we land it?</p><details><summary>More details</summary>`) }
+  assert { page.contains("<p>Everyone is affected.</p>") and page.contains("<p>Before beta.25.</p>") }
+  assert { questionsOf(loaded).contains("<details open><summary>More details</summary><p>older export</p>") }
   assert { page.contains(`<input type="radio" name="q-questions/land" value="A" data-text="Wait for the tag, then restack">`) }
   assert { page.split(`<span class="rec">RECOMMENDED</span>`).length == 2 }
   assert { page.contains(`<a class="chip k-fact" href="index.html#b-facts/a"`) }

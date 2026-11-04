@@ -388,11 +388,8 @@ type Context {
 
   A QUESTION also takes a priority and a one-line summary (both required),
   what it blocks, and the options on offer with the one you recommend. Its
-  text carries the rest, by convention under these headings: "## Background"
-  (what a reader who forgot everything needs), "## Blast radius" (who or
-  what the answer affects) and "## Shipping" (how it relates to what ships
-  next). exportContext's HTML renders open questions as questions.html, a
-  page to answer them from.
+  text is freeform Markdown for any further details. exportContext's HTML
+  renders open questions as questions.html, a page to answer them from.
   """
   blockWrite(
     """

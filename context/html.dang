@@ -694,7 +694,7 @@ let questionsHtml(all: [Block!]!, own: [Block!]!, title: String!, repo: String!)
       `<div class="h"><span class="qn">${short}</span>${prioHtml(b)}<a class="bid" href="index.html#b-${id}">${id}</a>${blocker}${holdsHtml(b, known, repo)}` +
       b.tags.map { t => `<span class="tag">#${escLit(t)}</span>` }.join("") + "</div>"
     let folded = if (b.summary == "") { "<details open>" } else { "<details>" }
-    let body = summaryHtml(b, known, repo) + folded + "<summary>Background, blast radius and shipping</summary>" +
+    let body = summaryHtml(b, known, repo) + folded + "<summary>More details</summary>" +
       markdownHtml(b.text, known, repo) + "</details>"
     let choices = `<div class="answer">` + b.options.map { o =>
       let rec = if (o.recommended) { recHtml } else { "" }
