@@ -170,8 +170,18 @@ let testContextExportRefresh(source: Workspace!): String! {
   }
   assert { collision.any { s => s.contains("conflicting Q-1 assignments") and s.contains("import the existing context first") } }
 
-  # Foreign supersession metadata survives the same automatic refresh.
-  let resolvedBundle = exportedDir(answered, gistFormats)
+  # A partial import can renumber a question without leaving duplicate
+  # numbers, while foreign text still cites the original assignment.
+  let citedBundle = exportedDir(question.blockWrite("notes/citation", ContextBlockKind.NOTE, "See Q-1"), gistFormats)
+  let partial = importJson(colliding, jsonOf(question))
+  let changed = citedBundle.withChanges(partial.exportContext(source: citedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { changed.any { s => s.contains("question numbers changed") and s.contains("import the existing context first") } }
+
+  # Foreign supersession metadata survives even when the prior selective
+  # export omitted the replacement Block itself.
+  let resolvedBundle = directory.withChanges(answered.exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["questions/ship"]))
   let foreignRefresh = resolvedBundle.withChanges(other.exportContext(source: resolvedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
   let foreignDoc: {{blocks: [{{id: String!, superseded_by: [String!]!}}!]!}}! = JSON.decode(foreignRefresh.file("context.json").contents)
   assert { foreignDoc.blocks.filter { b => b.id == "questions/ship" }.map { b => b.superseded_by } == [["decisions/ship"]] }

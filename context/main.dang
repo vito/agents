@@ -906,7 +906,24 @@ type Context {
     # Refresh an existing JSON copy even when only another format is requested.
     let writeJson = formats.contains(ExportFormat.JSON) or hasJson
     if (writeJson) {
-      out = out.withNewFile(jsonPath, jsonOf(copy + foreign, priorDoc.questions))
+      # Foreign citations still use the prior copy's numbering. A partial
+      # import must not silently retarget them when the session renumbered it.
+      if (!foreign.isEmpty and prior.any { old =>
+        old.number != null and copy.any { b =>
+          b.address == old.address and b.number != old.number
+        }
+      }) {
+        raise "cannot refresh foreign blocks after question numbers changed — import the existing context first to reconcile citations"
+      }
+      # A selective export can name a superseder it does not contain. Keep
+      # these recorded pointers for foreign Blocks, whose full history this
+      # session cannot reconstruct.
+      let foreignLinks: [{{id: String!, superseded_by: [String!]}}!]! = []
+      if (hasJson) {
+        let links: {{blocks: [{{id: String!, superseded_by: [String!]}}!]!}}! = JSON.decode(base.file(jsonPath).contents)
+        foreignLinks = links.blocks.filter { b => foreign.any { f => f.address == b.id } }
+      }
+      out = out.withNewFile(jsonPath, jsonOf(copy + foreign, priorDoc.questions, foreignLinks))
       written += ["context.json"]
     }
     if (wantHtml) {
@@ -1235,7 +1252,7 @@ type Context {
   # context.json for these Blocks: every field, plus question_count, the
   # highest Q-number this Context or the prior export ever assigned, so a
   # session importing it never reuses a forgotten one.
-  let jsonOf(bs: [Block!]!, priorQuestions: Int! = 0): String! {
+  let jsonOf(bs: [Block!]!, priorQuestions: Int! = 0, foreignLinks: [{{id: String!, superseded_by: [String!]}}!]! = []): String! {
     bs.each { b =>
       let n = b.number
       if (n != null and bs.any { other => other.address != b.address and other.number == n }) {
@@ -1259,7 +1276,12 @@ type Context {
           status: statusLabel(b),
           supersedes: b.supersedes,
           superseded_by: if (b.superseded) {
-            known.values.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+            let recorded = foreignLinks.filter { x => x.id == b.address }
+            if (recorded.isEmpty) {
+              known.values.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+            } else {
+              recorded.reduce(([] :: [String!]!)) { acc, x => acc + (x.superseded_by ?? []) }
+            }
           } else { [] :: [String!]! },
           number: b.number,
           priority: priorityLabel(b),
