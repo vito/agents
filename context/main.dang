@@ -1236,6 +1236,13 @@ type Context {
   # highest Q-number this Context or the prior export ever assigned, so a
   # session importing it never reuses a forgotten one.
   let jsonOf(bs: [Block!]!, priorQuestions: Int! = 0): String! {
+    bs.each { b =>
+      let n = b.number
+      if (n != null and bs.any { other => other.address != b.address and other.number == n }) {
+        raise `cannot export conflicting Q-${toString(n)} assignments — import the existing context first to reconcile question numbers`
+      }
+    }
+    let known = bs.reduce(blocks) { acc, b => acc.with(b.address, b) }
     # Computed outside the record: inside it, `blocks` is the sibling field.
     let floor = if (priorQuestions > questionCount) { priorQuestions } else { questionCount }
     let high = maxNumber(blocks.values + bs, floor)
@@ -1251,7 +1258,9 @@ type Context {
           pin: b.pin,
           status: statusLabel(b),
           supersedes: b.supersedes,
-          superseded_by: supersededBy(b),
+          superseded_by: if (b.superseded) {
+            known.values.filter { x => x.supersedes.contains(b.address) }.map { x => x.address }
+          } else { [] :: [String!]! },
           number: b.number,
           priority: priorityLabel(b),
           blocks: b.blocks,

@@ -161,6 +161,20 @@ let testContextExportRefresh(source: Workspace!): String! {
   let resumed = importDir(context, refreshedBundle)
     .blockWrite("questions/next", ContextBlockKind.QUESTION, "next", priority: p2, summary: "Next?")
   assert { resumed.blockIndex.contains("questions/next  question  Q-3") }
+
+  # A high-water mark cannot reconcile two different questions already
+  # called Q-1. Refuse the refresh rather than corrupting their citations.
+  let colliding = context.blockWrite("questions/other", ContextBlockKind.QUESTION, "another Q-1", priority: p2, summary: "Other?")
+  let collision = numberedBundle.withChanges(colliding.exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { collision.any { s => s.contains("conflicting Q-1 assignments") and s.contains("import the existing context first") } }
+
+  # Foreign supersession metadata survives the same automatic refresh.
+  let resolvedBundle = exportedDir(answered, gistFormats)
+  let foreignRefresh = resolvedBundle.withChanges(other.exportContext(source: resolvedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
+  let foreignDoc: {{blocks: [{{id: String!, superseded_by: [String!]!}}!]!}}! = JSON.decode(foreignRefresh.file("context.json").contents)
+  assert { foreignDoc.blocks.filter { b => b.id == "questions/ship" }.map { b => b.superseded_by } == [["decisions/ship"]] }
   "Export refresh checks passed."
 }
 
@@ -688,7 +702,7 @@ let testContextQuestions(source: Workspace!): String! {
   # A question only an earlier context.json at the path holds stays on
   # index.html, but is not offered for answering: the session lacks it.
   let elsewhere = directory.withFile("out/context.json",
-    jsonOf(context.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
+    jsonOf(ctx.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
   let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML]))
   assert { mixed.file("out/index.html").contents.contains(`id="b-questions/foreign"`) }
   assert { !mixed.file("out/questions.html").contents.contains(`id="q-questions/foreign"`) }
