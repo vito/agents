@@ -168,7 +168,7 @@ let testContextExportRefresh(source: Workspace!): String! {
   let collision = numberedBundle.withChanges(colliding.exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
     e: Error => [e.message]
   }
-  assert { collision.any { s => s.contains("conflicting Q-1 assignments") and s.contains("import the existing context first") } }
+  assert { collision.any { s => s.contains("import the existing context first") } }
 
   # A partial import can renumber a question without leaving duplicate
   # numbers, while foreign text still cites the original assignment.
@@ -178,6 +178,14 @@ let testContextExportRefresh(source: Workspace!): String! {
     e: Error => [e.message]
   }
   assert { changed.any { s => s.contains("question numbers changed") and s.contains("import the existing context first") } }
+  # A selective export may keep only a citation, not the question itself.
+  # Its high-water mark still reserves that number against unrelated reuse.
+  let citationOnly = directory.withChanges(question.blockWrite("notes/citation", ContextBlockKind.NOTE, "See Q-1")
+    .exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["notes/citation"]))
+  let reused = citationOnly.withChanges(colliding.exportContext(source: citationOnly.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { reused.any { s => s.contains("import the existing context first") } }
 
   # Foreign supersession metadata survives even when the prior selective
   # export omitted the replacement Block itself.

@@ -908,11 +908,15 @@ type Context {
     if (writeJson) {
       # Foreign citations still use the prior copy's numbering. A partial
       # import must not silently retarget them when the session renumbered it.
-      if (!foreign.isEmpty and prior.any { old =>
+      if (!foreign.isEmpty and (prior.any { old =>
         old.number != null and copy.any { b =>
           b.address == old.address and b.number != old.number
         }
-      }) {
+      } or copy.any { b =>
+        let n = b.number
+        n != null and n <= priorDoc.questions and
+          !prior.any { old => old.address == b.address and old.number == n }
+      })) {
         raise "cannot refresh foreign blocks after question numbers changed — import the existing context first to reconcile citations"
       }
       # A selective export can name a superseder it does not contain. Keep
