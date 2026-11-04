@@ -23,6 +23,11 @@ let htmlOf(ctx: Context!, title: String! = "Context", repo: String! = "", lead: 
     formats: [ContextExportFormat.HTML], title: title, repo: repo, lead: lead)).file("out/index.html").contents
 }
 
+let questionsOf(ctx: Context!, repo: String! = ""): String! {
+  directory.withChanges(ctx.exportContext(source: scratch, path: "out",
+    formats: [ContextExportFormat.HTML], repo: repo)).file("out/questions.html").contents
+}
+
 let importDir(ctx: Context!, dir: Directory!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
   ctx.importContext(source: directory.withDirectory("in", dir).asWorkspace, from: "in", onConflict: onConflict)
 }
@@ -34,6 +39,10 @@ let importJson(ctx: Context!, json: File!, onConflict: ContextImportConflict! = 
 let readBlock(ctx: Context!, id: String!): String! {
   ctx.compose(ids: [id])
 }
+
+# blockWrite requires a QUESTION's priority and summary; checks about
+# something else give every question this one.
+let p2: ContextQuestionPriority! = ContextQuestionPriority.P2
 
 let testContextExportMetadata(source: Workspace!): String! {
   let tags = [
@@ -126,6 +135,79 @@ let testContextExportRefresh(source: Workspace!): String! {
   let d6 = elsewhere.withChanges(third.exportContext(source: elsewhere.asWorkspace, formats: [ContextExportFormat.JSON], ids: ["facts/newer"]))
   let json = d6.file("context/context.json").contents
   assert { json.contains(`"notes/elsewhere"`) and json.contains(`"facts/old"`) }
+
+  # Refresh a JSON+HTML bundle after answering, even when only HTML is
+  # requested. A narrow export keeps the old question and foreign Blocks.
+  let question = context.blockWrite("questions/ship", ContextBlockKind.QUESTION, "Ready to ship?", priority: p2, summary: "Ship?")
+  let bundle = exportedDir(question.blockWrite("notes/foreign", ContextBlockKind.NOTE, "kept from another session"), gistFormats)
+  let answered = question.blockWrite("decisions/ship", ContextBlockKind.DECISION, "Ship now.", supersedes: ["questions/ship"])
+  let updated = bundle.withChanges(answered.exportContext(source: bundle.asWorkspace, path: ".",
+    formats: [ContextExportFormat.HTML], ids: ["decisions/ship"]))
+  assert { updated.file("questions.html").contents.contains("No open questions.") }
+  let imported = importDir(context, updated)
+  assert { imported.compose.contains("Ship now.") and !imported.compose.contains("Ready to ship?") }
+  assert { readBlock(imported, "questions/ship").contains("superseded by decisions/ship") }
+  assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
+  # Format selection still controls creation: HTML alone adds no JSON file.
+  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["index.html", "questions.html"] }
+
+  # A different session refreshing HTML must not lower the JSON's retired
+  # Q-number high-water mark, even when that question no longer has a Block.
+  let retired = question.blockWrite("questions/retired", ContextBlockKind.QUESTION, "obsolete", priority: p2, summary: "Obsolete?")
+    .blockDrop(["questions/retired"], forget: true)
+  let numberedBundle = exportedDir(retired, gistFormats)
+  let other = context.blockWrite("notes/other", ContextBlockKind.NOTE, "another session")
+  let refreshedBundle = numberedBundle.withChanges(other.exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
+  let resumed = importDir(context, refreshedBundle)
+    .blockWrite("questions/next", ContextBlockKind.QUESTION, "next", priority: p2, summary: "Next?")
+  assert { resumed.blockIndex.contains("questions/next  question  Q-3") }
+
+  # A high-water mark cannot reconcile two different questions already
+  # called Q-1. Refuse the refresh rather than corrupting their citations.
+  let colliding = context.blockWrite("questions/other", ContextBlockKind.QUESTION, "another Q-1", priority: p2, summary: "Other?")
+  let collision = numberedBundle.withChanges(colliding.exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { collision.any { s => s.contains("import the existing context first") } }
+
+  # A partial import can renumber a question without leaving duplicate
+  # numbers, while foreign text still cites the original assignment.
+  let citedBundle = exportedDir(question.blockWrite("notes/citation", ContextBlockKind.NOTE, "See Q-1"), gistFormats)
+  let partial = importJson(colliding, jsonOf(question))
+  let changed = citedBundle.withChanges(partial.exportContext(source: citedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { changed.any { s => s.contains("question numbers changed") and s.contains("import the existing context first") } }
+  # A selective export may keep only a citation, not the question itself.
+  # Its high-water mark still reserves that number against unrelated reuse.
+  let citationOnly = directory.withChanges(question.blockWrite("notes/citation", ContextBlockKind.NOTE, "See Q-1")
+    .exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["notes/citation"]))
+  let reused = citationOnly.withChanges(colliding.exportContext(source: citationOnly.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { reused.any { s => s.contains("import the existing context first") } }
+  # The opposite selection also conflicts: a session note can cite its
+  # omitted question while the copy retains another question with that number.
+  let omitted = numberedBundle.withChanges(colliding.blockWrite("notes/new", ContextBlockKind.NOTE, "See Q-1")
+    .exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], ids: ["notes/new"])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { omitted.any { s => s.contains("import the existing context first") } }
+  # After a selective import, only the session high-water mark remembers
+  # the cited question. It still reserves that number against foreign reuse.
+  let citationSession = importDir(context, citationOnly)
+  let unrelatedBundle = exportedDir(colliding, gistFormats)
+  let reserved = unrelatedBundle.withChanges(citationSession.exportContext(source: unrelatedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { reserved.any { s => s.contains("import the existing context first") } }
+
+  # Foreign supersession metadata survives even when the prior selective
+  # export omitted the replacement Block itself.
+  let resolvedBundle = directory.withChanges(answered.exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["questions/ship"]))
+  let foreignRefresh = resolvedBundle.withChanges(other.exportContext(source: resolvedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
+  let foreignDoc: {{blocks: [{{id: String!, superseded_by: [String!]!}}!]!}}! = JSON.decode(foreignRefresh.file("context.json").contents)
+  assert { foreignDoc.blocks.filter { b => b.id == "questions/ship" }.map { b => b.superseded_by } == [["decisions/ship"]] }
   "Export refresh checks passed."
 }
 
@@ -198,7 +280,7 @@ let testContextExportRoundTrip(source: Workspace!): String! {
   assert { gist.entries.all { e => !e.hasSuffix("/") } }
   assert { sameContext(importDir(context, gist), fixture) }
   let bundle = exportedDir(fixture, [ContextExportFormat.JSON, ContextExportFormat.HTML])
-  assert { bundle.entries == ["context.json", "index.html"] }
+  assert { bundle.entries == ["context.json", "index.html", "questions.html"] }
   assert { sameContext(importDir(context, bundle), fixture) }
   "Context export/import round-trip checks passed."
 }
@@ -306,19 +388,27 @@ let testContextHtml(source: Workspace!): String! {
 }
 
 # The curated sections: lead Blocks under "At a glance" in the caller's
-# order, then every active QUESTION, #blocker first, then pinned.
+# order, then every active QUESTION by priority (unprioritized last), each
+# priority #blocker first, then pinned.
 let testContextHtmlCurated(source: Workspace!): String! {
   let plain = htmlOf(contextIoFixture)
   assert { !plain.contains(`id="glance"`) and !plain.contains(`id="questions"`) }
 
-  let fixture = contextIoFixture
+  # Questions recorded before priorities existed: unprioritized, #blocker
+  # still first among them.
+  let legacy = directory
+    .withNewFile("questions/g-legacy.md", "---\nkind: question\ntags: [blocker]\n---\n\nlegacy blocking question\n")
+    .withNewFile("questions/h-legacy.md", "---\nkind: question\n---\n\nlegacy question\n")
+  let written = contextIoFixture
     .blockWrite("results/status", ContextBlockKind.RESULT, "| pr | state |\n|---|---|\n| #40 | draft |")
-    .blockWrite("questions/a-plain", ContextBlockKind.QUESTION, "plain question")
-    .blockWrite("questions/b-blocks", ContextBlockKind.QUESTION, "blocking question", tags: ["blocker"])
-    .blockWrite("questions/c-pinned", ContextBlockKind.QUESTION, "pinned question", pin: true)
-    .blockWrite("questions/d-led", ContextBlockKind.QUESTION, "led question")
-    .blockWrite("questions/e-old", ContextBlockKind.QUESTION, "old question")
-    .blockWrite("questions/f-new", ContextBlockKind.QUESTION, "new question", supersedes: ["questions/e-old"])
+    .blockWrite("questions/a-plain", ContextBlockKind.QUESTION, "plain question", priority: ContextQuestionPriority.P1, summary: "plain?")
+    .blockWrite("questions/b-blocks", ContextBlockKind.QUESTION, "blocking question", tags: ["blocker"], priority: p2, summary: "blocking?")
+    .blockWrite("questions/c-pinned", ContextBlockKind.QUESTION, "pinned question", pin: true, priority: p2, summary: "pinned?")
+    .blockWrite("questions/d-led", ContextBlockKind.QUESTION, "led question", priority: ContextQuestionPriority.P0, summary: "led?")
+    .blockWrite("questions/e-old", ContextBlockKind.QUESTION, "old question", priority: ContextQuestionPriority.P3, summary: "old?")
+    .blockWrite("questions/f-new", ContextBlockKind.QUESTION, "new question", supersedes: ["questions/e-old"],
+      priority: ContextQuestionPriority.P3, summary: "new?")
+  let fixture = importDir(written, legacy)
   let html = htmlOf(fixture, lead: ["results/status", "questions/d-led", "glossary"])
 
   let afterGlance = html.split(`<h2 id="glance">`)[1] ?? ""
@@ -334,11 +424,14 @@ let testContextHtmlCurated(source: Workspace!): String! {
   assert { glance.contains("<th>pr</th>") }
   assert { html.split(`id="b-results/status"`).length == 2 }
 
-  # Questions: blocker, pinned, then the rest; led and superseded ones out.
+  # Questions: by priority, blocker then pinned within one, unprioritized
+  # last; led and superseded ones out.
   let asked = questions.split(`<a class="bid" href="#b-`).dropFirst(1).map { s => s.split(`"`)[0] ?? "" }
-  assert { asked == ["questions/b-blocks", "questions/c-pinned", "questions/a-plain", "questions/f-new"] }
-  assert { questions.contains(`<span class="badge">BLOCKER</span>`) and questions.contains("1 blocking") }
-  assert { html.split(`<span class="badge">BLOCKER</span>`).length == 3 }
+  assert { asked == ["questions/a-plain", "questions/b-blocks", "questions/c-pinned", "questions/f-new", "questions/g-legacy", "questions/h-legacy"] }
+  assert { questions.contains(`<span class="badge">BLOCKER</span>`) and questions.contains("2 blocking") }
+  assert { html.split(`<span class="badge">BLOCKER</span>`).length == 5 }
+  assert { questions.contains(`<span class="prio p1">P1</span>`) and questions.contains(`<span class="prio pn">unprioritized</span>`) }
+  assert { questions.contains(`<a href="questions.html">Answer them in questions.html</a>`) }
 
   # The Blocks list stays complete: every active Block has its one card.
   assert { html.split(`id="b-questions/d-led"`).length == 2 }
@@ -360,23 +453,23 @@ let testContextHtmlCurated(source: Workspace!): String! {
 let testContextShortIds(source: Workspace!): String! {
   let ctx = context
     .blockWrite("facts/a", ContextBlockKind.FACT, "not a question")
-    .blockWrite("questions/one", ContextBlockKind.QUESTION, "first?")
-    .blockWrite("questions/two", ContextBlockKind.QUESTION, "second? see Q-1")
-  assert { ctx.blockIndex.contains("questions/one  question  Q-1  1 line(s)") }
-  assert { ctx.blockIndex.contains("questions/two  question  Q-2  1 line(s)") }
+    .blockWrite("questions/one", ContextBlockKind.QUESTION, "first?", priority: p2, summary: "q")
+    .blockWrite("questions/two", ContextBlockKind.QUESTION, "second? see Q-1", priority: p2, summary: "q")
+  assert { ctx.blockIndex.contains("questions/one  question  Q-1  P2  3 line(s)") }
+  assert { ctx.blockIndex.contains("questions/two  question  Q-2  P2  3 line(s)") }
   assert { ctx.blockIndex.contains("facts/a  fact  1 line(s)") }
-  assert { readBlock(ctx, "Q-2").contains("── questions/two · question · Q-2 ──") }
+  assert { readBlock(ctx, "Q-2").contains("── questions/two · question · Q-2 · P2 ──") }
   assert { ctx.compose(ids: ["Q-1"]).contains("first?") }
 
   # Rewrites keep the number; forgetting the newest never frees it.
-  let rewritten = ctx.blockWrite("questions/one", ContextBlockKind.QUESTION, "first, reworded?")
+  let rewritten = ctx.blockWrite("questions/one", ContextBlockKind.QUESTION, "first, reworded?", priority: p2, summary: "q")
   assert { rewritten.blockIndex.contains("questions/one  question  Q-1") }
-  let pruned = rewritten.blockDrop(["Q-2"], forget: true).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?")
+  let pruned = rewritten.blockDrop(["Q-2"], forget: true).blockWrite("questions/three", ContextBlockKind.QUESTION, "third?", priority: p2, summary: "q")
   assert { pruned.blockIndex.contains("questions/three  question  Q-3") }
 
   # Answering supersedes the question by its number; the number stays.
   let answered = pruned.blockWrite("decisions/one", ContextBlockKind.DECISION, "answered", supersedes: ["Q-1"])
-  assert { answered.blockIndex.contains("questions/one  question  Q-1  1 line(s)  superseded by decisions/one") }
+  assert { answered.blockIndex.contains("questions/one  question  Q-1  P2  3 line(s)  superseded by decisions/one") }
   assert { readBlock(answered, "Q-1").contains("superseded by decisions/one") }
   let unknown = readBlock(answered, "Q-9") rescue { e: Error => e.message }
   assert { unknown.contains("no question Q-9") }
@@ -387,11 +480,11 @@ let testContextShortIds(source: Workspace!): String! {
   assert { markdownOf(answered).file("facts/a.md").contents.contains("number: null") }
   let fresh = importJson(context, jsonOf(answered))
   assert { readBlock(fresh, "Q-3").contains("third?") }
-  assert { fresh.blockWrite("questions/four", ContextBlockKind.QUESTION, "fourth?").blockIndex.contains("questions/four  question  Q-4") }
+  assert { fresh.blockWrite("questions/four", ContextBlockKind.QUESTION, "fourth?", priority: p2, summary: "q").blockIndex.contains("questions/four  question  Q-4") }
 
   # A clash with the session's own numbers renumbers the import; a
   # question recorded without a number (an older export) gets one.
-  let other = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?")
+  let other = context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?", priority: p2, summary: "q")
   let legacy = directory.withNewFile("questions/old.md", "---\nkind: question\n---\n\nolder export\n")
   let merged = importDir(importJson(other, jsonOf(answered)), legacy)
   assert { readBlock(merged, "Q-1").contains("mine?") }
@@ -407,20 +500,20 @@ let testContextShortIds(source: Workspace!): String! {
   assert { html.contains(`<a class="bid" href="#b-questions/three">`) }
 
   # blockWrite takes an existing question's Q-number as its id.
-  let reworded = answered.blockWrite("Q-3", ContextBlockKind.QUESTION, "third, reworded?")
+  let reworded = answered.blockWrite("Q-3", ContextBlockKind.QUESTION, "third, reworded?", priority: p2, summary: "q")
   assert { readBlock(reworded, "questions/three").contains("third, reworded?") }
 
   # A forgotten number stays retired across a context.json round trip, and
   # within the session that forgot it.
   let forgetting = context
-    .blockWrite("questions/x", ContextBlockKind.QUESTION, "x?")
-    .blockWrite("questions/y", ContextBlockKind.QUESTION, "y?")
+    .blockWrite("questions/x", ContextBlockKind.QUESTION, "x?", priority: p2, summary: "q")
+    .blockWrite("questions/y", ContextBlockKind.QUESTION, "y?", priority: p2, summary: "q")
     .blockDrop(["Q-2"], forget: true)
   let reborn = importJson(context, jsonOf(forgetting))
-    .blockWrite("questions/z", ContextBlockKind.QUESTION, "z?")
+    .blockWrite("questions/z", ContextBlockKind.QUESTION, "z?", priority: p2, summary: "q")
   assert { reborn.blockIndex.contains("questions/z  question  Q-3") }
-  let stranger = jsonOf(context.blockWrite("questions/other", ContextBlockKind.QUESTION, "other?")
-    .blockWrite("questions/second", ContextBlockKind.QUESTION, "second?"))
+  let stranger = jsonOf(context.blockWrite("questions/other", ContextBlockKind.QUESTION, "other?", priority: p2, summary: "q")
+    .blockWrite("questions/second", ContextBlockKind.QUESTION, "second?", priority: p2, summary: "q"))
   let into = importJson(forgetting, stranger)
   assert { into.blockIndex.contains("questions/other  question  Q-3") }
   assert { into.blockIndex.contains("questions/second  question  Q-4") }
@@ -428,17 +521,26 @@ let testContextShortIds(source: Workspace!): String! {
   # Renumbering carries the imported text's citations along.
   let theirs = jsonOf(context
     .blockWrite("notes/m", ContextBlockKind.NOTE, "blocked on Q-1, not Q-7")
-    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?"))
-  let mine = importJson(context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?"), theirs)
+    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?", priority: p2, summary: "q"))
+  let mine = importJson(context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?", priority: p2, summary: "q"), theirs)
   assert { mine.blockIndex.contains("questions/theirs  question  Q-2") }
   assert { readBlock(mine, "notes/m").contains("blocked on Q-2, not Q-7") }
   assert { readBlock(mine, "Q-1").contains("mine?") }
+
+  # ... and a question's own fields along (questions/first is Q-1 there,
+  # Q-3 here).
+  let deps = jsonOf(context
+    .blockWrite("questions/first", ContextBlockKind.QUESTION, "first?", priority: p2, summary: "q")
+    .blockWrite("questions/then", ContextBlockKind.QUESTION, "then?", priority: ContextQuestionPriority.P1,
+      summary: "after Q-1", blocks: "Q-1", options: ["wait for Q-1"], recommended: "A"))
+  let followed = readBlock(importJson(context.blockWrite("questions/mine", ContextBlockKind.QUESTION, "mine?", priority: p2, summary: "q"), deps), "questions/then")
+  assert { followed.contains("· blocks: Q-3 ──\nTL;DR: after Q-3\n") and followed.contains("A. wait for Q-3  (recommended)") }
 
   # KEEP leaves a clashing question out; citations of it follow the
   # session's number for it (questions/theirs is Q-2 in mine, Q-1 there).
   let kept = importJson(mine, jsonOf(context
     .blockWrite("notes/k", ContextBlockKind.NOTE, "about Q-1")
-    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?")), onConflict: ContextImportConflict.KEEP)
+    .blockWrite("questions/theirs", ContextBlockKind.QUESTION, "theirs?", priority: p2, summary: "q")), onConflict: ContextImportConflict.KEEP)
   assert { readBlock(kept, "notes/k").contains("about Q-2") }
 
   # Re-importing a legacy file with REPLACE keeps the number it got.
@@ -455,12 +557,12 @@ let testContextDrop(source: Workspace!): String! {
   let ctx = context
     .blockWrite("facts/keep", ContextBlockKind.FACT, "still true")
     .blockWrite("results/served", ContextBlockKind.RESULT, "served its purpose")
-    .blockWrite("questions/moot", ContextBlockKind.QUESTION, "moot now? see results/served", tags: ["blocker"])
+    .blockWrite("questions/moot", ContextBlockKind.QUESTION, "moot now? see results/served", tags: ["blocker"], priority: p2, summary: "moot?")
   let dropped = ctx.blockDrop(["results/served", "Q-1"])
   let index = dropped.blockIndex
   assert { index.contains("3 block(s) — 1 active (1 text line(s), 0 pinned), 0 superseded, 2 dropped") }
   assert { index.contains("results/served  result  1 line(s)  dropped") }
-  assert { index.contains("questions/moot  question  Q-1  1 line(s)  #blocker  dropped") }
+  assert { index.contains("questions/moot  question  Q-1  P2  3 line(s)  #blocker  dropped") }
   assert { !dropped.compose.contains("served its purpose") }
   assert { dropped.compose.contains("2 superseded or dropped block(s) held out") }
   let named = readBlock(dropped, "results/served")
@@ -497,7 +599,7 @@ let testContextDrop(source: Workspace!): String! {
   let revived = dropped.blockWrite("results/served", ContextBlockKind.RESULT, "useful again")
   assert { revived.blockIndex.contains("results/served  result  1 line(s)\n") }
   let replaced = dropped.blockWrite("decisions/settled", ContextBlockKind.DECISION, "answered after all", supersedes: ["Q-1"])
-  assert { replaced.blockIndex.contains("questions/moot  question  Q-1  1 line(s)  #blocker  superseded by decisions/settled") }
+  assert { replaced.blockIndex.contains("questions/moot  question  Q-1  P2  3 line(s)  #blocker  superseded by decisions/settled") }
   assert { replaced.blockIndex.contains("1 superseded, 1 dropped") }
 
   # A superseded Block whose replacement was dropped says so.
@@ -515,6 +617,129 @@ let testContextDrop(source: Workspace!): String! {
   }
   assert { orphan.contains(`cannot lead with "results/r1": it is superseded`) and !orphan.contains("()") }
   "Context drop checks passed."
+}
+
+# Structured questions: blockWrite's requirements, ordering by priority in
+# blockIndex and compose, exact round trips through every format, defaults
+# for older exports, and questions.html.
+let testContextQuestions(source: Workspace!): String! {
+  let failure(ctx: Context!): String! { ctx.blockIndex rescue { e: Error => e.message } }
+
+  # A QUESTION needs a priority and a summary; other kinds take neither,
+  # and a recommendation must name an option.
+  let bare = failure(context.blockWrite("questions/bare", ContextBlockKind.QUESTION, "bare?"))
+  assert { bare.contains(`question "questions/bare" needs a priority (P0, P1, P2 or P3) and a summary`) }
+  let unsummarized = failure(context.blockWrite("questions/bare", ContextBlockKind.QUESTION, "bare?", priority: p2, summary: " \n "))
+  assert { unsummarized.contains("needs a summary") and !unsummarized.contains("a priority") }
+  let onFact = failure(context.blockWrite("facts/f", ContextBlockKind.FACT, "f", priority: p2, options: ["x"]))
+  assert { onFact.contains(`priority, options: only a QUESTION takes these, and "facts/f" is a fact`) }
+  let stray = failure(context.blockWrite("questions/q", ContextBlockKind.QUESTION, "q", priority: p2, summary: "q",
+    options: ["a", "b"], recommended: "C"))
+  assert { stray.contains(`recommended "C" names no option of "questions/q": its options are A, B`) }
+  let blank = failure(context.blockWrite("questions/q", ContextBlockKind.QUESTION, "q", priority: p2, summary: "q", options: ["a", " "]))
+  assert { blank.contains("option B of \"questions/q\" is empty") }
+
+  # Question details are freeform Markdown, without prescribed headings.
+  let land = "See facts/a and #12.\n\nEveryone is affected.\n\nBefore beta.25."
+  let ctx = context
+    .blockWrite("facts/a", ContextBlockKind.FACT, "a fact")
+    .blockWrite("questions/later", ContextBlockKind.QUESTION, "whenever", priority: ContextQuestionPriority.P3, summary: "Later?")
+    .blockWrite("questions/land", ContextBlockKind.QUESTION, land, priority: ContextQuestionPriority.P0,
+      blocks: "the  beta.25\nrelease", summary: " How do we land it? ",
+      options: ["Wait for the tag, then restack", "Restack now: see Q-1", "Merge as is"], recommended: "a")
+    .blockWrite("questions/mid", ContextBlockKind.QUESTION, "mid", priority: p2, summary: "Mid?", options: ["yes", "no"])
+
+  # Open questions by priority, everywhere; the headline counts them. A
+  # question's size counts its summary and options, as compose prints them.
+  let index = ctx.blockIndex
+  assert { index.contains("; 3 open question(s), 1 P0") }
+  assert { index.contains("questions/land  question  Q-2  P0  blocks: the beta.25 release  12 line(s)") }
+  assert { index.contains("questions/mid  question  Q-3  P2  7 line(s)") }
+  let budgeted = ctx.compose(budget: 4)
+  assert { budgeted.contains("composed 2 of 4 block(s), 4 text line(s)") and !budgeted.contains("Options:") }
+  let listed = index.split("\n").dropFirst(1).map { l => l.trimSpace.split("  ")[0] ?? "" }
+  assert { listed == ["facts/a", "questions/land", "questions/mid", "questions/later"] }
+  let composed = ctx.compose
+  assert { composed.contains("── questions/land · question · Q-2 · P0 · blocks: the beta.25 release ──\nTL;DR: How do we land it?\n\nSee facts/a and #12.") }
+  assert { composed.contains("Before beta.25.\n\nOptions:\n  A. Wait for the tag, then restack  (recommended)\n  B. Restack now: see Q-1\n  C. Merge as is") }
+  let afterLand = composed.split("── questions/land ")[1] ?? ""
+  assert { afterLand.contains("── questions/mid ") and (afterLand.split("── questions/mid ")[1] ?? "").contains("── questions/later ") }
+
+  # Every format carries the fields, exactly; markdown only on questions.
+  let answered = ctx.blockWrite("decisions/later", ContextBlockKind.DECISION, "Later, then.", supersedes: ["Q-1"])
+  assert { answered.blockIndex.contains("questions/later  question  Q-1  P3  3 line(s)  superseded by decisions/later") }
+  let same(a: Context!, b: Context!): Boolean! {
+    a.blockIndex == b.blockIndex and a.compose == b.compose and readBlock(a, "Q-1") == readBlock(b, "Q-1") and
+      jsonOf(a).contents == jsonOf(b).contents
+  }
+  assert { same(importJson(context, jsonOf(answered)), answered) }
+  assert { same(importDir(context, markdownOf(answered)), answered) }
+  assert { same(importDir(context, markdownOf(answered, flat: true)), answered) }
+  let md = markdownOf(answered).file("questions/land.md").contents
+  let front = md.trimPrefix("---\n").split("\n---\n\n", limit: 2)[0] ?? ""
+  let meta: {{priority: String, blocks: String!, summary: String!, options: [{{key: String!, text: String!, recommended: Boolean!}}!]!}}! = YAML.decode(front)
+  assert { meta.priority == "P0" and meta.blocks == "the beta.25 release" and meta.summary == "How do we land it?" }
+  assert { meta.options == [
+    {{key: "A", text: "Wait for the tag, then restack", recommended: true}},
+    {{key: "B", text: "Restack now: see Q-1", recommended: false}},
+    {{key: "C", text: "Merge as is", recommended: false}},
+  ] }
+  assert { !markdownOf(answered).file("facts/a.md").contents.contains("priority") }
+  let doc: {{blocks: [{{id: String!, priority: String, options: [{{key: String!}}!]!}}!]!}}! = JSON.decode(jsonOf(answered).contents)
+  assert { doc.blocks.filter { b => b.id == "questions/mid" }.map { b => [b.priority ?? ""] + b.options.map { o => o.key } } == [["P2", "A", "B"]] }
+  assert { doc.blocks.filter { b => b.id == "facts/a" }.map { b => b.priority == null and b.options.isEmpty } == [true] }
+
+  # Older exports: questions without the fields load unprioritized, listed
+  # last; a rewrite must add them. Malformed fields import nothing.
+  let legacy = directory
+    .withNewFile("questions/old.md", "---\nkind: question\n---\n\nolder export\n")
+    .withNewFile("context.json", `{"version": 1, "blocks": [{"id": "questions/older", "kind": "question", "text": "from json"}]}`)
+  let loaded = importDir(ctx, legacy)
+  assert { loaded.blockIndex.contains("; 5 open question(s), 1 P0, 2 unprioritized") }
+  assert { loaded.blockIndex.contains("unprioritized  1 line(s)") }
+  let asked = loaded.blockIndex.split("\n").map { l => l.trimSpace.split("  ")[0] ?? "" }.filter { id => id.hasPrefix("questions/") }
+  assert { asked == ["questions/land", "questions/mid", "questions/later", "questions/old", "questions/older"] }
+  assert { same(importJson(context, jsonOf(loaded)), loaded) }
+  assert { failure(loaded.blockWrite("questions/old", ContextBlockKind.QUESTION, "reworded")).contains("needs a priority") }
+  let onFactFile = failure(importDir(context, directory.withNewFile("facts/x.md", "---\nkind: fact\npriority: P1\n---\n\nx\n")))
+  assert { onFactFile.contains("belong to a question") }
+  let badPriority = failure(importDir(context, directory.withNewFile("questions/x.md", "---\nkind: question\npriority: P9\n---\n\nx\n")))
+  assert { badPriority.contains(`unknown priority "P9"`) }
+
+  # index.html badges questions and links to questions.html.
+  let html = htmlOf(answered)
+  assert { html.contains(`<a href="questions.html">Answer questions ↗</a>`) and html.contains(`<a href="questions.html">Answer them in questions.html</a>`) }
+  assert { html.contains(`<span class="prio p0">P0</span>`) and html.contains(`<span class="holds">blocks: the beta.25 release</span>`) }
+  assert { html.contains(`<p class="tldr">How do we land it?</p>`) }
+  assert { html.contains(`<li><b>A.</b> Wait for the tag, then restack<span class="rec">RECOMMENDED</span></li>`) }
+
+  # questions.html: open questions by priority, written beside index.html
+  # (flat too), self-contained and deterministic.
+  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["index.html", "questions.html"] }
+  let page = questionsOf(answered, repo: "vito/agents")
+  assert { page.hasPrefix("<!doctype html>") and !page.contains("<link") and !page.contains(" src=") }
+  assert { questionsOf(answered, repo: "vito/agents") == page }
+  let cards = page.split(`<section class="blk k-question q" id="q-`).dropFirst(1).map { s => s.split(`"`)[0] ?? "" }
+  assert { cards == ["questions/land", "questions/mid"] }
+  assert { page.contains(`data-id="questions/land" data-q="Q-2"`) and page.contains(`<span class="prio p0">P0</span>`) }
+  assert { page.contains(`<p class="tldr">How do we land it?</p><details><summary>More details</summary>`) }
+  assert { page.contains("<p>Everyone is affected.</p>") and page.contains("<p>Before beta.25.</p>") }
+  assert { questionsOf(loaded).contains("<details open><summary>More details</summary><p>older export</p>") }
+  assert { page.contains(`<input type="radio" name="q-questions/land" value="A" data-text="Wait for the tag, then restack">`) }
+  assert { page.split(`<span class="rec">RECOMMENDED</span>`).length == 2 }
+  assert { page.contains(`<a class="chip k-fact" href="index.html#b-facts/a"`) }
+  assert { page.contains(`href="index.html#b-questions/later" title="questions/later">Q-1</a>`) }
+  assert { page.contains(`href="https://github.com/vito/agents/issues/12"`) }
+  assert { page.contains("writing the DECISION that settles it") and page.contains("localStorage") }
+  assert { questionsOf(context.blockWrite("facts/a", ContextBlockKind.FACT, "a")).contains("No open questions.") }
+  # A question only an earlier context.json at the path holds stays on
+  # index.html, but is not offered for answering: the session lacks it.
+  let elsewhere = directory.withFile("out/context.json",
+    jsonOf(ctx.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
+  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML]))
+  assert { mixed.file("out/index.html").contents.contains(`id="b-questions/foreign"`) }
+  assert { !mixed.file("out/questions.html").contents.contains(`id="q-questions/foreign"`) }
+  "Context question checks passed."
 }
 
 # The agent sees six tools: curate, query, move.
