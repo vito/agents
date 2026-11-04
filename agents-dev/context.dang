@@ -193,6 +193,14 @@ let testContextExportRefresh(source: Workspace!): String! {
     e: Error => [e.message]
   }
   assert { omitted.any { s => s.contains("import the existing context first") } }
+  # After a selective import, only the session high-water mark remembers
+  # the cited question. It still reserves that number against foreign reuse.
+  let citationSession = importDir(context, citationOnly)
+  let unrelatedBundle = exportedDir(colliding, gistFormats)
+  let reserved = unrelatedBundle.withChanges(citationSession.exportContext(source: unrelatedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { reserved.any { s => s.contains("import the existing context first") } }
 
   # Foreign supersession metadata survives even when the prior selective
   # export omitted the replacement Block itself.
