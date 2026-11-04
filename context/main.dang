@@ -906,15 +906,16 @@ type Context {
     # Refresh an existing JSON copy even when only another format is requested.
     let writeJson = formats.contains(ExportFormat.JSON) or hasJson
     if (writeJson) {
-      # Foreign citations still use the prior copy's numbering. A partial
-      # import must not silently retarget them when the session renumbered it.
+      # Foreign and session citations use their original namespaces, even
+      # when selection omits the questions they cite. Check the whole session.
+      let priorHigh = maxNumber(prior, priorDoc.questions)
       if (!foreign.isEmpty and (prior.any { old =>
-        old.number != null and copy.any { b =>
+        old.number != null and blocks.values.any { b =>
           b.address == old.address and b.number != old.number
         }
-      } or copy.any { b =>
+      } or blocks.values.any { b =>
         let n = b.number
-        n != null and n <= priorDoc.questions and
+        n != null and n <= priorHigh and
           !prior.any { old => old.address == b.address and old.number == n }
       })) {
         raise "cannot refresh foreign blocks after question numbers changed — import the existing context first to reconcile citations"

@@ -186,6 +186,13 @@ let testContextExportRefresh(source: Workspace!): String! {
     e: Error => [e.message]
   }
   assert { reused.any { s => s.contains("import the existing context first") } }
+  # The opposite selection also conflicts: a session note can cite its
+  # omitted question while the copy retains another question with that number.
+  let omitted = numberedBundle.withChanges(colliding.blockWrite("notes/new", ContextBlockKind.NOTE, "See Q-1")
+    .exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], ids: ["notes/new"])).entries rescue {
+    e: Error => [e.message]
+  }
+  assert { omitted.any { s => s.contains("import the existing context first") } }
 
   # Foreign supersession metadata survives even when the prior selective
   # export omitted the replacement Block itself.
