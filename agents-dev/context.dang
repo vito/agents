@@ -150,6 +150,17 @@ let testContextExportRefresh(source: Workspace!): String! {
   assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
   # Format selection still controls creation: HTML alone adds no JSON file.
   assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["index.html", "questions.html"] }
+
+  # A different session refreshing HTML must not lower the JSON's retired
+  # Q-number high-water mark, even when that question no longer has a Block.
+  let retired = question.blockWrite("questions/retired", ContextBlockKind.QUESTION, "obsolete", priority: p2, summary: "Obsolete?")
+    .blockDrop(["questions/retired"], forget: true)
+  let numberedBundle = exportedDir(retired, gistFormats)
+  let other = context.blockWrite("notes/other", ContextBlockKind.NOTE, "another session")
+  let refreshedBundle = numberedBundle.withChanges(other.exportContext(source: numberedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
+  let resumed = importDir(context, refreshedBundle)
+    .blockWrite("questions/next", ContextBlockKind.QUESTION, "next", priority: p2, summary: "Next?")
+  assert { resumed.blockIndex.contains("questions/next  question  Q-3") }
   "Export refresh checks passed."
 }
 

@@ -859,11 +859,12 @@ type Context {
     let mdFiles = base.glob(prefix + "**/*.md")
     let jsonPath = prefix + "context.json"
     let hasJson = base.glob(jsonPath).contains(jsonPath)
-    let prior = if (hasJson) {
-      parseJsonBlocks(jsonPath, base.file(jsonPath).contents).blocks
+    let priorDoc = if (hasJson) {
+      parseJsonBlocks(jsonPath, base.file(jsonPath).contents)
     } else {
-      [] :: [Block!]!
+      {{blocks: [] :: [Block!]!, questions: 0}}
     }
+    let prior = priorDoc.blocks
     let held = mdFiles.map { f => idForFile(f.trimPrefix(prefix)) } + prior.map { b => b.address }
     let copy = ordered.filter { b => chosen.contains(b.address) or held.contains(b.address) }
     # Blocks of the old context.json this Context lacks (forgotten, or from
@@ -905,7 +906,7 @@ type Context {
     # Refresh an existing JSON copy even when only another format is requested.
     let writeJson = formats.contains(ExportFormat.JSON) or hasJson
     if (writeJson) {
-      out = out.withNewFile(jsonPath, jsonOf(copy + foreign))
+      out = out.withNewFile(jsonPath, jsonOf(copy + foreign, priorDoc.questions))
       written += ["context.json"]
     }
     if (wantHtml) {
@@ -1232,11 +1233,12 @@ type Context {
   }
 
   # context.json for these Blocks: every field, plus question_count, the
-  # highest Q-number this Context ever assigned, so a session importing it
-  # never reuses a forgotten one.
-  let jsonOf(bs: [Block!]!): String! {
+  # highest Q-number this Context or the prior export ever assigned, so a
+  # session importing it never reuses a forgotten one.
+  let jsonOf(bs: [Block!]!, priorQuestions: Int! = 0): String! {
     # Computed outside the record: inside it, `blocks` is the sibling field.
-    let high = maxNumber(blocks.values, questionCount)
+    let floor = if (priorQuestions > questionCount) { priorQuestions } else { questionCount }
+    let high = maxNumber(blocks.values + bs, floor)
     let doc = {{
       version: exportVersion,
       question_count: high,
