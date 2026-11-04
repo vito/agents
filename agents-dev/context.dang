@@ -135,6 +135,21 @@ let testContextExportRefresh(source: Workspace!): String! {
   let d6 = elsewhere.withChanges(third.exportContext(source: elsewhere.asWorkspace, formats: [ContextExportFormat.JSON], ids: ["facts/newer"]))
   let json = d6.file("context/context.json").contents
   assert { json.contains(`"notes/elsewhere"`) and json.contains(`"facts/old"`) }
+
+  # Refresh a JSON+HTML bundle after answering, even when only HTML is
+  # requested. A narrow export keeps the old question and foreign Blocks.
+  let question = context.blockWrite("questions/ship", ContextBlockKind.QUESTION, "Ready to ship?", priority: p2, summary: "Ship?")
+  let bundle = exportedDir(question.blockWrite("notes/foreign", ContextBlockKind.NOTE, "kept from another session"), gistFormats)
+  let answered = question.blockWrite("decisions/ship", ContextBlockKind.DECISION, "Ship now.", supersedes: ["questions/ship"])
+  let updated = bundle.withChanges(answered.exportContext(source: bundle.asWorkspace, path: ".",
+    formats: [ContextExportFormat.HTML], ids: ["decisions/ship"]))
+  assert { updated.file("questions.html").contents.contains("No open questions.") }
+  let imported = importDir(context, updated)
+  assert { imported.compose.contains("Ship now.") and !imported.compose.contains("Ready to ship?") }
+  assert { readBlock(imported, "questions/ship").contains("superseded by decisions/ship") }
+  assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
+  # Format selection still controls creation: HTML alone adds no JSON file.
+  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["index.html", "questions.html"] }
   "Export refresh checks passed."
 }
 

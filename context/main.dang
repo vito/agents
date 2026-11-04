@@ -858,7 +858,8 @@ type Context {
     # from the copy, nor leaves one stale for an import to bring back.
     let mdFiles = base.glob(prefix + "**/*.md")
     let jsonPath = prefix + "context.json"
-    let prior = if (base.glob(jsonPath).contains(jsonPath)) {
+    let hasJson = base.glob(jsonPath).contains(jsonPath)
+    let prior = if (hasJson) {
       parseJsonBlocks(jsonPath, base.file(jsonPath).contents).blocks
     } else {
       [] :: [Block!]!
@@ -901,7 +902,9 @@ type Context {
         }
       }
     }
-    if (formats.contains(ExportFormat.JSON)) {
+    # Refresh an existing JSON copy even when only another format is requested.
+    let writeJson = formats.contains(ExportFormat.JSON) or hasJson
+    if (writeJson) {
       out = out.withNewFile(jsonPath, jsonOf(copy + foreign))
       written += ["context.json"]
     }
@@ -917,7 +920,7 @@ type Context {
     if (!moved.isEmpty) {
       notes += ["removing the other layout's file of " + moved.join(", ")]
     }
-    if (kept > 0 and (formats.contains(ExportFormat.JSON) or wantHtml)) {
+    if (kept > 0 and (writeJson or wantHtml)) {
       notes += [`keeping ${toString(kept)} more block(s) already exported here in the copy`]
     }
     let also = if (notes.isEmpty) { "" } else { " (" + notes.join("; ") + ")" }
