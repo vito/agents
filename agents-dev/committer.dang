@@ -369,6 +369,65 @@ let committerLogSubjects(listing: String!): [String!]! {
   listing.split("\n").filter { l => l.trimSpace.hasPrefix("fixture:") }.map { l => l.trimSpace }
 }
 
+# A `lines` branch off feature: lines.txt lands with four lines, then its
+# second line is rewritten, so blame splits it into three hunks and the
+# pickaxe can tell adding a string from rewriting it.
+let committerLinesFixture: GitRepository! {
+  committerRebaseFixture.withExec(["sh", "-eu", "-c", """
+    export GIT_AUTHOR_DATE=2026-09-15T12:06:00Z
+    export GIT_COMMITTER_DATE=$GIT_AUTHOR_DATE
+    git checkout -q -b lines feature
+    printf 'one\ntwo\nthree\nfour\n' > lines.txt
+    git add lines.txt
+    git commit -qm 'fixture: four lines'
+    printf 'one\nTWO\nthree\nfour\n' > lines.txt
+    git commit -qam 'fixture: shout two'
+    git checkout -q main
+  """]).directory("/repo").asGit
+}
+
+let checkCommitterArchaeology: String! {
+  let fixture = committerLinesFixture
+  let lines = fixture.branch("lines").asWorkspace
+  let upstream = fixture.branch("main")
+
+  # Blame compacts consecutive lines of one commit into a single row.
+  let whole = committer.blame(source: lines, path: "lines.txt")
+  assert { whole.contains("lines 1-4 in 3 hunk(s)") }
+  # Each row is "<span>  <hash>  <date>  <author>  <subject>".
+  let rows = whole.split("\n").filter { l => l.contains("fixture:") }.map { l =>
+    let cols = l.trimSpace.split("  ")
+    cols.takeFirst.join("") + " | " + cols.takeLast.join("")
+  }
+  assert { rows == ["1 | fixture: four lines", "2 | fixture: shout two", "3-4 | fixture: four lines"] }
+  let ranged = committer.blame(source: lines, path: "lines.txt", startLine: 2, endLine: 3)
+  assert { ranged.contains("lines 2-3 in 2 hunk(s)") }
+  let missing = committer.blame(source: lines, path: "nope.txt") rescue { e: Error => e.message }
+  assert { missing.contains("nope.txt does not exist at") }
+  let backwards = committer.blame(source: lines, path: "lines.txt", startLine: 3, endLine: 2) rescue { e: Error => e.message }
+  assert { backwards.contains("endLine must not be smaller than startLine") }
+
+  # The pickaxe matches commits that change how often a string occurs, and
+  # is case-sensitive like `git log -S`.
+  assert { committerLogSubjects(committer.log(source: lines, pickaxe: "TWO")) == ["fixture: shout two"] }
+  assert { committerLogSubjects(committer.log(source: lines, pickaxe: "two")) == ["fixture: shout two", "fixture: four lines"] }
+  let limited = committer.log(source: lines, pickaxe: "two", limit: 1)
+  assert { committerLogSubjects(limited) == ["fixture: shout two"] }
+  assert { limited.contains("more pickaxe matches below") }
+  let grepped = committer.log(source: lines, pickaxe: "two", grep: "FOUR")
+  assert { committerLogSubjects(grepped) == ["fixture: four lines"] }
+  let scoped = committer.log(source: lines, pickaxe: "two", paths: ["shared.txt"])
+  assert { scoped.contains("No commit changes the number of occurrences of \"two\" under the given paths.") }
+  let withBase = committer.log(source: lines, pickaxe: "two", base: upstream) rescue { e: Error => e.message }
+  assert { withBase.contains("pickaxe does not combine with base") }
+
+  # Commit spellings resolve natively: revision syntax and short hashes.
+  assert { committer.show(source: lines, commit: "HEAD~1").contains("fixture: four lines") }
+  let fork = fixture.tag("fork").commitSHA
+  assert { committer.show(source: lines, commit: fork.split("").takeFirst(7).join("")).contains("fixture: fork point") }
+  "Committer blame and pickaxe checks passed."
+}
+
 # A `tools` branch off main whose commits flip tool.sh's mode: `plain` and
 # `again` are different commits with the same tree, `exec` differs only in
 # mode, and `mixed` changes content and mode together, turns alias.txt into

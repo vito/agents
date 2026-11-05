@@ -43,6 +43,12 @@ type AgentsDev {
     null
   }
 
+  """Check blame hunks and ranges, the log pickaxe, and native commit-spelling resolution."""
+  committerArchaeology: Void @check {
+    print(checkCommitterArchaeology)
+    null
+  }
+
   """Check glob filtering and commits on a private frozen workspace."""
   committerFiltering(source: Workspace!): Void @check {
     print(checkCommitterFiltering(source))
