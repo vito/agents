@@ -334,6 +334,8 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
   let gone = all.filter { b => b.superseded }
   let dropped = all.filter { b => b.dropped }
   let pinned = active.filter { b => b.pin }
+  # Body text only; a lower bound on the rendered orientation cost.
+  let pinnedChars = pinned.reduce(0) { n, b => n + b.text.length }
   let refs: Map[[String!]!]! = all.reduce(([:] :: Map[[String!]!]!)) { acc, b => acc.with(b.address, refsOf(b, known)) }
 
   # Tags of active blocks, most used first (ties: first seen in composition
@@ -430,7 +432,11 @@ let contextHtml(all: [Block!]!, title: String!, repo: String!, lead: [String!]!)
 
   page += `<div class="legend">` + kinds.map { k =>
     `<span><span class="kind k-${kindLabel(k)}">${kindLabel(k).toUpper}</span> ×${toString(kindCount(k))}</span>`
-  }.join("") + `<span><span class="pin">📌 pinned</span> ×${toString(pinned.length)}</span><span class="sub">(pinned = composed into every turn)</span></div>` + "\n"
+  }.join("") + `<span><span class="pin">📌 pinned</span> ×${toString(pinned.length)}</span><span class="sub">(pinned = candidates for bounded orientation, not automatic per-turn injection)</span></div>` + "\n"
+  page += `<div class="sub pin-cost">Active pinned body text: ${toString(pinnedChars)} character(s), excluding headers, summaries and options.</div>` + "\n"
+  if (pinnedChars > 12000) {
+    page += `<p class="pin-warning">Pinned bodies alone exceed the default 12000-character orientation budget. Keep a small current handoff and cross-task constraints pinned; unpin historical milestones with blockPin rather than deleting their records. Orientation will report omitted pins.</p>` + "\n"
+  }
 
   let leading = lead.reduce(([] :: [Block!]!)) { acc, id =>
     let b = known[id]

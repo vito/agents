@@ -73,7 +73,25 @@ type AgentsDev {
     null
   }
 
-  """Check the context agent sees exactly its six tools."""
+  """Check focused compose selection, rendered character and line budgets, and explicit full reads."""
+  contextRetrieval: Void @check {
+    print(testContextRetrieval)
+    null
+  }
+
+  """Check whole-output bounded orientation, oversized/many pins and inactive pin exclusion."""
+  contextOrient: Void @check {
+    print(testContextOrient)
+    null
+  }
+
+  """Check metadata-only pin changes, Q aliases, history preservation and atomic validation."""
+  contextPin: Void @check {
+    print(testContextPin)
+    null
+  }
+
+  """Check the context agent sees its eight tools."""
   contextTools: Void @check {
     print(testContextTools)
     null

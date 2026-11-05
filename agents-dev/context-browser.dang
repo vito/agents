@@ -46,7 +46,22 @@ let testContextDynamicHtml(source: Workspace!): String! {
   let selected = directory.withChanges(own.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], ids: ["questions/urgent"], title: title)).directory("out")
   let selectedDoc: {{blocks: [{{id: String!}}!]!}}! = JSON.decode(selected.file("context.json").contents)
   assert { selectedDoc.blocks.map { b => b.id } == ["questions/urgent"] }
+  # A pathological pin set must be visible, without counting historical pins.
+  let pins = context
+  let body = "📌".padRight(400)
+  let n = 0
+  loop {
+    if (n == 41) { break }
+    pins = pins.blockWrite("notes/pin-" + toString(n), ContextBlockKind.NOTE, body, pin: true)
+    n += 1
+  }
+  pins = pins.blockWrite("notes/dropped", ContextBlockKind.NOTE, body, pin: true).blockDrop(["notes/dropped"])
+    .blockWrite("notes/old", ContextBlockKind.NOTE, body, pin: true)
+    .blockWrite("notes/new", ContextBlockKind.NOTE, "Current, unpinned", supersedes: ["notes/old"])
+  let pinDynamic = exportedDir(pins, [ContextExportFormat.HTML])
+  let pinOffline = directory.withChanges(pins.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true)).directory("out")
   let files = directory.withDirectory("dynamic", dynamic).withDirectory("offline", offline).withDirectory("large", enlarged).withDirectory("selected", selected)
+    .withDirectory("pins", pinDynamic).withDirectory("pins-offline", pinOffline)
   container.from("mcr.microsoft.com/playwright:v1.58.2-noble")
     .withWorkdir("/tests")
     .withExec(["npm", "install", "--no-audit", "--no-fund", "--save-exact", "@playwright/test@1.58.2"])

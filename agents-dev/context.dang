@@ -647,11 +647,12 @@ let testContextDrop(source: Workspace!): String! {
   assert { named.contains("served its purpose") and named.contains("(dropped — kept for the record") }
   assert { named.contains("composed 1 of 3 block(s)") }
 
-  # A read by id alone is just that Block; pins ride along otherwise.
+  # Focused reads add pins only by explicit opt-in.
   let pinned = dropped.blockWrite("facts/pinned", ContextBlockKind.FACT, "always here", pin: true)
   assert { !readBlock(pinned, "results/served").contains("always here") }
   assert { pinned.compose.contains("always here") }
-  assert { pinned.compose(tags: ["nope"]).contains("always here") }
+  assert { !pinned.compose(tags: ["nope"]).contains("always here") }
+  assert { pinned.compose(tags: ["nope"], includePins: true).contains("always here") }
 
   # Dropping twice is refused; forget is the explicit way out.
   let again = dropped.blockDrop(["results/served"]).blockIndex rescue { e: Error => e.message }
@@ -820,10 +821,180 @@ let testContextQuestions(source: Workspace!): String! {
   "Context question checks passed."
 }
 
-# The agent sees six tools: curate, query, move.
+# Retrieval budgets count complete rendered Blocks, not merely payloads.
+let composedBody(doc: String!): String! {
+  doc.split("\n\n", limit: 2)[1] ?? ""
+}
+
+let testContextRetrieval: String! {
+  let ctx = context
+    .blockWrite("facts/pin", ContextBlockKind.FACT, "orientation payload", tags: ["global"], pin: true)
+    .blockWrite("notes/task", ContextBlockKind.NOTE, "task payload", tags: ["task"])
+    .blockWrite("notes/old", ContextBlockKind.NOTE, "old payload", pin: true)
+    .blockWrite("notes/new", ContextBlockKind.NOTE, "new payload", supersedes: ["notes/old"])
+    .blockWrite("notes/dropped", ContextBlockKind.NOTE, "dropped payload", pin: true)
+    .blockDrop(["notes/dropped"])
+  [ctx.compose(tags: ["task"]), ctx.compose(kinds: [ContextBlockKind.NOTE]),
+    ctx.compose(ids: ["notes/task"])].each { doc =>
+    assert { doc.contains("task payload") and !doc.contains("orientation payload") }
+    assert { !doc.contains("old payload") and !doc.contains("dropped payload") }
+  }
+  [ctx.compose(tags: ["task"], includePins: true),
+    ctx.compose(kinds: [ContextBlockKind.NOTE], includePins: true),
+    ctx.compose(ids: ["notes/task"], includePins: true), ctx.compose].each { doc =>
+    assert { doc.contains("task payload") and doc.contains("orientation payload") }
+    assert { !doc.contains("old payload") and !doc.contains("dropped payload") }
+  }
+  assert { ctx.compose(ids: ["notes/old", "notes/dropped"]).contains("old payload") }
+  assert { ctx.compose(ids: ["notes/old", "notes/dropped"]).contains("dropped payload") }
+  assert { ctx.compose(ids: ["facts/pin"], tags: ["task"]).contains("orientation payload") }
+
+  let huge = "LONG-SINGLE-LINE".padRight(13000)
+  let large = context.blockWrite("facts/huge", ContextBlockKind.FACT, huge, pin: true)
+    .blockWrite("notes/small", ContextBlockKind.NOTE, "small payload")
+  let limited = large.compose
+  assert { !limited.contains(huge) and limited.contains("small payload") }
+  assert { limited.contains("facts/huge") and limited.contains("exceeds character budget") }
+  assert { large.compose(ids: ["facts/huge"]).contains("composed 0 of 2") }
+  assert { large.compose(ids: ["facts/huge"], maxChars: 0).contains(huge) }
+  assert { large.compose(maxChars: 0, budget: 1).contains(huge) }
+  assert { !large.compose(maxChars: 0, budget: 1).contains("small payload") }
+
+  let lines = context.blockWrite("facts/lines", ContextBlockKind.FACT, "first\nsecond", pin: true)
+    .blockWrite("notes/small", ContextBlockKind.NOTE, "small payload")
+  let lineLimited = lines.compose(budget: 1)
+  assert { !lineLimited.contains("first\nsecond") and lineLimited.contains("exceeds line budget") }
+  assert { lineLimited.contains("small payload") }
+  assert { lines.compose(budget: 1, maxChars: 1).contains("exceeds line budget and character budget") }
+
+  # Exact admission boundaries include headers, unicode, question fields,
+  # status notes and inter-block separators. The manifest is excluded.
+  let question = context.blockWrite("questions/q", ContextBlockKind.QUESTION, "é🙂 payload", pin: true,
+    tags: ["tag"], priority: p2, summary: "Summary", blocks: "release", options: ["yes", "no"], recommended: "A")
+  let full = question.compose(maxChars: 0)
+  let cost = composedBody(full).length
+  assert { question.compose(maxChars: cost) == full }
+  assert { !question.compose(maxChars: cost - 1).contains("é🙂 payload") }
+  assert { question.compose(maxChars: cost).length > cost }
+  assert { question.blockIndex.contains(`active pin rendered cost: ${toString(cost)} character(s)`) }
+  let dropped = question.blockDrop(["Q-1"])
+  let history = dropped.compose(ids: ["Q-1"], maxChars: 0)
+  let historyCost = composedBody(history).length
+  assert { dropped.compose(ids: ["Q-1"], maxChars: historyCost) == history }
+  assert { !dropped.compose(ids: ["Q-1"], maxChars: historyCost - 1).contains("é🙂 payload") }
+  let pair = question.blockWrite("notes/second", ContextBlockKind.NOTE, "second payload")
+  let pairFull = pair.compose(maxChars: 0)
+  let pairCost = composedBody(pairFull).length
+  assert { pair.compose(maxChars: pairCost) == pairFull }
+  assert { !pair.compose(maxChars: pairCost - 1).contains("second payload") }
+  [context, question].each { state =>
+    assert { (state.compose(maxChars: -1) rescue { e: Error => e.message }).contains("nonnegative") }
+    assert { (state.compose(budget: -1) rescue { e: Error => e.message }).contains("nonnegative") }
+    assert { (state.compose(ids: ["missing"]) rescue { e: Error => e.message }).contains("no block") }
+  }
+  assert { large.blockIndex.contains("warning: active pins exceed") and large.blockIndex.contains("blockPin") }
+  assert { !large.blockPin(["facts/huge"], false).blockIndex.contains("warning:") }
+  assert { !large.blockDrop(["facts/huge"]).blockIndex.contains("warning:") }
+  "Context focused retrieval checks passed."
+}
+
+let testContextOrient: String! {
+  assert { context.orient.contains("0 of 0 active pin(s)") }
+  assert { context.orient.length <= 12000 }
+  let ctx = context
+    .blockWrite("facts/huge", ContextBlockKind.FACT, "HUGE".padRight(13000), pin: true)
+    .blockWrite("facts/small", ContextBlockKind.FACT, "small orientation", pin: true)
+    .blockWrite("notes/unpinned", ContextBlockKind.NOTE, "not orientation")
+    .blockWrite("notes/old", ContextBlockKind.NOTE, "old orientation", pin: true)
+    .blockWrite("notes/new", ContextBlockKind.NOTE, "new unpinned", supersedes: ["notes/old"])
+    .blockWrite("notes/dropped", ContextBlockKind.NOTE, "dropped orientation", pin: true)
+    .blockDrop(["notes/dropped"])
+  let doc = ctx.orient
+  assert { doc.length <= 12000 and doc.contains("1 of 2 active pin(s); 1 omitted") }
+  assert { doc.contains("small orientation") and !doc.contains("HUGE") }
+  assert { !doc.contains("not orientation") and !doc.contains("old orientation") and !doc.contains("dropped orientation") }
+  assert { doc.contains("blockIndex") and doc.contains("maxChars: 0") }
+  assert { ctx.orient(maxChars: 14000).contains("HUGE") }
+  assert { ctx.orient(maxChars: 14000).length <= 14000 }
+
+  # Entire-output boundaries: metadata can push a body that fits over budget.
+  let pin = context.blockWrite("facts/pin", ContextBlockKind.FACT, "WHOLE".padRight(300), pin: true)
+  let full = pin.orient
+  let cost = full.length
+  assert { pin.orient(maxChars: cost) == full }
+  let short = pin.orient(maxChars: cost - 1)
+  assert { short.length <= cost - 1 and short.contains("1 omitted") and !short.contains("WHOLE") }
+  let bodyCost = composedBody(pin.compose(maxChars: 0)).length
+  assert { !pin.orient(maxChars: bodyCost).contains("WHOLE") }
+
+  # Many individually oversized pins, with huge metadata as well as bodies:
+  # no per-omission ids or index lines can escape the total-output budget.
+  let records = "".padRight(100).split("").map { _, i =>
+    {{id: `facts/pin-${toString(i)}`, kind: "fact", text: "PAYLOAD".padRight(1500),
+      tags: ["metadata".padRight(1500).replace(" ", "x")], pin: true}}
+  }
+  let many = importDir(context, directory.withNewFile("context.json", JSON.encode({{version: 1, blocks: records}})))
+  [256, 500, 12000].each { ceiling =>
+    let result = many.orient(maxChars: ceiling)
+    assert { result.length <= ceiling and result.contains("omitted") }
+    assert { !result.contains("facts/pin-99") }
+  }
+  let tiny = many.orient(maxChars: 256)
+  assert { tiny.contains("0 of 100 active pin(s); 100 omitted") and !tiny.contains("PAYLOAD") }
+  # Metadata alone must fit, even when the payload itself is tiny.
+  let metadata = context.blockWrite("notes/meta", ContextBlockKind.NOTE, "BODY", tags: ["tag".padRight(13000).replace(" ", "x")], pin: true)
+  assert { metadata.orient.length <= 12000 and !metadata.orient.contains("BODY") }
+  [context, pin].each { state =>
+    [-1, 0, 1, 255].each { ceiling =>
+      assert { (state.orient(maxChars: ceiling) rescue { e: Error => e.message }).contains("at least 256") }
+    }
+    assert { state.orient(maxChars: 256).length <= 256 }
+  }
+  "Context bounded orientation checks passed."
+}
+
+let testContextPin: String! {
+  let ctx = context
+    .blockWrite("facts/prior", ContextBlockKind.FACT, "old fact", tags: ["history"], pin: true)
+    .blockWrite("questions/q", ContextBlockKind.QUESTION, "details\nQ-1", tags: ["blocker", "history"],
+      pin: true, supersedes: ["facts/prior"], priority: p2, blocks: "release", summary: "Question?",
+      options: ["yes", "no"], recommended: "B")
+    .blockWrite("notes/drop", ContextBlockKind.NOTE, "dropped text", pin: true)
+    .blockDrop(["notes/drop"])
+  let ids = ["facts/prior", "Q-1", "notes/drop"]
+  let off = ctx.blockPin(ids + ["questions/q"], false)
+  # Exact exported JSON equality after changing only true pin fields proves
+  # text, links, status, question fields and high-water mark all survive.
+  assert { jsonOf(off).contents == jsonOf(ctx).contents.rewriteMatches(`"pin"\s*:\s*true`) { m => m.string.replace("true", "false") } }
+  assert { off.blockPin(ids, true).blockIndex == ctx.blockIndex }
+  assert { jsonOf(off.blockPin(ids, true)).contents == jsonOf(ctx).contents }
+  assert { jsonOf(off.blockPin(ids, false)).contents == jsonOf(off).contents }
+  assert { off.compose(ids: ["Q-1"]).contains("details\nQ-1") }
+  assert { off.orient.contains("0 of 0 active pin(s)") }
+  assert { off.blockIndex.contains("1 superseded, 1 dropped") }
+  assert { off.blockPin(ids, true).orient.contains("1 of 1 active pin(s)") }
+  assert { off.blockWrite("questions/next", ContextBlockKind.QUESTION, "next?", priority: p2, summary: "Next?").blockIndex.contains("Q-2") }
+  # Toggling historical questions must not revive them or strip options,
+  # priority, summary, blockers, Q-number or supersession links.
+  [ctx.blockDrop(["Q-1"]),
+    ctx.blockWrite("decisions/answer", ContextBlockKind.DECISION, "answered", supersedes: ["Q-1"])].each { historical =>
+    let curated = historical.blockPin(ids, false)
+    assert { jsonOf(curated).contents == jsonOf(historical).contents.rewriteMatches(`"pin"\s*:\s*true`) { m => m.string.replace("true", "false") } }
+    assert { jsonOf(curated.blockPin(ids, true)).contents == jsonOf(historical).contents }
+    assert { curated.blockPin(ids, true).orient.contains("0 of 0 active pin(s)") }
+  }
+  let before = jsonOf(ctx).contents
+  assert { (ctx.blockPin([], false).blockIndex rescue { e: Error => e.message }).contains("at least one") }
+  assert { (ctx.blockPin(["Q-1", "missing"], false).blockIndex rescue { e: Error => e.message }).contains("no block") }
+  assert { (ctx.blockPin(["Q-1", "Q-99"], false).blockIndex rescue { e: Error => e.message }).contains("no question Q-99") }
+  assert { jsonOf(ctx).contents == before }
+  "Context metadata-only pin checks passed."
+}
+
+# The agent sees eight tools: curate, query, move.
 let testContextTools: String! {
   let tools = context.agent(llm).tools
-  ["blockWrite", "blockDrop", "blockIndex", "compose", "exportContext", "importContext"].each { t =>
+  ["blockWrite", "blockPin", "blockDrop", "blockIndex", "orient", "compose", "exportContext", "importContext"].each { t =>
     assert(message: t) { tools.contains(t) }
   }
   ["blockRead", "blockPrune", "promote", "importBlocks", "exportJson", "exportMarkdown", "exportHtml", "exportGist"].each { t =>
