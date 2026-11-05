@@ -13,7 +13,18 @@ const apiURL = 'https://api.github.com/gists/' + gistID;
 const rawURL = 'https://gist.githubusercontent.com/example/' + gistID + '/raw/context.json';
 
 test('JSON-backed Context exports', {timeout: 180000}, async t => {
+  let redirectJSON = false;
   const server = http.createServer(async (req, res) => {
+    if (redirectJSON && req.url === '/dynamic/context.json') {
+      res.writeHead(302, {location: './data.json'}); res.end(); return;
+    }
+    if (redirectJSON && req.url === '/dynamic/data.json') {
+      if (!(req.headers.cookie || '').includes('context-auth=allowed')) {
+        res.writeHead(401); res.end('authentication required'); return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(await read('dynamic', 'context.json')); return;
+    }
     const match = /^\/(dynamic|offline|large|selected)\/([a-z-]+\.(?:html|json|js|css))$/.exec(req.url);
     if (!match) { res.writeHead(404); res.end('not found'); return; }
     const mime = {json: 'application/json', html: 'text/html', js: 'text/javascript', css: 'text/css'};
@@ -72,6 +83,19 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       assert.equal(await page.locator('#blocks-list .blk.hide').count(), 0);
       await page.goto(`${origin}/selected/questions.html`); await ready();
       assert.deepEqual(await ids('section.q'), ['q-questions/urgent']);
+    });
+    await t.test('portable HTTP follows JSON redirects and retains same-origin cookies', async () => {
+      await context.addCookies([{name: 'context-auth', value: 'allowed', url: origin}]);
+      redirectJSON = true;
+      try {
+        for (const view of ['index.html', 'questions.html']) {
+          await page.goto(`${origin}/dynamic/${view}`); await ready();
+          await expect(page.locator('.blk').first()).toBeVisible();
+        }
+      } finally {
+        redirectJSON = false;
+        await context.clearCookies();
+      }
     });
     await t.test('ordinary HTTP choices/notes persist and prompts retain Q-number and stable id', async () => {
       await page.goto(`${origin}/dynamic/questions.html`); await ready();
