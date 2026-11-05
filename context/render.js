@@ -1,34 +1,7 @@
-/* Embedded in both HTML shells. No block payloads or external dependencies. */
-async function renderContext() {
+/* Shared trusted renderer. The loader passes data, never scripts from a gist. */
+function renderContext(doc, questions) {
   'use strict';
-  const config = JSON.parse(document.body.dataset.config);
-  async function getJSON(url) {
-    const response = await fetch(url, {signal: AbortSignal.timeout(30000)});
-    if (!response.ok) throw new Error(`HTTP ${response.status} loading ${url}. GitHub rate limits may require waiting before retrying.`);
-    try { return await response.json(); }
-    catch (_) { throw new Error(`Invalid or incomplete JSON from ${url}.`); }
-  }
-  async function load() {
-    if (location.protocol === 'file:') throw new Error('Browsers block file:// JSON fetches. Serve this directory over HTTP.');
-    if (location.hostname !== 'gistpreview.github.io') return getJSON('./context.json');
-    const match = /^\?([0-9a-f]{20,})(?:\/(?:index|questions)\.html)?$/.exec(location.search);
-    if (!match) throw new Error('Invalid gistpreview URL; use ?<gist-id> or ?<gist-id>/questions.html.');
-    const gist = await getJSON('https://api.github.com/gists/' + match[1]);
-    const file = gist.files && gist.files['context.json'];
-    if (!file) throw new Error('This gist has no context.json.');
-    if (!file.truncated && typeof file.content === 'string') {
-      try { return JSON.parse(file.content); }
-      catch (_) { throw new Error('The gist context.json is invalid or incomplete. Re-export and publish it.'); }
-    }
-    // The gist API's total inline budget can truncate even a small file.
-    // Never parse a prefix or silently render only part of a Context.
-    let raw;
-    try { raw = new URL(file.raw_url); } catch (_) { throw new Error('Truncated context.json has no usable raw_url.'); }
-    if (raw.protocol !== 'https:' || raw.hostname !== 'gist.githubusercontent.com') throw new Error('Unexpected context.json raw_url; expected gist.githubusercontent.com.');
-    return getJSON(raw.href);
-  }
   const kinds = ['glossary', 'fact', 'decision', 'design', 'result', 'question', 'note'];
-  const doc = await load();
   const fail = message => { throw new Error('Invalid Context schema: ' + message); };
   const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
   if (!object(doc) || !Array.isArray(doc.blocks)) fail('expected a blocks array.');
@@ -73,6 +46,25 @@ async function renderContext() {
   });
   const active = b => b.status !== 'superseded' && b.status !== 'dropped';
   const live = all.filter(active), gone = all.filter(b => b.status === 'superseded'), dropped = all.filter(b => b.status === 'dropped');
+  // Missing metadata means a legacy JSON-only export. Present metadata must
+  // be complete: silently defaulting malformed ownership could expose controls
+  // for questions the exporting session cannot answer.
+  const viewer = Object.hasOwn(doc, 'viewer') ? doc.viewer : {
+    version: 1, title: 'Context', repo: '', lead: [],
+    ownQuestions: live.filter(b => b.kind === 'question').map(b => b.id)
+  };
+  if (!object(viewer) || viewer.version !== 1) fail('unsupported or malformed viewer metadata (expected version 1).');
+  if (typeof viewer.title !== 'string' || typeof viewer.repo !== 'string' ||
+      !Array.isArray(viewer.lead) || !Array.isArray(viewer.ownQuestions)) fail('malformed viewer metadata.');
+  if (viewer.repo && !/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(viewer.repo)) fail('viewer.repo must be owner/repo or empty.');
+  for (const name of ['lead', 'ownQuestions']) {
+    strings(viewer[name], 'viewer.' + name);
+    if (new Set(viewer[name]).size !== viewer[name].length || viewer[name].some(id => !known.has(id))) fail('viewer.' + name + ' must contain unique known block ids.');
+  }
+  if (viewer.ownQuestions.some(id => known.get(id).kind !== 'question' || !active(known.get(id)))) fail('viewer.ownQuestions must name active questions.');
+  const config = {...viewer, questions: questions === true};
+  document.body.dataset.title = config.title;
+  document.title = config.title + (config.questions ? ' — open questions' : '');
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
   const lit = s => esc(s).replace(/\*/g, '&#42;').replace(/~/g, '&#126;');
   const chip = (id, short = false) => {
