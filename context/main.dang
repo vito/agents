@@ -17,10 +17,9 @@
 #     on the LLM's environment, OUTSIDE the message log: compaction rewrites
 #     messages and cannot touch it. That is the whole persistence story — no
 #     git, no volume, no store to keep in sync.
-#   * The viewport. `compose` renders a selection — manifest first, then the
-#     Blocks in kind order — into a single tool result. After a compaction
-#     squashes the transcript, one compose call re-materializes everything
-#     worth knowing.
+#   * The viewport. `orient` recovers a bounded set of active pins after
+#     compaction; `compose` retrieves selected Blocks with an omission manifest.
+#     Full reads are explicit, not automatic context injection.
 #   * The reflex. The @agent system prompt (which survives compaction along
 #     with the tools) teaches the discipline — write on resolution, drop on
 #     irrelevance, compose on doubt — and every mutation prints the updated
@@ -34,12 +33,12 @@
 # resolve() is not here either, because it is composition: hand the noisy
 # legwork to a staff worker, then blockWrite only the distilled answer.
 #
-# The tools follow a Context's lifecycle: curate (blockWrite, blockDrop),
-# query (blockIndex, compose), and move — exportContext writes markdown,
-# JSON or a self-contained HTML page (io.dang, html.dang) into the pending
-# changes, and importContext reads them back from the workspace, a git URL
-# or a gist. Transport is the caller's: nothing here knows GitHub; a gist
-# is published from the exported files with whatever tools the agent has.
+# The tools follow a Context's lifecycle: curate (blockWrite, blockPin,
+# blockDrop), query (orient, blockIndex, compose), and move — exportContext
+# writes markdown, JSON or a self-contained HTML page (io.dang, html.dang)
+# into the pending changes, and importContext reads them back from the
+# workspace, a git URL or a gist. Transport is the caller's: nothing here
+# knows GitHub; publish a gist from the exports with whatever tools you have.
 #
 # Caveats:
 #   * State survives COMPACTION, not RECOMPOSITION: install/reload build
@@ -243,6 +242,25 @@ let asDropped(b: Block!): Block! {
   )
 }
 
+# Pin curation changes only the pin flag, including on historical Blocks.
+let withPin(b: Block!, pin: Boolean!): Block! {
+  Block(
+    address: b.address,
+    kind: b.kind,
+    text: b.text,
+    tags: b.tags,
+    pin: pin,
+    superseded: b.superseded,
+    supersedes: b.supersedes,
+    number: b.number,
+    dropped: b.dropped,
+    priority: b.priority,
+    blocks: b.blocks,
+    summary: b.summary,
+    options: b.options,
+  )
+}
+
 let withNumber(b: Block!, n: Int!): Block! {
   Block(
     address: b.address,
@@ -297,8 +315,9 @@ type Block {
   tags: [String!]!
 
   """
-  Pinned Blocks are included in every composition, regardless of selection
-  and budget.
+  A candidate for bounded orientation: cross-task context, not a measure of
+  importance. Pins obey retrieval budgets and are not automatically added
+  to focused compose selections.
   """
   pin: Boolean!
 
@@ -415,9 +434,10 @@ type Context {
     """
     tags: [String!]! = [],
     """
-    Pin the Block: composed every time, regardless of selection and budget
-    (a read by ids alone returns just those Blocks). For the handful of
-    things every future turn needs.
+    Pin the Block for bounded orientation after compaction. Reserve pins for
+    compact cross-task context, not importance or historical milestones.
+    Pins obey all retrieval budgets; blockPin changes this flag later
+    without rewriting the Block.
     """
     pin: Boolean! = false,
     """
@@ -556,8 +576,10 @@ type Context {
 
   """
   The Context at a glance: one compact line per Block — id, kind, size,
-  tags, flags — under a totals headline. This is the cheap overview; compose
-  renders the actual text.
+  tags, flags — under a totals headline. Active pins' rendered character
+  cost includes headers, question fields and separators; above 12000 it
+  warns to curate pins, not delete history. orient bounds recovery;
+  compose renders selected text.
   """
   blockIndex: String! {
     if (blocks.isEmpty) {
@@ -583,7 +605,36 @@ type Context {
     let headline = `${toString(all.length)} block(s) — ${toString(active.length)} active ` +
       `(${toString(total)} text line(s), ${toString(pinned.length)} pinned), ` +
       `${toString(superseded)} superseded${droppedNote}${askedNote}`
-    headline + "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
+    let pinChars = pinned.map { b => renderBlock(b) }.join("\n\n").length
+    let warning = if (pinChars > 12000) {
+      "\nwarning: active pins exceed the 12000-character orientation budget (which also includes metadata); curate with blockPin(ids: [...], pin: false), not deletion."
+    } else { "" }
+    headline + `; active pin rendered cost: ${toString(pinChars)} character(s)` + warning +
+      "\n" + all.map { b => "  " + indexLine(b) }.join("\n")
+  }
+
+  """
+  Change only the pin flag, without rewriting text, question fields, links,
+  or status. Unpin valid historical records rather than dropping or
+  superseding them merely because they are no longer cross-task context.
+  All ids are validated before any change; inactive Blocks stay inactive.
+  """
+  blockPin(
+    """Ids or Q-numbers of the Blocks to curate."""
+    ids: [String!]!,
+    """Whether these Blocks should be candidates for bounded orientation."""
+    pin: Boolean!,
+  ): Context! {
+    if (ids.isEmpty) {
+      raise "name at least one block id to pin or unpin"
+    }
+    let addrs = ids.map { id => mustGet(id).address }.uniq
+    self.blocks = blocks.map { id, b =>
+      if (addrs.contains(id)) { withPin(b, pin) } else { b }
+    }
+    let verb = if (pin) { "pinned" } else { "unpinned" }
+    print(`${verb} ${addrs.join(", ")}` + "\n\n" + blockIndex)
+    self
   }
 
   """
@@ -639,22 +690,51 @@ type Context {
   }
 
   """
+  Recover cross-task context after compaction: only active pinned Blocks,
+  in composition order, whole or omitted. The ENTIRE result, metadata and
+  separators included, fits maxChars. Omission counts stay compact even
+  with many pins; blockIndex lists ids for focused follow-up reads.
+  """
+  orient(
+    """Total returned character ceiling, at least 256; default 12000."""
+    maxChars: Int! = 12000,
+  ): String! {
+    if (maxChars < 256) {
+      raise "orient maxChars must be at least 256, including its recovery metadata"
+    }
+    let pins = ordered.filter { b => isActive(b) and b.pin }
+    let included: [Block!]! = []
+    let result = orientationDoc(included, pins.length)
+    if (result.length > maxChars) {
+      raise "orient maxChars is too small for its recovery metadata"
+    }
+    pins.each { b =>
+      # Admission checks the actual complete result, not just payload size.
+      let candidate = orientationDoc(included + [b], pins.length)
+      if (candidate.length <= maxChars) {
+        included += [b]
+        result = candidate
+      }
+    }
+    result
+  }
+
+  """
   Compose the Context into one document: a manifest of what went in (and
   what was left out, and why), then the selected Blocks in kind order —
   glossary → fact → decision → design → result → question → note, ties
   broken by id — so definitions land before the things that use them. Open
   questions come first among questions, by priority (P0 first).
 
-  With no selectors this composes every active Block. Selectors union: a
-  Block is included when its id, its kind, or any of its tags matches.
-  Pinned Blocks are always included, except in a read by ids alone, which
-  returns just those Blocks; superseded and dropped Blocks only when named
-  in ids — that is how to read one, with a note on what replaced it.
+  With no selectors this selects every active Block for compatibility.
+  Selectors union: a Block is selected when its id, kind, or any tag matches.
+  Focused reads add no unrelated pins unless includePins is true (including
+  id-only reads). Superseded and dropped Blocks are selected only by explicit
+  id, with a note on what replaced them. Every selected Block, even an
+  explicit id or pin, must fit both budgets: no truncation or exemptions.
 
-  Call it whenever you are unsure what you know — and ALWAYS as your first
-  move after your conversation has been compacted: the Context lives in
-  tool state, not in your messages, so nothing a compaction squashed is
-  lost from here.
+  Use orient first after compaction, then retrieve narrowly by ids, tags or
+  kinds. For an explicit full read use maxChars: 0 (and budget: 0).
   """
   compose(
     """
@@ -671,55 +751,71 @@ type Context {
     """
     kinds: [BlockKind!]! = [],
     """
-    Ceiling on composed text lines. Blocks that do not fit are named in the
-    manifest, never silently dropped; pinned Blocks are exempt. 0 means no
-    ceiling.
+    Ceiling on composed text lines (payload, summary and options, not
+    headers or manifest). 0 means no ceiling; pins are not exempt.
     """
     budget: Int! = 0,
+    """
+    Add active pins to focused selections, including id-only reads.
+    """
+    includePins: Boolean! = false,
+    """
+    Ceiling on rendered Block characters, including headers, question
+    fields, status notes and inter-block separators, but NOT the manifest.
+    Omitted Blocks are named with reasons; use orient for a total-output
+    ceiling. 0 explicitly requests unlimited characters. Pins are not exempt.
+    """
+    maxChars: Int! = 12000,
   ): String! {
-    if (blocks.isEmpty) {
-      return "The Context is empty — nothing to compose. blockWrite records the first Block."
+    if (budget < 0 or maxChars < 0) {
+      raise "compose budget and maxChars must be nonnegative; 0 means unlimited"
     }
     ids.each { id =>
       if (!blocks.has(resolveId(id))) {
         raise `no block "${id}" in the Context — blockIndex lists what is there`
       }
     }
+    if (blocks.isEmpty) {
+      return "The Context is empty — nothing to compose. blockWrite records the first Block."
+    }
     let wanted = ids.map { id => resolveId(id) }
 
     let wantAll = ids.isEmpty and tags.isEmpty and kinds.isEmpty
-    # A read by id alone (no tags or kinds) is just those Blocks: pins ride
-    # along with every other composition.
-    let readOnly = !ids.isEmpty and tags.isEmpty and kinds.isEmpty
     let all = ordered
     let active = all.filter { b => isActive(b) }
     let selected = all.filter { b =>
       wanted.contains(b.address) or isActive(b) and (
-        (b.pin and !readOnly) or wantAll or
+        (b.pin and includePins) or wantAll or
           kinds.contains(b.kind) or
           b.tags.any { t => tags.contains(t) }
       )
     }
 
     let included: [Block!]! = []
-    let overBudget: [Block!]! = []
+    let overBudget: [String!]! = []
     let used = 0
+    let usedChars = 0
     selected.each { b =>
       let cost = blockLines(b)
-      if (b.pin or budget == 0 or used + cost <= budget) {
+      let chars = (renderBlock(b) + statusNote(b)).length + (if (included.isEmpty) { 0 } else { 2 })
+      let reasons: [String!]! = []
+      if (budget != 0 and used + cost > budget) { reasons += ["line budget"] }
+      if (maxChars != 0 and usedChars + chars > maxChars) { reasons += ["character budget"] }
+      if (reasons.isEmpty) {
         included += [b]
         used += cost
+        usedChars += chars
       } else {
-        overBudget += [b]
+        overBudget += ["  " + indexLine(b) + " — exceeds " + reasons.join(" and ")]
       }
     }
 
     let manifest: [String!]! = []
-    manifest += [`CONTEXT — composed ${toString(included.length)} of ${toString(all.length)} block(s), ${toString(used)} text line(s)`]
+    manifest += [`CONTEXT — composed ${toString(included.length)} of ${toString(all.length)} block(s), ${toString(used)} text line(s), ${toString(usedChars)} rendered character(s) (manifest excluded)`]
     included.each { b => manifest += ["  " + indexLine(b)] }
     if (!overBudget.isEmpty) {
-      manifest += ["over budget — compose these by id, or raise the budget:"]
-      overBudget.each { b => manifest += ["  " + indexLine(b)] }
+      manifest += ["over budget — compose these by id with higher limits, or maxChars: 0 and budget: 0 for a full read:"]
+      manifest += overBudget
     }
     let notes: [String!]! = []
     let filtered = active.filter { b => !selected.contains(b) }.length
@@ -735,7 +831,7 @@ type Context {
     }
 
     if (included.isEmpty) {
-      return manifest.join("\n") + "\n\n(nothing matched the selection)"
+      return manifest.join("\n") + "\n\n(no Blocks included)"
     }
     manifest.join("\n") + "\n\n" + included.map { b => renderBlock(b) + statusNote(b) }.join("\n\n")
   }
@@ -1268,6 +1364,16 @@ type Context {
     `── ${b.address} · ${kindLabel(b.kind)}${number}${questionFlags(b, " · ")}${tags}${pin} ──`
   }
 
+  # Keep orientation metadata independent of ids, tags and total pin count:
+  # only bounded counts grow, never an unbounded per-omission manifest.
+  let orientationDoc(included: [Block!]!, total: Int!): String! {
+    let headline = `CONTEXT — orientation: ${toString(included.length)} of ${toString(total)} active pin(s); ${toString(total - included.length)} omitted (character budget).` +
+      "\nUse blockIndex for ids; compose narrowly. Full reads: compose(ids: [...], maxChars: 0)."
+    if (included.isEmpty) { headline } else {
+      headline + "\n\n" + included.map { b => renderBlock(b) }.join("\n\n")
+    }
+  }
+
   # A question's summary leads its text, and its options follow.
   let renderBlock(b: Block!): String! {
     let brief = if (b.summary == "") { "" } else { "TL;DR: " + b.summary + "\n\n" }
@@ -1349,9 +1455,9 @@ type Context {
   let systemPrompt: String! = """
     You carry a CONTEXT: a set of Blocks — distilled, addressable truths —
     stored in tool state BESIDE your conversation, not inside it. When your
-    conversation is compacted, the Blocks are untouched, and one `compose`
-    call brings everything worth knowing back. Treat the transcript as
-    scratch and the Context as the record.
+    conversation is compacted, the Blocks are untouched. Start recovery with
+    `orient`: a bounded view of active pins, not the whole archive. Treat the
+    transcript as scratch and the Context as the record.
 
     WRITE AS YOU RESOLVE, not at the end. The moment you establish
     something future turns will need — a fact verified, a decision made and
@@ -1360,18 +1466,28 @@ type Context {
     colleague would need, never the play-by-play that led to it. Ids are
     path-shaped addresses ("facts/engine-caches-by-id",
     "decisions/no-git-store"); writing an existing id replaces that Block,
-    so converging on one Block beats accumulating near-duplicates. Pin the
-    handful of things every future turn needs; tag the rest for selection.
+    so converging on one Block beats accumulating near-duplicates. Pin only
+    compact cross-task orientation: current goals, constraints and pointers.
+    Pin is not importance. Tag task-specific details and historical milestones
+    for retrieval instead of carrying them in every recovery.
 
-    READ IT BACK with compose: a manifest of what went in (and what was
-    left out, and why), then the Blocks, definitions first. Call it
-    whenever you are unsure what you know — ALWAYS as your first move after
-    a compaction. blockIndex is the cheap one-line-per-block overview;
-    compose(ids: [...]) reads particular Blocks, superseded and dropped
-    ones included.
+    READ NARROWLY. ALWAYS call orient first after compaction: its default
+    12000-character limit covers the whole response, and oversized pins are
+    omitted whole with a count, never silently truncated. Then use blockIndex
+    to discover ids and compose(ids:, tags: or kinds:) for the current task.
+    Focused selections do not add unrelated pins unless includePins: true;
+    compose with no selectors still selects all active Blocks. Both line and
+    character budgets apply to every Block, pins and explicit ids included.
+    compose's default maxChars: 12000 bounds rendered Blocks, NOT its manifest;
+    omissions are named with reasons. Explicit full reads use maxChars: 0
+    (and budget: 0). Reading by id also reaches superseded or dropped Blocks.
+    Do not reread the archive on every turn.
 
     CURATE. A set can have things taken out of composition — its whole
-    advantage over a log. When a new truth contradicts an old one,
+    advantage over a log. Unpin valid historical records with blockPin(ids:,
+    pin: false): it preserves their text, links, question fields and status.
+    Watch blockIndex's active pin cost; curate an oversized set, do not delete
+    history to meet the budget. When a new truth contradicts an old one,
     blockWrite the new Block with supersedes: naming the old. When a Block
     stopped mattering and nothing replaces it, blockDrop drops it. Either
     way it is kept out of composition but preserved, because the reasoning
