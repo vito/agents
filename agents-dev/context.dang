@@ -106,6 +106,18 @@ let testContextExportMetadata(source: Workspace!): String! {
   assert { doc.version == 1 and doc.viewer == expected }
   assert { importDir(context, onlyJson).blockIndex == active.blockIndex }
 
+  # Incidental JSON refreshes from markdown edits keep presentation settings,
+  # pruning a dropped lead and recomputing which own questions remain open.
+  let edited = active.blockDrop(["notes/lead", "questions/foreign"])
+  let incidental = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
+    path: ".", ids: ["notes/lead"]))
+  let incidentalDoc: {{viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(incidental.file("context.json").contents)
+  assert { incidentalDoc.viewer == {{version: 1, title: title, repo: repo, lead: ["questions/open"], ownQuestions: ["questions/open"]}} }
+  let explicit = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
+    path: ".", formats: [ContextExportFormat.JSON], ids: ["notes/lead"]))
+  let explicitDoc: {{viewer: {{title: String!, repo: String!, lead: [String!]!}}!}}! = JSON.decode(explicit.file("context.json").contents)
+  assert { explicitDoc.viewer.title == "Context" and explicitDoc.viewer.repo == "" and explicitDoc.viewer.lead.isEmpty }
+
   # A fresh selection excludes other live questions, unlike a retained copy.
   let selected = directory.withChanges(active.exportContext(source: scratch, path: ".",
     formats: [ContextExportFormat.JSON], ids: ["Q-1"], lead: ["Q-1"]))

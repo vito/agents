@@ -889,6 +889,21 @@ type Context {
       lead: featured,
       ownQuestions: copy.filter { b => isActive(b) and b.kind == BlockKind.QUESTION }.map { b => b.address },
     }}
+    # A markdown edit refreshes the JSON's blocks, not its presentation.
+    # Preserve curation unless the caller explicitly requests JSON or HTML.
+    if (hasJson and !wantHtml and !formats.contains(ExportFormat.JSON)) {
+      let priorViewer: {{viewer: {{title: String, repo: String, lead: [String!]}}}}! = JSON.decode(base.file(jsonPath).contents)
+      let settings = priorViewer.viewer
+      if (settings != null) {
+        viewer = {{
+          version: 1,
+          title: settings.title ?? title,
+          repo: settings.repo ?? repo,
+          lead: (settings.lead ?? []).filter { id => (copy + foreign).any { b => b.address == id and isActive(b) } },
+          ownQuestions: viewer.ownQuestions,
+        }}
+      }
+    }
 
     let out = base
     let written: [String!]! = []
