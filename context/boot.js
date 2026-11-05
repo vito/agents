@@ -30,8 +30,10 @@
     const gist = await getJSON('https://api.github.com/gists/' + id);
     const file = gist && gist.files && gist.files['context.json'];
     if (!file || typeof file !== 'object') throw new Error('This gist has no context.json.');
+    // Plain text, only ever a fallback title for untitled exports.
+    const description = typeof gist.description === 'string' ? gist.description : '';
     if (file.truncated !== true && typeof file.content === 'string') {
-      try { return JSON.parse(file.content); }
+      try { return {doc: JSON.parse(file.content), description}; }
       catch (_) { throw new Error('The gist context.json is invalid or incomplete. Re-export and publish it.'); }
     }
     // A gist API response can omit content when its total inline budget is
@@ -41,7 +43,7 @@
     if (raw.protocol !== 'https:' || raw.hostname !== 'gist.githubusercontent.com' || raw.username || raw.password || raw.port) {
       throw new Error('Unexpected context.json raw_url; expected HTTPS gist.githubusercontent.com.');
     }
-    return getJSON(raw.href);
+    return {doc: await getJSON(raw.href), description};
   }
   function reveal() {
     let id;
@@ -77,17 +79,17 @@
       if (params.has('view') && !['context', 'questions'].includes(params.get('view'))) throw new Error('Unknown view; use context or questions.');
     }
     const questions = hosted ? params.get('view') === 'questions' : document.body.dataset.view === 'questions';
-    let doc;
+    let doc, fallbackTitle = '';
     if (gist) {
       document.body.dataset.gist = gist;
-      doc = await loadGist(gist);
+      ({doc, description: fallbackTitle} = await loadGist(gist));
     } else {
       if (location.protocol === 'file:') throw new Error('Browsers block file:// JSON fetches. Serve this directory over HTTP, or export again with offlineHtml: true.');
       // Portable HTTP hosting keeps normal authenticated/redirect behavior;
       // only untrusted gist metadata is constrained to non-redirecting fetches.
       doc = await getJSON('./context.json', 'same-origin', 'follow');
     }
-    renderContext(doc, questions);
+    renderContext(doc, questions, fallbackTitle);
     if (hosted) {
       document.querySelectorAll('a[href^="index.html"],a[href^="questions.html"]').forEach(a => {
         const match = /^(index|questions)\.html(#.*)?$/.exec(a.getAttribute('href'));

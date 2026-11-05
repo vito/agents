@@ -210,6 +210,39 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       await expect(page.locator('section.q')).toHaveCount(7); // old exports lack ownership metadata
       await expect(page.locator('[id="q-questions/foreign"]')).toBeVisible();
       assert.ok((await page.title()).startsWith('Context'));
+      // Untitled or generically titled exports take the gist's description;
+      // a real title always wins over it.
+      const described = (content, description) => page.route(apiURL, route => route.fulfill({json: {description, files: {'context.json': {content: JSON.stringify(content)}}}}));
+      const generic = structuredClone(doc); generic.viewer.title = 'Context';
+      for (const content of [legacy, generic]) {
+        await described(content, '  Release <b>prep</b>  ');
+        await page.goto(gistURL + '&view=questions'); await ready();
+        assert.equal(await page.title(), 'Release <b>prep</b> — open questions');
+        await expect(page.locator('h1')).toHaveText('Release <b>prep</b> — open questions');
+        assert.equal(await page.locator('h1 b').count(), 0);
+      }
+      await described(doc, 'Release prep');
+      await page.goto(gistURL); await ready();
+      assert.equal(await page.title(), doc.viewer.title);
+    });
+    await t.test('dark mode follows the system color scheme', async () => {
+      const colors = () => page.evaluate(() => {
+        const css = el => getComputedStyle(document.querySelector(el));
+        return {bg: css('body').backgroundColor, fg: css('body').color, card: css('.blk').backgroundColor, button: css('button').backgroundColor};
+      });
+      const luminance = rgb => { const [r, g, b] = rgb.match(/\d+/g).map(Number); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+      for (const url of [`${origin}/dynamic/questions.html`, `${origin}/offline/index.html`, gistURL]) {
+        if (url === gistURL) await gist({content: JSON.stringify(doc)});
+        await page.emulateMedia({colorScheme: 'light'});
+        await page.goto(url); await ready();
+        const light = await colors();
+        await page.emulateMedia({colorScheme: 'dark'});
+        const dark = await colors();
+        assert.ok(luminance(light.bg) > 200 && luminance(dark.bg) < 60, `${url}: ${light.bg} → ${dark.bg}`);
+        assert.ok(luminance(dark.fg) > 180 && luminance(dark.card) < 60, `${url}: ${dark.fg} on ${dark.card}`);
+        assert.notEqual(light.button, dark.button);
+      }
+      await page.emulateMedia({colorScheme: 'light'});
     });
     await t.test('truncated or missing inline content uses complete raw JSON', async () => {
       const large = await read('large', 'context.json');

@@ -6,8 +6,8 @@ let scratch: Workspace! {
 }
 
 # Export into a scratch directory's out/ and return out/.
-let exportedDir(ctx: Context!, formats: [ContextExportFormat!]!, flat: Boolean! = false): Directory! {
-  directory.withChanges(ctx.exportContext(source: scratch, path: "out", formats: formats, flat: flat)).directory("out")
+let exportedDir(ctx: Context!, formats: [ContextExportFormat!]!, flat: Boolean! = false, title: String! = "Test context"): Directory! {
+  directory.withChanges(ctx.exportContext(source: scratch, path: "out", formats: formats, flat: flat, title: title)).directory("out")
 }
 
 let jsonOf(ctx: Context!): File! {
@@ -18,14 +18,14 @@ let markdownOf(ctx: Context!, flat: Boolean! = false): Directory! {
   exportedDir(ctx, [ContextExportFormat.MARKDOWN], flat: flat)
 }
 
-let htmlOf(ctx: Context!, title: String! = "Context", repo: String! = "", lead: [String!]! = []): String! {
+let htmlOf(ctx: Context!, title: String! = "Test context", repo: String! = "", lead: [String!]! = []): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
     formats: [ContextExportFormat.HTML], offlineHtml: true, title: title, repo: repo, lead: lead)).file("out/index.html").contents
 }
 
 let questionsOf(ctx: Context!, repo: String! = ""): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
-    formats: [ContextExportFormat.HTML], offlineHtml: true, repo: repo)).file("out/questions.html").contents
+    formats: [ContextExportFormat.HTML], offlineHtml: true, title: "Test context", repo: repo)).file("out/questions.html").contents
 }
 
 let importDir(ctx: Context!, dir: Directory!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
@@ -113,14 +113,50 @@ let testContextExportMetadata(source: Workspace!): String! {
     path: ".", ids: ["notes/lead"]))
   let incidentalDoc: {{viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(incidental.file("context.json").contents)
   assert { incidentalDoc.viewer == {{version: 1, title: title, repo: repo, lead: ["questions/open"], ownQuestions: ["questions/open"]}} }
+  # An explicit JSON or HTML export resets curation (repo, lead) to its
+  # arguments, but the page keeps its title unless given a new one.
   let explicit = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
     path: ".", formats: [ContextExportFormat.JSON], ids: ["notes/lead"]))
   let explicitDoc: {{viewer: {{title: String!, repo: String!, lead: [String!]!}}!}}! = JSON.decode(explicit.file("context.json").contents)
-  assert { explicitDoc.viewer.title == "Context" and explicitDoc.viewer.repo == "" and explicitDoc.viewer.lead.isEmpty }
+  assert { explicitDoc.viewer.title == title and explicitDoc.viewer.repo == "" and explicitDoc.viewer.lead.isEmpty }
+  let retitled = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
+    path: ".", formats: [ContextExportFormat.JSON], ids: ["notes/lead"], title: "Renamed"))
+  let retitledDoc: {{viewer: {{title: String!}}!}}! = JSON.decode(retitled.file("context.json").contents)
+  assert { retitledDoc.viewer.title == "Renamed" }
+
+  # A new JSON or HTML page needs a real title; markdown alone does not.
+  [ContextExportFormat.JSON, ContextExportFormat.HTML].each { format =>
+    [false, true].each { offline =>
+      let untitled = directory.withChanges(active.exportContext(source: scratch, path: ".",
+        formats: [format], offlineHtml: offline)).entries rescue { e: Error => [e.message] }
+      assert { untitled.any { m => m.contains("name a title for the viewer page") } }
+    }
+  }
+  ["  ", "Context"].each { generic =>
+    let rejected = directory.withChanges(active.exportContext(source: scratch, path: ".",
+      formats: [ContextExportFormat.JSON], title: generic)).entries rescue { e: Error => [e.message] }
+    assert { rejected.any { m => m.contains("title must name what this Context is about") } }
+  }
+  let legacyPage = directory.withNewFile("context.json", `{ "version": 1, "blocks": [{"id":"notes/legacy","kind":"note","text":"legacy"}] }`)
+  let defaultTitled = directory.withNewFile("context.json", `{ "version": 1, "viewer": {"version":1,"title":"Context","repo":"","lead":[],"ownQuestions":[]}, "blocks": [{"id":"notes/legacy","kind":"note","text":"legacy"}] }`)
+  [legacyPage, defaultTitled].each { old =>
+    let untitledOld = old.withChanges(active.exportContext(source: old.asWorkspace, path: ".",
+      formats: [ContextExportFormat.HTML])).entries rescue { e: Error => [e.message] }
+    assert { untitledOld.any { m => m.contains("name a title for the viewer page") } }
+  }
+  # Offline pages keep no context.json; a re-export reads their title back.
+  let offlineDir = directory.withChanges(active.exportContext(source: scratch, path: ".",
+    formats: [ContextExportFormat.HTML], offlineHtml: true, title: title))
+  let reOffline = offlineDir.withChanges(edited.exportContext(source: offlineDir.asWorkspace, path: ".",
+    formats: [ContextExportFormat.HTML], offlineHtml: true))
+  assert { reOffline.file("questions.html").contents == offlineDir.withChanges(edited.exportContext(source: scratch, path: ".",
+    formats: [ContextExportFormat.HTML], offlineHtml: true, title: title)).file("questions.html").contents }
+  assert { reOffline.file("index.html").contents.contains("<title>Review &lt;this&gt; &quot;title&quot;</title>") }
+  assert { directory.withChanges(active.exportContext(source: scratch, path: ".")).glob("**/*.md").length > 0 }
 
   # A fresh selection excludes other live questions, unlike a retained copy.
   let selected = directory.withChanges(active.exportContext(source: scratch, path: ".",
-    formats: [ContextExportFormat.JSON], ids: ["Q-1"], lead: ["Q-1"]))
+    formats: [ContextExportFormat.JSON], ids: ["Q-1"], lead: ["Q-1"], title: title))
   let selectedDoc: {{viewer: {{lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(selected.file("context.json").contents)
   assert { selectedDoc.viewer.lead == ["questions/open"] and selectedDoc.viewer.ownQuestions == ["questions/open"] }
   # Retained own questions stay answerable; foreign, dropped, superseded,
@@ -190,7 +226,7 @@ let testContextExportRefresh(source: Workspace!): String! {
   # markdown already there, which would otherwise win on import.
   let third = second.blockWrite("facts/newer", ContextBlockKind.FACT, "newer truth", supersedes: ["facts/new"])
   let gistFormats = [ContextExportFormat.JSON, ContextExportFormat.HTML]
-  let d4 = d3.withChanges(third.exportContext(source: d3.asWorkspace, formats: gistFormats))
+  let d4 = d3.withChanges(third.exportContext(source: d3.asWorkspace, formats: gistFormats, title: "Refresh"))
   assert { d4.file("context/facts~new.md").contents.contains("status: superseded") }
   assert { context.importContext(source: d4.asWorkspace).blockIndex.contains("facts/new  fact  1 line(s)  superseded by facts/newer") }
 
@@ -219,7 +255,7 @@ let testContextExportRefresh(source: Workspace!): String! {
   assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
   # HTML alone includes its JSON dependency; offline HTML needs no JSON.
   assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
-  assert { directory.withChanges(answered.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true)).directory("out").entries == ["index.html", "questions.html"] }
+  assert { directory.withChanges(answered.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true, title: "Offline")).directory("out").entries == ["index.html", "questions.html"] }
 
   # A different session refreshing HTML must not lower the JSON's retired
   # Q-number high-water mark, even when that question no longer has a Block.
@@ -251,7 +287,7 @@ let testContextExportRefresh(source: Workspace!): String! {
   # A selective export may keep only a citation, not the question itself.
   # Its high-water mark still reserves that number against unrelated reuse.
   let citationOnly = directory.withChanges(question.blockWrite("notes/citation", ContextBlockKind.NOTE, "See Q-1")
-    .exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["notes/citation"]))
+    .exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["notes/citation"], title: "Citation"))
   let reused = citationOnly.withChanges(colliding.exportContext(source: citationOnly.asWorkspace, path: ".", formats: [ContextExportFormat.HTML])).entries rescue {
     e: Error => [e.message]
   }
@@ -274,7 +310,7 @@ let testContextExportRefresh(source: Workspace!): String! {
 
   # Foreign supersession metadata survives even when the prior selective
   # export omitted the replacement Block itself.
-  let resolvedBundle = directory.withChanges(answered.exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["questions/ship"]))
+  let resolvedBundle = directory.withChanges(answered.exportContext(source: scratch, path: ".", formats: gistFormats, ids: ["questions/ship"], title: "Resolved"))
   let foreignRefresh = resolvedBundle.withChanges(other.exportContext(source: resolvedBundle.asWorkspace, path: ".", formats: [ContextExportFormat.HTML]))
   let foreignDoc: {{blocks: [{{id: String!, superseded_by: [String!]!}}!]!}}! = JSON.decode(foreignRefresh.file("context.json").contents)
   assert { foreignDoc.blocks.filter { b => b.id == "questions/ship" }.map { b => b.superseded_by } == [["decisions/ship"]] }

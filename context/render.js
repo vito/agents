@@ -1,5 +1,5 @@
 /* Shared trusted renderer. The loader passes data, never scripts from a gist. */
-function renderContext(doc, questions) {
+function renderContext(doc, questions, fallbackTitle) {
   'use strict';
   const kinds = ['glossary', 'fact', 'decision', 'design', 'result', 'question', 'note'];
   const fail = message => { throw new Error('Invalid Context schema: ' + message); };
@@ -62,7 +62,11 @@ function renderContext(doc, questions) {
     if (new Set(viewer[name]).size !== viewer[name].length || viewer[name].some(id => !known.has(id))) fail('viewer.' + name + ' must contain unique known block ids.');
   }
   if (viewer.ownQuestions.some(id => known.get(id).kind !== 'question' || !active(known.get(id)))) fail('viewer.ownQuestions must name active questions.');
-  const config = {...viewer, questions: questions === true};
+  // Exports from before titles were required say only the generic "Context";
+  // the caller's fallback (a hosted gist's description) names them better.
+  const fallback = typeof fallbackTitle === 'string' ? fallbackTitle.trim() : '';
+  const generic = !viewer.title.trim() || viewer.title === 'Context';
+  const config = {...viewer, title: generic && fallback ? fallback : viewer.title, questions: questions === true};
   document.body.dataset.title = config.title;
   document.title = config.title + (config.questions ? ' — open questions' : '');
   const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));

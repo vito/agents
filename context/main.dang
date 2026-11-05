@@ -177,6 +177,12 @@ let oneLine(s: String!): String! {
   s.replaceMatches(`\s+`, with: " ").trimSpace
 }
 
+# A viewer title that names nothing: blank, or the "Context" older exports
+# defaulted to.
+let genericTitle(t: String!): Boolean! {
+  t.trimSpace == "" or t.trimSpace == "Context"
+}
+
 # Block ids are addresses: lowercase path-shaped segments.
 let idShape: Regexp! = `^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`
 
@@ -858,8 +864,9 @@ type Context {
   formats and selection, so a copy never keeps a stale status nor loses a
   Block to a narrower export.
 
-  For a gist: export JSON alone into a path of its own, then publish that
-  directory. Open https://vito.github.io/agents/context/v1/?gist=<id>
+  For a gist: export JSON alone into a path of its own, with a title naming
+  what it explains, then publish that directory. Open
+  https://vito.github.io/agents/context/v1/?gist=<id>
   (add &view=questions for the questions page). The shared viewer loads
   context.json; do not upload HTML or renderer assets to the gist.
   importContext(from: "<gist id>") reads it back. To curate the page,
@@ -895,9 +902,12 @@ type Context {
     """
     kinds: [BlockKind!]! = [],
     """
-    The viewer page title, with JSON or HTML.
+    The viewer page title, with JSON or HTML: name what this Context is
+    about, e.g. the task, branch or pull request it explains; "Context"
+    alone is not a title. Required with JSON or HTML unless path's earlier
+    export already has a title, which is then kept.
     """
-    title: String! = "Context",
+    title: String = null,
     """
     GitHub "owner/repo" that bare #123 references point at in the viewer,
     with JSON or HTML. owner/repo#123 is always linked.
@@ -976,24 +986,46 @@ type Context {
     # another session) stay as they were, as their markdown files do.
     let foreign = prior.filter { b => !blocks.has(b.address) }
     let kept = copy.length - selected.length + foreign.length
+    let priorViewer: {{viewer: {{title: String, repo: String, lead: [String!]}}}}! = JSON.decode(if (hasJson) { base.file(jsonPath).contents } else { "{}" })
+    let settings = priorViewer.viewer
+    let priorTitle = if (settings == null) { "" } else { settings.title ?? "" }
+    # Offline HTML keeps no context.json; its questions page records the title.
+    let offlinePage = prefix + "questions.html"
+    if (priorTitle.trimSpace == "" and base.glob(offlinePage).contains(offlinePage)) {
+      let m = base.file(offlinePage).contents.match(`<body data-title="([^"]*)"`)
+      if (m != null) {
+        priorTitle = unescHtml(m.captures[0] ?? "")
+      }
+    }
+    # The page is named for what it explains, never the generic "Context"
+    # older exports defaulted to: an explicit title wins, then the one this
+    # path's earlier export carries.
+    if (title != null and genericTitle(title)) {
+      raise `title must name what this Context is about, not just "${title.trimSpace}"`
+    }
+    let explicitViewer = wantHtml or formats.contains(ExportFormat.JSON)
+    if (explicitViewer and title == null and genericTitle(priorTitle)) {
+      raise "name a title for the viewer page — what this Context is about, e.g. the task, branch or pull request it explains"
+    }
+    # Only an incidental refresh of an older context.json gets here without
+    # a real title; it keeps what that file had.
+    let pageTitle = title ?? (if (priorTitle.trimSpace == "") { "Context" } else { priorTitle })
     # This copy's live questions, not questions merely retained from another
     # session. JSON and HTML share the same presentation configuration.
     let viewer = {{
       version: 1,
-      title: title,
+      title: pageTitle,
       repo: repo,
       lead: featured,
       ownQuestions: copy.filter { b => isActive(b) and b.kind == BlockKind.QUESTION }.map { b => b.address },
     }}
     # A markdown edit refreshes the JSON's blocks, not its presentation.
     # Preserve curation unless the caller explicitly requests JSON or HTML.
-    if (hasJson and !wantHtml and !formats.contains(ExportFormat.JSON)) {
-      let priorViewer: {{viewer: {{title: String, repo: String, lead: [String!]}}}}! = JSON.decode(base.file(jsonPath).contents)
-      let settings = priorViewer.viewer
+    if (hasJson and !explicitViewer) {
       if (settings != null) {
         viewer = {{
           version: 1,
-          title: settings.title ?? title,
+          title: pageTitle,
           repo: settings.repo ?? repo,
           lead: (settings.lead ?? []).filter { id => (copy + foreign).any { b => b.address == id and isActive(b) } },
           ownQuestions: viewer.ownQuestions,
@@ -1505,6 +1537,8 @@ type Context {
     EXPORT what should outlive this session: exportContext writes the
     Context into your pending changes — markdown under context/ to commit
     beside the code that motivated it, or JSON alone to publish as a gist.
+    JSON and HTML need a title naming what the Context explains (the task,
+    branch or pull request), not just "Context".
     View it at https://vito.github.io/agents/context/v1/?gist=<id> (append
     &view=questions for the questions page). HTML is an optional portable
     export; offlineHtml makes it self-contained for file:// viewing.

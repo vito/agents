@@ -32,6 +32,15 @@ let escHtml(s: String!): String! {
     .replace("'", "&#39;")
 }
 
+# Exactly reverses escHtml, for reading back an attribute it wrote.
+let unescHtml(s: String!): String! {
+  s.replace("&#39;", "'")
+    .replace("&quot;", "\"")
+    .replace("&gt;", ">")
+    .replace("&lt;", "<")
+    .replace("&amp;", "&")
+}
+
 # Escape text that must also stay out of the emphasis pass (code, URLs, ids).
 let escLit(s: String!): String! {
   escHtml(s).replace("*", "&#42;").replace("~", "&#126;")

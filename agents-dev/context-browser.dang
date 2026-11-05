@@ -59,7 +59,7 @@ let testContextDynamicHtml(source: Workspace!): String! {
     .blockWrite("notes/old", ContextBlockKind.NOTE, body, pin: true)
     .blockWrite("notes/new", ContextBlockKind.NOTE, "Current, unpinned", supersedes: ["notes/old"])
   let pinDynamic = exportedDir(pins, [ContextExportFormat.HTML])
-  let pinOffline = directory.withChanges(pins.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true)).directory("out")
+  let pinOffline = directory.withChanges(pins.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true, title: "Test context")).directory("out")
   let files = directory.withDirectory("dynamic", dynamic).withDirectory("offline", offline).withDirectory("large", enlarged).withDirectory("selected", selected)
     .withDirectory("pins", pinDynamic).withDirectory("pins-offline", pinOffline)
   container.from("mcr.microsoft.com/playwright:v1.58.2-noble")
