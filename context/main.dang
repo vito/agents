@@ -78,9 +78,9 @@ enum ImportConflict {
 
 """
 What exportContext writes: MARKDOWN, one front-matter file per Block (what
-a repo commits); JSON, context.json, lossless; HTML, index.html, the
-Context as one self-contained page, and questions.html, the open questions
-to answer.
+a repo commits); JSON, context.json, lossless and ready for the hosted
+viewer; HTML, index.html and questions.html with shared assets and JSON,
+self-contained only with offlineHtml.
 """
 enum ExportFormat {
   MARKDOWN
@@ -748,11 +748,12 @@ type Context {
   - MARKDOWN: one <id>.md per Block, front matter then text. Reviewable
     and diffable; what a repo commits under context/.
   - JSON: <path>/context.json, every field plus the Q-number high-water
-    mark. The lossless form.
-  - HTML: <path>/index.html, the Context as one self-contained page —
-    "At a glance" (the lead Blocks), open questions, kind and tag filters,
-    every Block as a card — and <path>/questions.html, the open questions
-    by priority, with options to pick, notes, and a prompt to copy back.
+    mark and viewer settings. The lossless form; all a gist needs.
+  - HTML: small index.html and questions.html pages loading context.json
+    (automatically included, even with HTML alone). The dashboard has "At a
+    glance", open questions, kind/tag filters and every Block as a card;
+    questions.html has options, notes and a prompt to copy back. Serve over
+    HTTP; use offlineHtml for self-contained files.
 
   Every Block of every status is exported unless ids, tags or kinds narrow
   it, e.g. to the decisions a pull request motivated. What path already
@@ -761,11 +762,13 @@ type Context {
   formats and selection, so a copy never keeps a stale status nor loses a
   Block to a narrower export.
 
-  For a gist: a path of its own, flat, formats HTML and JSON; gistpreview
-  renders its index.html (gistpreview.github.io/?<id>, and ?<id>/questions.html
-  the questions page), and importContext(from: "<gist id>") reads it
-  back. To curate the page, write the curated content as Blocks (a status
-  table, a checklist) and name them in lead.
+  For a gist: export JSON alone into a path of its own, then publish that
+  directory. Open https://vito.github.io/agents/context/v1/?gist=<id>
+  (add &view=questions for the questions page). The shared viewer loads
+  context.json; do not upload HTML or renderer assets to the gist.
+  importContext(from: "<gist id>") reads it back. To curate the page,
+  write the curated content as Blocks (a status table, a checklist) and
+  name them in lead.
   """
   exportContext(
     source: Workspace!,
@@ -796,19 +799,25 @@ type Context {
     """
     kinds: [BlockKind!]! = [],
     """
-    The page title, with HTML.
+    The viewer page title, with JSON or HTML.
     """
     title: String! = "Context",
     """
-    GitHub "owner/repo" that bare #123 references point at, with HTML.
-    owner/repo#123 is always linked.
+    GitHub "owner/repo" that bare #123 references point at in the viewer,
+    with JSON or HTML. owner/repo#123 is always linked.
     """
     repo: String! = "",
     """
     Ids (or Q-numbers) of active, exported Blocks to feature first in the
-    page, in this order, with HTML.
+    page, in this order, with JSON or HTML.
     """
     lead: [String!]! = [],
+    """
+    Render self-contained HTML files instead of JSON-backed pages. For offline
+    file:// viewing; larger, so avoid this for gists. Default HTML needs HTTP
+    hosting with context.json and renderer assets beside it.
+    """
+    offlineHtml: Boolean! = false,
   ): Changeset! {
     if (blocks.isEmpty) {
       raise "the Context is empty — nothing to export"
@@ -817,8 +826,8 @@ type Context {
       raise "name at least one format: MARKDOWN, JSON or HTML"
     }
     let wantHtml = formats.contains(ExportFormat.HTML)
-    if (!lead.isEmpty and !wantHtml) {
-      raise "lead features Blocks in the HTML page — add HTML to formats"
+    if (!lead.isEmpty and !wantHtml and !formats.contains(ExportFormat.JSON)) {
+      raise "lead features Blocks in the viewer — add JSON or HTML to formats"
     }
     ids.each { id => mustGet(id) }
     let wanted = ids.map { id => resolveId(id) }
@@ -871,6 +880,30 @@ type Context {
     # another session) stay as they were, as their markdown files do.
     let foreign = prior.filter { b => !blocks.has(b.address) }
     let kept = copy.length - selected.length + foreign.length
+    # This copy's live questions, not questions merely retained from another
+    # session. JSON and HTML share the same presentation configuration.
+    let viewer = {{
+      version: 1,
+      title: title,
+      repo: repo,
+      lead: featured,
+      ownQuestions: copy.filter { b => isActive(b) and b.kind == BlockKind.QUESTION }.map { b => b.address },
+    }}
+    # A markdown edit refreshes the JSON's blocks, not its presentation.
+    # Preserve curation unless the caller explicitly requests JSON or HTML.
+    if (hasJson and !wantHtml and !formats.contains(ExportFormat.JSON)) {
+      let priorViewer: {{viewer: {{title: String, repo: String, lead: [String!]}}}}! = JSON.decode(base.file(jsonPath).contents)
+      let settings = priorViewer.viewer
+      if (settings != null) {
+        viewer = {{
+          version: 1,
+          title: settings.title ?? title,
+          repo: settings.repo ?? repo,
+          lead: (settings.lead ?? []).filter { id => (copy + foreign).any { b => b.address == id and isActive(b) } },
+          ownQuestions: viewer.ownQuestions,
+        }}
+      }
+    }
 
     let out = base
     let written: [String!]! = []
@@ -904,7 +937,7 @@ type Context {
       }
     }
     # Refresh an existing JSON copy even when only another format is requested.
-    let writeJson = formats.contains(ExportFormat.JSON) or hasJson
+    let writeJson = formats.contains(ExportFormat.JSON) or hasJson or (wantHtml and !offlineHtml)
     if (writeJson) {
       # Foreign and session citations use their original namespaces, even
       # when selection omits the questions they cite. Check the whole session.
@@ -933,12 +966,19 @@ type Context {
         let links: {{blocks: [{{id: String!, superseded_by: [String!]}}!]!}}! = JSON.decode(base.file(jsonPath).contents)
         foreignLinks = links.blocks.filter { b => foreign.any { f => f.address == b.id } }
       }
-      out = out.withNewFile(jsonPath, jsonOf(copy + foreign, priorDoc.questions, foreignLinks))
+      out = out.withNewFile(jsonPath, jsonOf(copy + foreign, viewer, priorDoc.questions, foreignLinks))
       written += ["context.json"]
     }
     if (wantHtml) {
-      out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
-      out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, title, repo))
+      if (offlineHtml) {
+        out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, viewer.title, viewer.repo, viewer.lead))
+        out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, viewer.title, viewer.repo))
+      } else {
+        out = out.withDirectory(into, contextAssets)
+        written += ["context.css", "render.js", "interactions.js", "boot.js"]
+        out = out.withNewFile(prefix + "index.html", contextShell(false, viewer.title))
+        out = out.withNewFile(prefix + "questions.html", contextShell(true, viewer.title))
+      }
       written += ["index.html", "questions.html"]
     }
     let notes: [String!]! = []
@@ -1262,7 +1302,7 @@ type Context {
   # context.json for these Blocks: every field, plus question_count, the
   # highest Q-number this Context or the prior export ever assigned, so a
   # session importing it never reuses a forgotten one.
-  let jsonOf(bs: [Block!]!, priorQuestions: Int! = 0, foreignLinks: [{{id: String!, superseded_by: [String!]}}!]! = []): String! {
+  let jsonOf(bs: [Block!]!, viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!, priorQuestions: Int! = 0, foreignLinks: [{{id: String!, superseded_by: [String!]}}!]! = []): String! {
     bs.each { b =>
       let n = b.number
       if (n != null and bs.any { other => other.address != b.address and other.number == n }) {
@@ -1275,6 +1315,7 @@ type Context {
     let high = maxNumber(blocks.values + bs, floor)
     let doc = {{
       version: exportVersion,
+      viewer: viewer,
       question_count: high,
       blocks: bs.map { b =>
         {{
@@ -1347,8 +1388,11 @@ type Context {
 
     EXPORT what should outlive this session: exportContext writes the
     Context into your pending changes — markdown under context/ to commit
-    beside the code that motivated it, or an HTML page and context.json to
-    publish. The in-session set does NOT survive recomposition
+    beside the code that motivated it, or JSON alone to publish as a gist.
+    View it at https://vito.github.io/agents/context/v1/?gist=<id> (append
+    &view=questions for the questions page). HTML is an optional portable
+    export; offlineHtml makes it self-contained for file:// viewing.
+    The in-session set does NOT survive recomposition
     (install/reload), so export before those. importContext loads an
     export back: a committed context/, a git URL, or a gist.
 

@@ -20,12 +20,12 @@ let markdownOf(ctx: Context!, flat: Boolean! = false): Directory! {
 
 let htmlOf(ctx: Context!, title: String! = "Context", repo: String! = "", lead: [String!]! = []): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
-    formats: [ContextExportFormat.HTML], title: title, repo: repo, lead: lead)).file("out/index.html").contents
+    formats: [ContextExportFormat.HTML], offlineHtml: true, title: title, repo: repo, lead: lead)).file("out/index.html").contents
 }
 
 let questionsOf(ctx: Context!, repo: String! = ""): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
-    formats: [ContextExportFormat.HTML], repo: repo)).file("out/questions.html").contents
+    formats: [ContextExportFormat.HTML], offlineHtml: true, repo: repo)).file("out/questions.html").contents
 }
 
 let importDir(ctx: Context!, dir: Directory!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
@@ -76,6 +76,74 @@ let testContextExportMetadata(source: Workspace!): String! {
     let roundtrip: {{id: String!, kind: String!, tags: [String!]!, pin: Boolean!, supersedes: [String!]!, superseded_by: [String!]!, status: String}}! = YAML.decode(YAML.encode(metadata))
     assert { roundtrip == metadata }
   }
+  # JSON-only gists carry presentation data without changing document v1.
+  let questions = context
+    .blockWrite("questions/open", ContextBlockKind.QUESTION, "open?", priority: p2, summary: "Open?")
+    .blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "Foreign?")
+    .blockWrite("questions/old", ContextBlockKind.QUESTION, "old?", priority: p2, summary: "Old?")
+    .blockWrite("questions/dropped", ContextBlockKind.QUESTION, "dropped?", priority: p2, summary: "Dropped?")
+    .blockWrite("notes/lead", ContextBlockKind.NOTE, "At a glance")
+  let active = questions
+    .blockWrite("decisions/answer", ContextBlockKind.DECISION, "answered", supersedes: ["questions/old"])
+    .blockDrop(["questions/dropped"])
+  let title = "Review <this> \"title\""
+  let repo = "vito/agents"
+  let lead = ["notes/lead", "questions/open"]
+  let expected = {{version: 1, title: title, repo: repo, lead: lead, ownQuestions: ["questions/foreign", "questions/open"]}}
+  # Both optional HTML modes retain identical JSON metadata.
+  [false, true].each { offline =>
+    let bundle = directory.withChanges(active.exportContext(source: scratch, path: ".",
+      formats: [ContextExportFormat.JSON, ContextExportFormat.HTML], offlineHtml: offline,
+      title: title, repo: repo, lead: ["notes/lead", "Q-1", "notes/lead"]))
+    let doc: {{version: Int!, viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(bundle.file("context.json").contents)
+    assert { doc.version == 1 and doc.viewer == expected }
+    assert { importDir(context, bundle).blockIndex == active.blockIndex }
+  }
+  let onlyJson = directory.withChanges(active.exportContext(source: scratch, path: ".",
+    formats: [ContextExportFormat.JSON], title: title, repo: repo, lead: ["notes/lead", "Q-1"]))
+  assert { onlyJson.entries == ["context.json"] }
+  let doc: {{version: Int!, viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(onlyJson.file("context.json").contents)
+  assert { doc.version == 1 and doc.viewer == expected }
+  assert { importDir(context, onlyJson).blockIndex == active.blockIndex }
+
+  # Incidental JSON refreshes from markdown edits keep presentation settings,
+  # pruning a dropped lead and recomputing which own questions remain open.
+  let edited = active.blockDrop(["notes/lead", "questions/foreign"])
+  let incidental = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
+    path: ".", ids: ["notes/lead"]))
+  let incidentalDoc: {{viewer: {{version: Int!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(incidental.file("context.json").contents)
+  assert { incidentalDoc.viewer == {{version: 1, title: title, repo: repo, lead: ["questions/open"], ownQuestions: ["questions/open"]}} }
+  let explicit = onlyJson.withChanges(edited.exportContext(source: onlyJson.asWorkspace,
+    path: ".", formats: [ContextExportFormat.JSON], ids: ["notes/lead"]))
+  let explicitDoc: {{viewer: {{title: String!, repo: String!, lead: [String!]!}}!}}! = JSON.decode(explicit.file("context.json").contents)
+  assert { explicitDoc.viewer.title == "Context" and explicitDoc.viewer.repo == "" and explicitDoc.viewer.lead.isEmpty }
+
+  # A fresh selection excludes other live questions, unlike a retained copy.
+  let selected = directory.withChanges(active.exportContext(source: scratch, path: ".",
+    formats: [ContextExportFormat.JSON], ids: ["Q-1"], lead: ["Q-1"]))
+  let selectedDoc: {{viewer: {{lead: [String!]!, ownQuestions: [String!]!}}!}}! = JSON.decode(selected.file("context.json").contents)
+  assert { selectedDoc.viewer.lead == ["questions/open"] and selectedDoc.viewer.ownQuestions == ["questions/open"] }
+  # Retained own questions stay answerable; foreign, dropped, superseded,
+  # and never-exported questions do not become the viewer's own questions.
+  let session = active.blockDrop(["questions/foreign"], forget: true)
+    .blockWrite("questions/omitted", ContextBlockKind.QUESTION, "omitted?", priority: p2, summary: "Omitted?")
+  # An old unnumbered foreign question can coexist without crossing Q-number
+  # namespaces (numbered conflicts are covered by the export refresh check).
+  let prior = onlyJson.withNewFile("context.json", onlyJson.file("context.json").contents.replaceMatches(`"number"\s*:\s*2`, with: `"number":null`))
+    .withNewFile("keep.txt", "unrelated")
+    .withNewFile("index.html", "unrelated HTML")
+  let refreshed = prior.withChanges(session.exportContext(source: prior.asWorkspace, path: ".",
+    formats: [ContextExportFormat.JSON], ids: ["notes/lead"], lead: ["notes/lead"]))
+  let refreshedDoc: {{viewer: {{lead: [String!]!, ownQuestions: [String!]!}}!, blocks: [{{id: String!}}!]!}}! = JSON.decode(refreshed.file("context.json").contents)
+  assert { refreshedDoc.viewer.lead == ["notes/lead"] and refreshedDoc.viewer.ownQuestions == ["questions/open"] }
+  assert { refreshedDoc.blocks.any { b => b.id == "questions/foreign" } }
+  assert { !refreshedDoc.blocks.any { b => b.id == "questions/omitted" } }
+  assert { refreshed.file("keep.txt").contents == "unrelated" and refreshed.file("index.html").contents == "unrelated HTML" }
+
+  # Viewer settings are optional presentation data, never import state.
+  let legacy = directory.withNewFile("context.json", `{ "version": 1, "blocks": [{"id":"notes/legacy","kind":"note","text":"legacy"}] }`)
+  let legacyWithViewer = directory.withNewFile("context.json", `{ "version": 1, "viewer": {"version":99,"title":"future"}, "blocks": [{"id":"notes/legacy","kind":"note","text":"legacy"}] }`)
+  assert { importDir(context, legacy).blockIndex == importDir(context, legacyWithViewer).blockIndex }
   "Export metadata and payload checks passed."
 }
 
@@ -143,13 +211,15 @@ let testContextExportRefresh(source: Workspace!): String! {
   let answered = question.blockWrite("decisions/ship", ContextBlockKind.DECISION, "Ship now.", supersedes: ["questions/ship"])
   let updated = bundle.withChanges(answered.exportContext(source: bundle.asWorkspace, path: ".",
     formats: [ContextExportFormat.HTML], ids: ["decisions/ship"]))
-  assert { updated.file("questions.html").contents.contains("No open questions.") }
+  let updatedDoc: {{viewer: {{ownQuestions: [String!]!}}!}}! = JSON.decode(updated.file("context.json").contents)
+  assert { updatedDoc.viewer.ownQuestions.isEmpty }
   let imported = importDir(context, updated)
   assert { imported.compose.contains("Ship now.") and !imported.compose.contains("Ready to ship?") }
   assert { readBlock(imported, "questions/ship").contains("superseded by decisions/ship") }
   assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
-  # Format selection still controls creation: HTML alone adds no JSON file.
-  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["index.html", "questions.html"] }
+  # HTML alone includes its JSON dependency; offline HTML needs no JSON.
+  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
+  assert { directory.withChanges(answered.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true)).directory("out").entries == ["index.html", "questions.html"] }
 
   # A different session refreshing HTML must not lower the JSON's retired
   # Q-number high-water mark, even when that question no longer has a Block.
@@ -280,7 +350,7 @@ let testContextExportRoundTrip(source: Workspace!): String! {
   assert { gist.entries.all { e => !e.hasSuffix("/") } }
   assert { sameContext(importDir(context, gist), fixture) }
   let bundle = exportedDir(fixture, [ContextExportFormat.JSON, ContextExportFormat.HTML])
-  assert { bundle.entries == ["context.json", "index.html", "questions.html"] }
+  assert { bundle.entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
   assert { sameContext(importDir(context, bundle), fixture) }
   "Context export/import round-trip checks passed."
 }
@@ -301,9 +371,17 @@ let testContextExportSelection(source: Workspace!): String! {
   assert { none.any { m => m.contains("nothing matched the selection") } }
   let noFormat = directory.withChanges(fixture.exportContext(source: scratch, formats: [])).entries rescue { e: Error => [e.message] }
   assert { noFormat.any { m => m.contains("name at least one format") } }
-  let leadOut = directory.withChanges(fixture.exportContext(source: scratch, formats: [ContextExportFormat.HTML],
-    ids: ["facts/z"], lead: ["glossary"])).entries rescue { e: Error => [e.message] }
-  assert { leadOut.any { m => m.contains("not in the selection") } }
+  [ContextExportFormat.HTML, ContextExportFormat.JSON].each { format =>
+    let leadOut = directory.withChanges(fixture.exportContext(source: scratch, formats: [format],
+      ids: ["facts/z"], lead: ["glossary"])).entries rescue { e: Error => [e.message] }
+    assert { leadOut.any { m => m.contains("not in the selection") } }
+    let stale = directory.withChanges(fixture.exportContext(source: scratch, formats: [format],
+      lead: ["facts/old"])).entries rescue { e: Error => [e.message] }
+    assert { stale.any { m => m.contains("it is superseded") } }
+    let dropped = directory.withChanges(fixture.blockDrop(["glossary"]).exportContext(source: scratch,
+      formats: [format], lead: ["glossary"])).entries rescue { e: Error => [e.message] }
+    assert { dropped.any { m => m.contains("it is dropped") } }
+  }
 
   # from: a missing workspace path is an error naming it.
   let missing = context.importContext(source: scratch, from: "nowhere").blockIndex rescue { e: Error => e.message }
@@ -443,7 +521,7 @@ let testContextHtmlCurated(source: Workspace!): String! {
   let noHtml = directory.withChanges(fixture.exportContext(source: scratch, lead: ["glossary"])).entries rescue {
     e: Error => [e.message]
   }
-  assert { noHtml.any { m => m.contains("add HTML to formats") } }
+  assert { noHtml.any { m => m.contains("add JSON or HTML to formats") } }
   "Context curated HTML checks passed."
 }
 
@@ -715,7 +793,7 @@ let testContextQuestions(source: Workspace!): String! {
 
   # questions.html: open questions by priority, written beside index.html
   # (flat too), self-contained and deterministic.
-  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["index.html", "questions.html"] }
+  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
   let page = questionsOf(answered, repo: "vito/agents")
   assert { page.hasPrefix("<!doctype html>") and !page.contains("<link") and !page.contains(" src=") }
   assert { questionsOf(answered, repo: "vito/agents") == page }
@@ -736,7 +814,7 @@ let testContextQuestions(source: Workspace!): String! {
   # index.html, but is not offered for answering: the session lacks it.
   let elsewhere = directory.withFile("out/context.json",
     jsonOf(ctx.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
-  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML]))
+  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true))
   assert { mixed.file("out/index.html").contents.contains(`id="b-questions/foreign"`) }
   assert { !mixed.file("out/questions.html").contents.contains(`id="q-questions/foreign"`) }
   "Context question checks passed."

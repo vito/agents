@@ -1,0 +1,59 @@
+# Real Chromium checks for the JSON-backed pages. No live GitHub requests:
+# API and raw responses are intercepted, including the 900 KiB gist limit.
+let testContextDynamicHtml(source: Workspace!): String! {
+  let title = "Context <&> \"quoted\" </script><script>window.pwned=1</script>"
+  let legacy = directory.withNewFile("questions/legacy.md", "---\nkind: question\n---\n\nLegacy without priority.\n")
+  let fixture = importDir(contextIoFixture, legacy)
+    .blockWrite("questions/later", ContextBlockKind.QUESTION, "See facts/current and Q-1.\n\n> quoted\n\n---\n\n1. first\n2. second\n\n# heading\n\n*italic* ~~strike~~ `literal*` [link](https://example.com/?x=1&y=2)", priority: p2, summary: "Later?", options: ["Wait", "Go"], recommended: "A")
+    .blockWrite("questions/blocker-a", ContextBlockKind.QUESTION, "A blocker", priority: p2, summary: "A?", tags: ["blocker"])
+    .blockWrite("questions/blocker-b", ContextBlockKind.QUESTION, "Pinned blocker", priority: p2, summary: "B?", tags: ["blocker"], pin: true)
+    .blockWrite("questions/pinned", ContextBlockKind.QUESTION, "Pinned", priority: p2, summary: "Pinned?", pin: true)
+    .blockWrite("questions/urgent", ContextBlockKind.QUESTION, "<img src=x onerror=window.pwned=1>\n\n`Q-1` facts/old. #12", priority: ContextQuestionPriority.P0, summary: "**Now?** <script>window.pwned=1</script>", blocks: "release <&>", options: ["Yes <img src=x onerror=window.pwned=1>", "No & wait"], recommended: "B")
+    .blockWrite("questions/done", ContextBlockKind.QUESTION, "Done", priority: p2, summary: "Done?")
+    .blockWrite("decisions/done", ContextBlockKind.DECISION, "Done", supersedes: ["questions/done"])
+    .blockWrite("notes/dropped", ContextBlockKind.NOTE, "Dropped", tags: ["gone"])
+    .blockDrop(["notes/dropped"])
+    .blockWrite("notes/large", ContextBlockKind.NOTE, "small payload")
+  let prior = exportedDir(fixture.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "Foreign", priority: p2, summary: "Foreign?"), [ContextExportFormat.JSON])
+  let own = fixture
+  let lead = ["decisions/x", "questions/urgent"]
+  let dynamic = prior.withChanges(own.exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead))
+  let offline = prior.withChanges(own.exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead, offlineHtml: true))
+  assert { dynamic.entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
+  assert { dynamic.file("context.json").contents == offline.file("context.json").contents }
+  assert { jsonOf(importDir(context, dynamic)).contents == jsonOf(importDir(context, offline)).contents }
+  let large = "large-payload!"
+  let medium = large
+  let i = 0
+  loop {
+    if (i == 17) { break }
+    large += large
+    i += 1
+    if (i == 15) { medium = large }
+  }
+  let typical = prior.withChanges(own.blockWrite("notes/large", ContextBlockKind.NOTE, medium).exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead))
+  assert { typical.file("context.json").size > 343452 }
+  assert { typical.file("context.json").size + typical.file("index.html").size + typical.file("questions.html").size < 921600 }
+  print("HTML shell bytes: index=" + toString(typical.file("index.html").size) + ", questions=" + toString(typical.file("questions.html").size) + "; typical context.json=" + toString(typical.file("context.json").size))
+  let enlarged = prior.withChanges(own.blockWrite("notes/large", ContextBlockKind.NOTE, large).exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead))
+  assert { enlarged.file("context.json").size > 921600 }
+  ["index.html", "questions.html"].each { page =>
+    assert { dynamic.file(page).contents == enlarged.file(page).contents }
+    assert { enlarged.file(page).size < 4000 }
+    assert { !enlarged.file(page).contents.contains("async function renderContext") }
+    assert { !enlarged.file(page).contents.contains("small payload") }
+  }
+  let selected = directory.withChanges(own.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], ids: ["questions/urgent"], title: title)).directory("out")
+  let selectedDoc: {{blocks: [{{id: String!}}!]!}}! = JSON.decode(selected.file("context.json").contents)
+  assert { selectedDoc.blocks.map { b => b.id } == ["questions/urgent"] }
+  let files = directory.withDirectory("dynamic", dynamic).withDirectory("offline", offline).withDirectory("large", enlarged).withDirectory("selected", selected)
+  container.from("mcr.microsoft.com/playwright:v1.58.2-noble")
+    .withWorkdir("/tests")
+    .withExec(["npm", "install", "--no-audit", "--no-fund", "--save-exact", "@playwright/test@1.58.2"])
+    .withDirectory("/fixtures", files)
+    .withDirectory("/source/context", source.directory("context"))
+    .withExec(["node", "/source/context/build-viewer.cjs", "/fixtures/viewer"])
+    .withFile("/tests/context.cjs", currentModule.source.file("context-browser.cjs"))
+    .withExec(["node", "--test", "/tests/context.cjs"]).sync
+  "JSON-backed Context browser and export checks passed."
+}

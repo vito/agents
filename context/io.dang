@@ -176,7 +176,9 @@ let parseMarkdownBlock(origin: String!, path: String!, raw: String!): Block {
 
 # Parse a context.json document: its Blocks, and the highest question number
 # its Context ever assigned (question_count), so numbers a forgotten
-# question held stay retired in the importing session.
+# question held stay retired in the importing session. The optional viewer
+# object is presentation metadata, ignored on import; version-1 documents
+# written before it existed remain valid.
 let parseJsonBlocks(origin: String!, raw: String!): {{blocks: [Block!]!, questions: Int!}}! {
   let doc: {{version: Int, question_count: Int, blocks: [{{id: String, kind: String, text: String, tags: [String!], pin: Boolean, supersedes: [String!], status: String, number: Int, priority: String, blocks: String, summary: String, options: [{{key: String, text: String, recommended: Boolean}}!]}}!]}}! = JSON.decode(raw) rescue {
     e: Error => raise `${origin}: not a Context export (context.json): ${e.message}`
