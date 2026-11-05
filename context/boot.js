@@ -20,8 +20,8 @@
     main.textContent = 'Unable to load Context: ' + error.message;
     main.setAttribute('role', 'alert');
   }
-  async function getJSON(url) {
-    const response = await fetch(url, {signal: AbortSignal.timeout(30000), credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer'});
+  async function getJSON(url, credentials = 'omit') {
+    const response = await fetch(url, {signal: AbortSignal.timeout(30000), credentials, redirect: 'error', referrerPolicy: 'no-referrer'});
     if (!response.ok) throw new Error(`HTTP ${response.status} loading Context. GitHub rate limits may require waiting before retrying.`);
     try { return await response.json(); }
     catch (_) { throw new Error('Invalid or incomplete JSON. Re-export and publish context.json.'); }
@@ -83,7 +83,7 @@
       doc = await loadGist(gist);
     } else {
       if (location.protocol === 'file:') throw new Error('Browsers block file:// JSON fetches. Serve this directory over HTTP, or export again with offlineHtml: true.');
-      doc = await getJSON('./context.json');
+      doc = await getJSON('./context.json', 'same-origin');
     }
     renderContext(doc, questions);
     if (hosted) {

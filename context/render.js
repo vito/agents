@@ -56,7 +56,7 @@ function renderContext(doc, questions) {
   if (!object(viewer) || viewer.version !== 1) fail('unsupported or malformed viewer metadata (expected version 1).');
   if (typeof viewer.title !== 'string' || typeof viewer.repo !== 'string' ||
       !Array.isArray(viewer.lead) || !Array.isArray(viewer.ownQuestions)) fail('malformed viewer metadata.');
-  if (viewer.repo && !/^[A-Za-z0-9][\w.-]*\/[A-Za-z0-9][\w.-]*$/.test(viewer.repo)) fail('viewer.repo must be owner/repo or empty.');
+  if (viewer.repo && !/^[A-Za-z0-9][\w.-]*\/[\w.-]+$/.test(viewer.repo)) fail('viewer.repo must be owner/repo or empty.');
   for (const name of ['lead', 'ownQuestions']) {
     strings(viewer[name], 'viewer.' + name);
     if (new Set(viewer[name]).size !== viewer[name].length || viewer[name].some(id => !known.has(id))) fail('viewer.' + name + ' must contain unique known block ids.');
