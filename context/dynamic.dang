@@ -1,0 +1,28 @@
+# JSON-backed pages share the renderer source and the existing interactions.
+# Presentation and ownership belong to this export, not the importable JSON.
+let contextShell(questions: Boolean!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!): String! {
+  let config = JSON.encode({{questions: questions, title: title, repo: repo, lead: lead, ownQuestions: ownQuestions}})
+  let pageTitle = title + (if (questions) { " — open questions" } else { "" })
+  let css = contextCss + (if (questions) { questionsCss } else { "" })
+  let interactions = if (questions) { questionsJs } else { contextJs }
+  `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(pageTitle)}</title><style>` + css +
+    `</style></head><body data-title="${escHtml(title)}" data-config="${escHtml(config)}"><main><p role="status">Loading context.json…</p><noscript>JavaScript is required. Use exportContext with offlineHtml: true for self-contained HTML.</noscript></main><script>` +
+    currentModule.source.file("render.js").contents + "\nrenderContext().then(function(){\n" + interactions + gistLinksJs + """
+      // Loading is asynchronous: restore deep links after the cards exist.
+      function reveal(){
+        var id;try{id=decodeURIComponent(location.hash.slice(1));}catch(e){return;}
+        var el=document.getElementById(id);if(!el)return;
+        for(var p=el.parentElement;p;p=p.parentElement)if(p.tagName==='DETAILS')p.open=true;
+        el.classList.remove('hide');el.scrollIntoView();
+      }
+      window.addEventListener('hashchange',reveal);reveal();
+    }).catch(function(error){
+      var main=document.querySelector('main');
+      main.textContent='Unable to load Context: '+error.message+
+        ' Ensure context.json is published beside both HTML files, then reload. '+
+        'For local file viewing, export again with offlineHtml: true.';
+      main.setAttribute('role','alert');
+    });
+    </script></body></html>
+    """
+}

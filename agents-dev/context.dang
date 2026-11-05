@@ -20,12 +20,12 @@ let markdownOf(ctx: Context!, flat: Boolean! = false): Directory! {
 
 let htmlOf(ctx: Context!, title: String! = "Context", repo: String! = "", lead: [String!]! = []): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
-    formats: [ContextExportFormat.HTML], title: title, repo: repo, lead: lead)).file("out/index.html").contents
+    formats: [ContextExportFormat.HTML], offlineHtml: true, title: title, repo: repo, lead: lead)).file("out/index.html").contents
 }
 
 let questionsOf(ctx: Context!, repo: String! = ""): String! {
   directory.withChanges(ctx.exportContext(source: scratch, path: "out",
-    formats: [ContextExportFormat.HTML], repo: repo)).file("out/questions.html").contents
+    formats: [ContextExportFormat.HTML], offlineHtml: true, repo: repo)).file("out/questions.html").contents
 }
 
 let importDir(ctx: Context!, dir: Directory!, onConflict: ContextImportConflict! = ContextImportConflict.ERROR): Context! {
@@ -148,8 +148,9 @@ let testContextExportRefresh(source: Workspace!): String! {
   assert { imported.compose.contains("Ship now.") and !imported.compose.contains("Ready to ship?") }
   assert { readBlock(imported, "questions/ship").contains("superseded by decisions/ship") }
   assert { readBlock(imported, "notes/foreign").contains("kept from another session") }
-  # Format selection still controls creation: HTML alone adds no JSON file.
-  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["index.html", "questions.html"] }
+  # HTML alone includes its JSON dependency; offline HTML needs no JSON.
+  assert { exportedDir(answered, [ContextExportFormat.HTML]).entries == ["context.json", "index.html", "questions.html"] }
+  assert { directory.withChanges(answered.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true)).directory("out").entries == ["index.html", "questions.html"] }
 
   # A different session refreshing HTML must not lower the JSON's retired
   # Q-number high-water mark, even when that question no longer has a Block.
@@ -715,7 +716,7 @@ let testContextQuestions(source: Workspace!): String! {
 
   # questions.html: open questions by priority, written beside index.html
   # (flat too), self-contained and deterministic.
-  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["index.html", "questions.html"] }
+  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["context.json", "index.html", "questions.html"] }
   let page = questionsOf(answered, repo: "vito/agents")
   assert { page.hasPrefix("<!doctype html>") and !page.contains("<link") and !page.contains(" src=") }
   assert { questionsOf(answered, repo: "vito/agents") == page }
@@ -736,7 +737,7 @@ let testContextQuestions(source: Workspace!): String! {
   # index.html, but is not offered for answering: the session lacks it.
   let elsewhere = directory.withFile("out/context.json",
     jsonOf(ctx.blockWrite("questions/foreign", ContextBlockKind.QUESTION, "foreign?", priority: p2, summary: "f")))
-  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML]))
+  let mixed = elsewhere.withChanges(answered.exportContext(source: elsewhere.asWorkspace, path: "out", formats: [ContextExportFormat.HTML], offlineHtml: true))
   assert { mixed.file("out/index.html").contents.contains(`id="b-questions/foreign"`) }
   assert { !mixed.file("out/questions.html").contents.contains(`id="q-questions/foreign"`) }
   "Context question checks passed."

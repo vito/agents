@@ -749,10 +749,11 @@ type Context {
     and diffable; what a repo commits under context/.
   - JSON: <path>/context.json, every field plus the Q-number high-water
     mark. The lossless form.
-  - HTML: <path>/index.html, the Context as one self-contained page —
-    "At a glance" (the lead Blocks), open questions, kind and tag filters,
-    every Block as a card — and <path>/questions.html, the open questions
-    by priority, with options to pick, notes, and a prompt to copy back.
+  - HTML: small index.html and questions.html pages loading context.json
+    (automatically included, even with HTML alone). The dashboard has "At a
+    glance", open questions, kind/tag filters and every Block as a card;
+    questions.html has options, notes and a prompt to copy back. Serve over
+    HTTP or gistpreview.github.io; use offlineHtml for self-contained files.
 
   Every Block of every status is exported unless ids, tags or kinds narrow
   it, e.g. to the decisions a pull request motivated. What path already
@@ -809,6 +810,12 @@ type Context {
     page, in this order, with HTML.
     """
     lead: [String!]! = [],
+    """
+    Render self-contained HTML files instead of JSON-backed pages. For offline
+    file:// viewing; larger, so avoid this for gists. Default HTML needs HTTP
+    hosting (with context.json beside it) or gistpreview.github.io.
+    """
+    offlineHtml: Boolean! = false,
   ): Changeset! {
     if (blocks.isEmpty) {
       raise "the Context is empty — nothing to export"
@@ -904,7 +911,7 @@ type Context {
       }
     }
     # Refresh an existing JSON copy even when only another format is requested.
-    let writeJson = formats.contains(ExportFormat.JSON) or hasJson
+    let writeJson = formats.contains(ExportFormat.JSON) or hasJson or (wantHtml and !offlineHtml)
     if (writeJson) {
       # Foreign and session citations use their original namespaces, even
       # when selection omits the questions they cite. Check the whole session.
@@ -937,8 +944,14 @@ type Context {
       written += ["context.json"]
     }
     if (wantHtml) {
-      out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
-      out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, title, repo))
+      if (offlineHtml) {
+        out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, title, repo, featured))
+        out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, title, repo))
+      } else {
+        let ownQuestions = copy.filter { b => isActive(b) and b.kind == BlockKind.QUESTION }.map { b => b.address }
+        out = out.withNewFile(prefix + "index.html", contextShell(false, title, repo, featured, ownQuestions))
+        out = out.withNewFile(prefix + "questions.html", contextShell(true, title, repo, featured, ownQuestions))
+      }
       written += ["index.html", "questions.html"]
     }
     let notes: [String!]! = []

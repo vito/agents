@@ -97,6 +97,12 @@ type AgentsDev {
     null
   }
 
+  """Check JSON-backed HTML in Chromium: HTTP/gist loading, truncation, safe rendering, navigation and persistent question answers."""
+  contextDynamicHtml(source: Workspace!): Void @check {
+    print(testContextDynamicHtml(source: source))
+    null
+  }
+
   """Check the exported HTML's rendering, escaping and links."""
   contextHtml(source: Workspace!): Void @check {
     print(testContextHtml(source: source))

@@ -1,4 +1,5 @@
-# exportContext's HTML: a Context rendered as one self-contained page — kind
+# exportContext's offlineHtml renderer (the default JSON-backed shells reuse
+# its styles and interactions from dynamic.dang). A self-contained page — kind
 # legend and counts, pins, tags, kind/tag filters, a kind × tag matrix, block
 # cards with their markdown rendered, linkified URLs, GitHub refs and block
 # ids, references / referenced-by inferred from block text, supersession, and
