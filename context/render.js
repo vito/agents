@@ -166,6 +166,9 @@ function renderContext(doc, questions) {
     page += '<div id="dock"><div class="inner"><button id="gen">Generate prompt</button><button id="copy-all">Copy prompt</button><button class="secondary" id="clear">Clear answers</button><span class="toast" id="toast"></span><textarea id="prompt" readonly></textarea></div></div>';
   } else {
     const pinned = live.filter(b => b.pin), counts = new Map();
+    // Body text only: a lower bound on composition cost, counted in Unicode
+    // code points like Dang String.length (not JavaScript UTF-16 units).
+    const pinnedChars = pinned.reduce((n, b) => n + Array.from(b.text).length, 0);
     live.forEach(b => b.tags.forEach(t => counts.set(t, (counts.get(t) || 0) + 1)));
     const tags = [...counts.keys()].sort((a, b) => counts.get(b) - counts.get(a));
     const present = kinds.filter(k => live.some(b => b.kind === k));
@@ -190,7 +193,9 @@ function renderContext(doc, questions) {
     }
     const badge = k => `<span class="kind k-${k}">${k.toUpperCase()}</span>`;
     page = `<h1>${esc(config.title)}</h1><div class="sub">${live.length} active block(s), ${pinned.length} pinned, ${gone.length} superseded${dropped.length ? ', ' + dropped.length + ' dropped' : ''}.</div>\n`;
-    page += '<div class="legend">' + present.map(k => `<span>${badge(k)} ×${live.filter(b => b.kind === k).length}</span>`).join('') + `<span><span class="pin">📌 pinned</span> ×${pinned.length}</span><span class="sub">(pinned = composed into every turn)</span></div>\n`;
+    page += '<div class="legend">' + present.map(k => `<span>${badge(k)} ×${live.filter(b => b.kind === k).length}</span>`).join('') + `<span><span class="pin">📌 pinned</span> ×${pinned.length}</span><span class="sub">(pinned = candidates for bounded orientation, not automatic per-turn injection)</span></div>\n`;
+    page += `<div class="sub pin-cost">Active pinned body text: ${pinnedChars} character(s), excluding headers, summaries and options.</div>\n`;
+    if (pinnedChars > 12000) page += '<p class="pin-warning">Pinned bodies alone exceed the default 12000-character orientation budget. Keep a small current handoff and cross-task constraints pinned; unpin historical milestones with blockPin rather than deleting their records. Orientation will report omitted pins.</p>\n';
     const leading = config.lead.map(id => known.get(id)).filter(b => b && active(b));
     const asked = urgency(live.filter(b => b.kind === 'question' && !config.lead.includes(b.id)));
     page += '<nav>' + (leading.length ? '<a href="#glance">At a glance</a>' : '') + (asked.length ? '<a href="#questions">Open questions</a>' : '') + '<a href="#overview">Overview</a><a href="#blocks">Blocks</a>' + (gone.length ? '<a href="#superseded">Superseded</a>' : '') + (dropped.length ? '<a href="#dropped">Dropped</a>' : '') + '<a href="#about">About</a>' + (live.some(b => b.kind === 'question') ? '<a href="questions.html">Answer questions ↗</a>' : '') + '</nav>\n';

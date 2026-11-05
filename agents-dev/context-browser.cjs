@@ -25,7 +25,7 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       res.setHeader('Content-Type', 'application/json');
       res.end(await read('dynamic', 'context.json')); return;
     }
-    const match = /^\/(dynamic|offline|large|selected)\/([a-z-]+\.(?:html|json|js|css))$/.exec(req.url);
+    const match = /^\/(dynamic|offline|large|selected|pins|pins-offline)\/([a-z-]+\.(?:html|json|js|css))$/.exec(req.url);
     if (!match) { res.writeHead(404); res.end('not found'); return; }
     const mime = {json: 'application/json', html: 'text/html', js: 'text/javascript', css: 'text/css'};
     try { res.setHeader('Content-Type', mime[match[2].split('.').pop()]); res.end(await read(match[1], match[2])); }
@@ -83,6 +83,24 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       assert.equal(await page.locator('#blocks-list .blk.hide').count(), 0);
       await page.goto(`${origin}/selected/questions.html`); await ready();
       assert.deepEqual(await ids('section.q'), ['q-questions/urgent']);
+    });
+    await t.test('pin cost and overload warning agree in dynamic and offline views', async () => {
+      let expected;
+      for (const dir of ['pins-offline', 'pins']) {
+        await page.goto(`${origin}/${dir}/index.html`); await ready();
+        await expect(page.locator('.legend')).toContainText('candidates for bounded orientation');
+        await expect(page.locator('.legend')).not.toContainText('composed into every turn');
+        await expect(page.locator('.pin-cost')).toHaveText('Active pinned body text: 16400 character(s), excluding headers, summaries and options.');
+        await expect(page.locator('.pin-warning')).toContainText('unpin historical milestones with blockPin rather than deleting their records');
+        const actual = await html('.legend, .pin-cost, .pin-warning');
+        if (expected) assert.deepEqual(actual, expected);
+        expected = actual;
+      }
+      for (const dir of ['offline', 'dynamic']) {
+        await page.goto(`${origin}/${dir}/index.html`); await ready();
+        await expect(page.locator('.pin-warning')).toHaveCount(0);
+        await expect(page.locator('.pin-cost')).toHaveCount(1);
+      }
     });
     await t.test('portable HTTP follows JSON redirects and retains same-origin cookies', async () => {
       await context.addCookies([{name: 'context-auth', value: 'allowed', url: origin}]);
