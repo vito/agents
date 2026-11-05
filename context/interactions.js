@@ -29,9 +29,12 @@ function initContextInteractions(questions) {
   const gist = body.dataset.gist || legacyGist;
   const KEY = 'context-answers:' + (gist || location.pathname + ':' + body.dataset.title);
   const legacyKey = 'context-answers:' + (gist || location.pathname) + ':' + body.dataset.title;
+  // Pages exported before titles were required were all titled "Context";
+  // a retitled re-export at the same path picks up their answers.
+  const untitledKey = gist ? legacyKey : 'context-answers:' + location.pathname + ':Context';
   let state = Object.create(null);
   try {
-    const saved = JSON.parse(localStorage.getItem(KEY) || localStorage.getItem(legacyKey) || '{}');
+    const saved = JSON.parse(localStorage.getItem(KEY) || localStorage.getItem(legacyKey) || localStorage.getItem(untitledKey) || '{}');
     if (saved && typeof saved === 'object' && !Array.isArray(saved)) {
       for (const [id, value] of Object.entries(saved)) {
         if (value && typeof value === 'object' && !Array.isArray(value)) state[id] = value;

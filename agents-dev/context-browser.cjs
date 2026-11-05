@@ -136,6 +136,12 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       await page.reload(); await ready();
       await expect(card.locator('input[value="B"]')).not.toBeChecked();
       await expect(card.locator('textarea')).toHaveValue('');
+      // Answers saved on a page from before titles were required ("Context")
+      // carry over to its retitled re-export at the same path.
+      await page.evaluate(() => { localStorage.clear(); localStorage.setItem('context-answers:' + location.pathname + ':Context', JSON.stringify({'questions/urgent': {notes: 'from an untitled export'}})); });
+      await page.reload(); await ready();
+      await expect(card.locator('textarea')).toHaveValue('from an untitled export');
+      await page.evaluate(() => localStorage.clear());
       await card.locator('a.bid').click(); await ready();
       assert.equal(page.url(), `${origin}/dynamic/index.html#b-questions/urgent`);
     });
