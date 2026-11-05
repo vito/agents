@@ -6,15 +6,18 @@ const http = require('node:http');
 const {chromium, expect} = require('@playwright/test');
 const read = (dir, file) => fs.readFile(`/fixtures/${dir}/${file}`, 'utf8');
 const gistID = 'abcdef0123456789abcdef0123456789';
-const gistURL = 'https://gistpreview.github.io/?' + gistID;
+const viewerOrigin = 'https://vito.github.io';
+const viewerPath = '/agents/context/v1/';
+const gistURL = viewerOrigin + viewerPath + '?gist=' + gistID;
 const apiURL = 'https://api.github.com/gists/' + gistID;
 const rawURL = 'https://gist.githubusercontent.com/example/' + gistID + '/raw/context.json';
 
 test('JSON-backed Context exports', {timeout: 180000}, async t => {
   const server = http.createServer(async (req, res) => {
-    const match = /^\/(dynamic|offline|large|selected)\/(index\.html|questions\.html|context\.json)$/.exec(req.url);
+    const match = /^\/(dynamic|offline|large|selected)\/([a-z-]+\.(?:html|json|js|css))$/.exec(req.url);
     if (!match) { res.writeHead(404); res.end('not found'); return; }
-    try { res.setHeader('Content-Type', match[2].endsWith('.json') ? 'application/json' : 'text/html'); res.end(await read(match[1], match[2])); }
+    const mime = {json: 'application/json', html: 'text/html', js: 'text/javascript', css: 'text/css'};
+    try { res.setHeader('Content-Type', mime[match[2].split('.').pop()]); res.end(await read(match[1], match[2])); }
     catch (_) { res.writeHead(404); res.end('not found'); }
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -33,9 +36,15 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
   const ids = selector => page.locator(selector).evaluateAll(es => es.map(e => e.id));
   const doc = JSON.parse(await read('dynamic', 'context.json'));
   const urgent = doc.blocks.find(b => b.id === 'questions/urgent');
-  const title = /data-title="([^"]*)"/.exec(await read('dynamic', 'questions.html'))[1];
+  const title = /<title>(.*?)<\/title>/.exec(await read('dynamic', 'questions.html'))[1];
   assert.ok(title.includes('&lt;'));
   try {
+    await t.test('portable and hosted views ship identical shared assets', async () => {
+      for (const asset of ['context.css', 'render.js', 'interactions.js', 'boot.js']) {
+        assert.equal(await read('dynamic', asset), await read('viewer', asset));
+        assert.equal(await read('dynamic', asset), await read('large', asset));
+      }
+    });
     await t.test('HTTP rendering matches offline cards, links and curated sections', async () => {
       for (const file of ['index.html', 'questions.html']) {
         await page.goto(`${origin}/offline/${file}`); await ready();
@@ -88,26 +97,49 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       await card.locator('a.bid').click(); await ready();
       assert.equal(page.url(), `${origin}/dynamic/index.html#b-questions/urgent`);
     });
+    // Serve the actual built Pages files, independently of anything in the gist.
+    await page.route(viewerOrigin + viewerPath + '**', async route => {
+      const file = new URL(route.request().url()).pathname.slice(viewerPath.length) || 'index.html';
+      const mime = {html: 'text/html', js: 'text/javascript', css: 'text/css'};
+      await route.fulfill({contentType: mime[file.split('.').pop()], body: await read('viewer', file)});
+    });
     async function gist(file) {
-      await page.route('https://gistpreview.github.io/**', async route => {
-        const question = route.request().url().includes('/questions.html');
-        await route.fulfill({contentType: 'text/html', body: await read('dynamic', question ? 'questions.html' : 'index.html')});
-      });
-      await page.route(apiURL, route => route.fulfill({json: {files: {'context.json': file}}}));
+      await page.route(apiURL, route => route.fulfill({json: {files: {'context.json': file,
+        'index.html': {content: '<script>window.pwned=1</script>'},
+        'context.js': {content: 'window.pwned=1'}
+      }}}));
     }
-    await t.test('gist inline JSON, correct cross-page URLs and same storage identity', async () => {
+    await t.test('landing page accepts gist IDs and URLs without fetching arbitrary hosts', async () => {
+      await gist({content: JSON.stringify(doc)});
+      for (const input of [gistID, 'https://gist.github.com/example/' + gistID]) {
+        await page.goto(viewerOrigin + viewerPath);
+        await page.getByLabel('Gist ID or URL').fill(input);
+        await page.getByRole('button', {name: 'Open Context'}).click();
+        await ready();
+        assert.equal(page.url(), gistURL);
+      }
+      await page.goto(viewerOrigin + viewerPath);
+      await page.getByLabel('Gist ID or URL').fill('https://attacker.example/' + gistID);
+      await page.getByRole('button', {name: 'Open Context'}).click();
+      await expect(page.locator('#gist-error')).toBeVisible();
+      assert.equal(page.url(), viewerOrigin + viewerPath);
+      await page.goto(viewerOrigin + viewerPath + '?gist=invalid');
+      await expect(page.getByRole('alert')).toContainText('gist');
+    });
+    await t.test('hosted inline JSON, correct cross-view URLs and answer persistence', async () => {
       await gist({truncated: false, content: JSON.stringify(doc), raw_url: rawURL});
-      await page.goto(gistURL + '/questions.html'); await ready();
-      const bodyTitle = await page.locator('body').getAttribute('data-title');
-      const key = `context-answers:${gistID}:${bodyTitle}`;
-      await page.evaluate(({key, urgent}) => localStorage.setItem(key, JSON.stringify({'questions/urgent': {choice: 'B', text: urgent.options[1].text, notes: 'old page answer'}})), {key, urgent});
+      await page.goto(gistURL + '&view=questions'); await ready();
+      assert.equal(await page.evaluate(() => window.pwned), undefined);
+      await expect(page.locator('section.q')).toHaveCount(6);
+      await page.locator('[id="q-questions/urgent"] input[value="B"]').check();
+      await page.locator('[id="q-questions/urgent"] textarea').fill('old page answer');
       await page.reload(); await ready();
       await expect(page.locator('[id="q-questions/urgent"] input[value="B"]')).toBeChecked();
       await expect(page.locator('[id="q-questions/urgent"] textarea')).toHaveValue('old page answer');
       await page.locator('[id="q-questions/urgent"] a.bid').click(); await ready();
-      assert.equal(page.url(), gistURL + '/index.html#b-questions/urgent');
+      assert.equal(page.url(), gistURL + '#b-questions/urgent');
       await page.locator('nav a').filter({hasText: 'Answer questions'}).click(); await ready();
-      assert.equal(page.url(), gistURL + '/questions.html');
+      assert.equal(page.url(), gistURL + '&view=questions');
       await expect(page.locator('[id="q-questions/urgent"] input[value="B"]')).toBeChecked();
       const changed = structuredClone(doc);
       changed.blocks.find(b => b.id === urgent.id).options[1].text = 'Different answer';
@@ -116,6 +148,26 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
       await expect(page.locator('[id="q-questions/urgent"] input[value="B"]')).not.toBeChecked();
       await page.locator('#gen').click();
       assert.ok((await page.locator('#prompt').inputValue()).includes('no option picked. Notes: old page answer'));
+    });
+    await t.test('hosted metadata, legacy defaults, deep links and gist isolation', async () => {
+      await gist({content: JSON.stringify(doc)});
+      await page.goto(gistURL + '#b-notes/dropped'); await ready();
+      await expect(page.locator('#dropped + .sub + details')).toHaveAttribute('open');
+      await expect(page.locator('[id="b-notes/dropped"]')).toBeVisible();
+      assert.equal(await page.title(), doc.viewer.title);
+      await expect(page.locator('#glance + .blk')).toContainText('decisions/x');
+      await expect(page.locator('#glance + .blk + .blk')).toContainText('questions/urgent');
+      const otherID = '123456789abcdef0123456789abcdef0';
+      await page.route('https://api.github.com/gists/' + otherID, route => route.fulfill({json: {files: {'context.json': {content: JSON.stringify(doc)}}}}));
+      await page.goto(viewerOrigin + viewerPath + '?gist=' + otherID + '&view=questions'); await ready();
+      await expect(page.locator('[id="q-questions/urgent"] textarea')).toHaveValue('');
+      await expect(page.locator('[id="q-questions/urgent"] input[value="B"]')).not.toBeChecked();
+      const legacy = structuredClone(doc); delete legacy.viewer;
+      await gist({content: JSON.stringify(legacy)});
+      await page.goto(gistURL + '&view=questions'); await ready();
+      await expect(page.locator('section.q')).toHaveCount(7); // old exports lack ownership metadata
+      await expect(page.locator('[id="q-questions/foreign"]')).toBeVisible();
+      assert.ok((await page.title()).startsWith('Context'));
     });
     await t.test('truncated or missing inline content uses complete raw JSON', async () => {
       const large = await read('large', 'context.json');
@@ -140,11 +192,19 @@ test('JSON-backed Context exports', {timeout: 180000}, async t => {
         [{files: {'context.json': {content:JSON.stringify({version:2, blocks:[]})}}}, 'unsupported version'],
         [{files: {'context.json': {content:JSON.stringify(bad)}}}, 'Invalid Context schema'],
       ];
+      const invalidViewers = [
+        {...doc.viewer, version: 2}, {...doc.viewer, title: {}},
+        {...doc.viewer, ownQuestions: ['facts/current']},
+        {...doc.viewer, lead: ['missing/id']},
+        {...doc.viewer, repo: 'javascript:alert(1)'},
+      ];
+      for (const viewer of invalidViewers) {
+        cases.push([{files: {'context.json': {content: JSON.stringify({...doc, viewer})}}}, 'viewer']);
+      }
       for (const [json, message] of cases) {
         await page.route(apiURL, route => route.fulfill({json}));
-        await page.goto(gistURL + '/questions.html');
+        await page.goto(gistURL + '&view=questions');
         await expect(page.getByRole('alert')).toContainText(message);
-        await expect(page.getByRole('alert')).toContainText('offlineHtml: true');
         assert.equal(await page.locator('.blk, input[type=radio]').count(), 0);
       }
       await page.route(apiURL, route => route.fulfill({status:403, json:{message:'rate limit'}}));

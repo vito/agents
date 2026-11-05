@@ -6,7 +6,7 @@ let contextAssets: Directory! = directory
   .withFile("interactions.js", currentModule.source.file("interactions.js"))
   .withFile("boot.js", currentModule.source.file("boot.js"))
 
-let contextShell(questions: Boolean!, title: String!, repo: String!, lead: [String!]!, ownQuestions: [String!]!): String! {
+let contextShell(questions: Boolean!, title: String!): String! {
   let pageTitle = title + (if (questions) { " — open questions" } else { "" })
   let view = if (questions) { "questions" } else { "context" }
   `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escHtml(pageTitle)}</title><link rel="stylesheet" href="context.css"><script src="render.js" defer></script><script src="interactions.js" defer></script><script src="boot.js" defer></script></head><body data-view="${view}"><main><p role="status">Loading context.json…</p><noscript>JavaScript is required. Use exportContext with offlineHtml: true for self-contained HTML.</noscript></main></body></html>` + "\n"

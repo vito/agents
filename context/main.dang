@@ -78,9 +78,9 @@ enum ImportConflict {
 
 """
 What exportContext writes: MARKDOWN, one front-matter file per Block (what
-a repo commits); JSON, context.json, lossless; HTML, index.html, the
-Context as one self-contained page, and questions.html, the open questions
-to answer.
+a repo commits); JSON, context.json, lossless and ready for the hosted
+viewer; HTML, index.html and questions.html with shared assets and JSON,
+self-contained only with offlineHtml.
 """
 enum ExportFormat {
   MARKDOWN
@@ -974,8 +974,10 @@ type Context {
         out = out.withNewFile(prefix + "index.html", contextHtml(copy + foreign, viewer.title, viewer.repo, viewer.lead))
         out = out.withNewFile(prefix + "questions.html", questionsHtml(copy + foreign, copy, viewer.title, viewer.repo))
       } else {
-        out = out.withNewFile(prefix + "index.html", contextShell(false, viewer.title, viewer.repo, viewer.lead, viewer.ownQuestions))
-        out = out.withNewFile(prefix + "questions.html", contextShell(true, viewer.title, viewer.repo, viewer.lead, viewer.ownQuestions))
+        out = out.withDirectory(into, contextAssets)
+        written += ["context.css", "render.js", "interactions.js", "boot.js"]
+        out = out.withNewFile(prefix + "index.html", contextShell(false, viewer.title))
+        out = out.withNewFile(prefix + "questions.html", contextShell(true, viewer.title))
       }
       written += ["index.html", "questions.html"]
     }

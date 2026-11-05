@@ -50,7 +50,7 @@
 #   `gh gist create` takes files, and `gh gist edit` changes one file per
 #   call and never deletes, so syncing a directory through gh is a loop the
 #   agent would rebuild every time. Used to publish an exported Context
-#   (context module) for gistpreview.github.io to render.
+#   (context module) for the hosted Context viewer to render.
 #
 # - `mount` attaches ANOTHER repository's checkout to the workspace under
 #   mnt/<name> (Workspace.withMountedDirectory): the agent's file tools
@@ -800,8 +800,8 @@ type Contributor {
   directory deleted from the gist. One API call either way.
 
   Gists are flat: the directory must hold only files, no subdirectories,
-  and none of them empty. When it has an index.html, the result also names
-  its gistpreview.github.io URL, which renders that page. Secret by
+  and none of them empty. When it has context.json, the result names the
+  hosted Context viewer URL; otherwise index.html gets a gistpreview URL. Secret by
   default: a secret gist is unlisted, not private — anyone with the link
   can read it.
   """
@@ -909,7 +909,9 @@ type Contributor {
     }
     let gone = if (out.deleted.isEmpty) { "" } else { "; deleted " + out.deleted.join(", ") }
     let lines = [`${verb} with ${toString(entries.length)} file(s) from ${path}${gone}.`, `Gist id: ${out.id}`]
-    let preview = if (entries.contains("index.html")) {
+    let preview = if (entries.contains("context.json")) {
+      [`Context viewer: https://vito.github.io/agents/context/v1/?gist=${out.id}`]
+    } else if (entries.contains("index.html")) {
       [`Rendered page: https://gistpreview.github.io/?${out.id}`]
     } else {
       [] :: [String!]!
@@ -1828,8 +1830,11 @@ type Contributor {
     `gist` it creates one (secret unless `public`), and with a gist id or
     URL it updates that gist in place to hold exactly the directory's
     files, deleting the ones no longer there, so its links stay stable.
-    When the directory has an index.html, it also reports the
-    gistpreview.github.io URL that renders it. Pending files are
+    When the directory has context.json, it reports the hosted Context
+    viewer URL (no HTML assets needed); otherwise index.html gets a
+    gistpreview.github.io URL. For a lean Context gist, export JSON into
+    a fresh directory before syncing: syncing deletes old assets only when
+    they are absent from that directory. Pending files are
     published as they are; nothing needs committing.
 
     `checkout` replaces this conversation's workspace with a fresh checkout

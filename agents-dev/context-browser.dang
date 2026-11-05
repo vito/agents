@@ -19,7 +19,7 @@ let testContextDynamicHtml(source: Workspace!): String! {
   let lead = ["decisions/x", "questions/urgent"]
   let dynamic = prior.withChanges(own.exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead))
   let offline = prior.withChanges(own.exportContext(source: prior.asWorkspace, path: ".", formats: [ContextExportFormat.HTML], title: title, repo: "vito/agents", lead: lead, offlineHtml: true))
-  assert { dynamic.entries == ["context.json", "index.html", "questions.html"] }
+  assert { dynamic.entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
   assert { dynamic.file("context.json").contents == offline.file("context.json").contents }
   assert { jsonOf(importDir(context, dynamic)).contents == jsonOf(importDir(context, offline)).contents }
   let large = "large-payload!"
@@ -39,7 +39,8 @@ let testContextDynamicHtml(source: Workspace!): String! {
   assert { enlarged.file("context.json").size > 921600 }
   ["index.html", "questions.html"].each { page =>
     assert { dynamic.file(page).contents == enlarged.file(page).contents }
-    assert { enlarged.file(page).size < 60000 }
+    assert { enlarged.file(page).size < 4000 }
+    assert { !enlarged.file(page).contents.contains("async function renderContext") }
     assert { !enlarged.file(page).contents.contains("small payload") }
   }
   let selected = directory.withChanges(own.exportContext(source: scratch, path: "out", formats: [ContextExportFormat.HTML], ids: ["questions/urgent"], title: title)).directory("out")
@@ -50,6 +51,8 @@ let testContextDynamicHtml(source: Workspace!): String! {
     .withWorkdir("/tests")
     .withExec(["npm", "install", "--no-audit", "--no-fund", "--save-exact", "@playwright/test@1.58.2"])
     .withDirectory("/fixtures", files)
+    .withDirectory("/source/context", source.directory("context"))
+    .withExec(["node", "/source/context/build-viewer.cjs", "/fixtures/viewer"])
     .withFile("/tests/context.cjs", currentModule.source.file("context-browser.cjs"))
     .withExec(["node", "--test", "/tests/context.cjs"]).sync
   "JSON-backed Context browser and export checks passed."

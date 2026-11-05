@@ -211,7 +211,8 @@ let testContextExportRefresh(source: Workspace!): String! {
   let answered = question.blockWrite("decisions/ship", ContextBlockKind.DECISION, "Ship now.", supersedes: ["questions/ship"])
   let updated = bundle.withChanges(answered.exportContext(source: bundle.asWorkspace, path: ".",
     formats: [ContextExportFormat.HTML], ids: ["decisions/ship"]))
-  assert { updated.file("questions.html").contents.contains("No open questions.") }
+  let updatedDoc: {{viewer: {{ownQuestions: [String!]!}}!}}! = JSON.decode(updated.file("context.json").contents)
+  assert { updatedDoc.viewer.ownQuestions.isEmpty }
   let imported = importDir(context, updated)
   assert { imported.compose.contains("Ship now.") and !imported.compose.contains("Ready to ship?") }
   assert { readBlock(imported, "questions/ship").contains("superseded by decisions/ship") }
@@ -349,7 +350,7 @@ let testContextExportRoundTrip(source: Workspace!): String! {
   assert { gist.entries.all { e => !e.hasSuffix("/") } }
   assert { sameContext(importDir(context, gist), fixture) }
   let bundle = exportedDir(fixture, [ContextExportFormat.JSON, ContextExportFormat.HTML])
-  assert { bundle.entries == ["context.json", "index.html", "questions.html"] }
+  assert { bundle.entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
   assert { sameContext(importDir(context, bundle), fixture) }
   "Context export/import round-trip checks passed."
 }
@@ -792,7 +793,7 @@ let testContextQuestions(source: Workspace!): String! {
 
   # questions.html: open questions by priority, written beside index.html
   # (flat too), self-contained and deterministic.
-  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["context.json", "index.html", "questions.html"] }
+  assert { exportedDir(answered, [ContextExportFormat.HTML], flat: true).entries == ["boot.js", "context.css", "context.json", "index.html", "interactions.js", "questions.html", "render.js"] }
   let page = questionsOf(answered, repo: "vito/agents")
   assert { page.hasPrefix("<!doctype html>") and !page.contains("<link") and !page.contains(" src=") }
   assert { questionsOf(answered, repo: "vito/agents") == page }
