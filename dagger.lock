@@ -17,6 +17,7 @@
 ["","git-sha",["github.com/vito/editor","refs/tags/v0.0.5"],"9ced619d9f65ec73dbae0a8215bc1bf8fc4573d0"]
 ["","oci-latest",["cgr.dev/chainguard/apko"],"latest"]
 ["","oci-sha",["cgr.dev/chainguard/apko:latest"],"sha256:019a65fbb6e962ef351633c27ef4c8dc0a9c308fa27154a97a3d476c2fb69f2a"]
+["","oci-sha",["docker.io/library/alpine:3.21"],"sha256:ee16d92f96db08d9d2d07da48555a27f3a69d8f0759021dbc601195ed0d2b5bd"]
 ["","oci-sha",["docker.io/library/alpine:3.22"],"sha256:2e0b81d60597f449baa56dc25d355367869d2dca4cd57e866f1e2b52af3eb55f"]
 ["","oci-sha",["docker.io/library/golang:1.26-alpine"],"sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308"]
 ["","oci-sha",["docker.io/library/node:22-bookworm-slim"],"sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da"]
