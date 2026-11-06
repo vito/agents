@@ -18,6 +18,9 @@ source = "staff"
 [modules.contributor]
 source = "contributor"
 
+[modules.discord]
+source = "discord"
+
 [sdks.dang]
 module = "dang"
 

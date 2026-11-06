@@ -17,6 +17,10 @@ engineVersion = "v1.0.0-0"
   source = "../contributor"
 
 [[dependencies]]
+  name = "discord"
+  source = "../discord"
+
+[[dependencies]]
   name = "sandbox"
   source = "../sandbox"
 
