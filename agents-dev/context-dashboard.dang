@@ -1,6 +1,6 @@
 # The dashboard service against a fake GitHub API: two listing pages with
-# ETags, raw context.json files (valid, legacy, malformed, not a Context), a
-# raw URL off GitHub, and a gist without context.json.
+# ETags, raw context.json files (valid, legacy, malformed, not a Context, one
+# failing once), a raw URL off GitHub, and a gist without context.json.
 let testContextDashboard: String! {
   let node = container.from("node:22-alpine")
   let nonce = Random.string
@@ -10,7 +10,8 @@ let testContextDashboard: String! {
     .asService(args: ["node", "/github.cjs"])
     .withHostname("mockgh")
     .start
-  let dash = contextDashboard(token: setSecret("context-dashboard-token", "test-token"), api: "http://mockgh:8080").serve
+  let dash = contextDashboard(token: setSecret("context-dashboard-token", "test-token"), api: "http://mockgh:8080")
+    .serve(key: setSecret("context-dashboard-key", "test-key"))
   node.withFile("/probe.cjs", currentModule.source.file("context-dashboard/probe.cjs"))
     .withServiceBinding("dash", dash)
     .withEnvVariable("NONCE", nonce)

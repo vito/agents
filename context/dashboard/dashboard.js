@@ -84,6 +84,14 @@
     try {
       const res = await fetch('/api/contexts' + (force ? '?refresh=1' : ''), {cache: 'no-store'});
       const data = await res.json();
+      if (data.locked) {
+        error.hidden = false;
+        error.textContent = data.error;
+        status.textContent = 'Locked';
+        all = [];
+        cards.replaceChildren();
+        return;
+      }
       all = Array.isArray(data.cards) ? data.cards : [];
       error.hidden = !data.error;
       error.textContent = data.error ? 'GitHub: ' + data.error + (all.length ? ' — showing the last cards listed.' : '') : '';

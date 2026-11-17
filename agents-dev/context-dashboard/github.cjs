@@ -25,7 +25,9 @@ const docs = {
     {id: 'decisions/two', kind: 'decision', text: '# Heading\n\n- Legacy decision with a very long text ' + 'word '.repeat(80)},
   ], viewer: {version: 1, title: 'Context', repo: 'javascript:alert(1)', lead: [], ownQuestions: []}},
   [hex('f')]: {not: 'a context'},
+  [hex('1')]: {blocks: [{id: 'facts/flaky', kind: 'fact', text: 'Served on the second try.'}]},
 };
+let flaky = 0;
 const gist = (id, files, extra) => ({id, html_url: 'https://gist.github.com/vito/' + id, public: false, description: '', updated_at: '2026-11-01T00:00:00Z', files, ...extra});
 const ctx = (id, rev, raw) => ({'context.json': {filename: 'context.json', size: 10, raw_url: raw || `${base}/raw/${id}/${rev}/context.json`}});
 const pages = {
@@ -38,6 +40,7 @@ const pages = {
   2: [
     gist(hex('e'), ctx(hex('e'), 'r1', 'https://attacker.example/context.json'), {description: 'Evil raw URL'}),
     gist(hex('f'), ctx(hex('f'), 'r1'), {description: 'Not a Context export'}),
+    gist(hex('1'), ctx(hex('1'), 'r1'), {description: 'Flaky', updated_at: '2026-08-01T00:00:00Z'}),
   ],
 };
 http.createServer((req, res) => {
@@ -59,6 +62,7 @@ http.createServer((req, res) => {
   const raw = /^\/raw\/([0-9a-f]+)\/r1\/context\.json$/.exec(url.pathname);
   if (raw) {
     if (raw[1] === hex('c')) { res.end('{"blocks": ['); return; }
+    if (raw[1] === hex('1') && flaky++ === 0) { res.writeHead(503); res.end('try again'); return; }
     res.end(JSON.stringify(docs[raw[1]]));
     return;
   }

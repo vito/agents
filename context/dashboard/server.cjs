@@ -6,6 +6,7 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const token = process.env.GITHUB_TOKEN || '';
 const api = new URL((process.env.GITHUB_API || 'https://api.github.com').replace(/\/+$/, '') + '/');
@@ -14,6 +15,11 @@ const port = Number(process.env.PORT || 8080);
 // Only these Host headers are served, so a page elsewhere cannot rebind its
 // own domain to this port and read the cards.
 const hosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+// `dagger up` forwards the port on every interface, and anyone reaching it
+// picks their own Host header: the cards also need this key, exchanged once
+// (/?key=...) for an HttpOnly cookie.
+const key = process.env.DASHBOARD_KEY || crypto.randomBytes(18).toString('base64url');
+const cookieName = 'context-dashboard';
 const stale = 60 * 1000; // a page load reuses a listing this fresh
 const maxBytes = 20 * 1024 * 1024; // a context.json bigger than this is skipped
 const kinds = ['glossary', 'fact', 'decision', 'design', 'result', 'question', 'note'];
@@ -57,14 +63,23 @@ function rawURL(value) {
   return githubRaw || url.origin === api.origin ? url : null;
 }
 
+// A failure the next refresh should retry, unlike one the revision itself
+// causes (bad JSON, not a Context), which is cached with it.
+const transient = message => Object.assign(new Error(message), {transient: true});
+
 async function fetchRaw(url) {
   const headers = {'user-agent': 'context-dashboard'};
   // Secret gists' raw files are readable without auth; only a self-hosted
   // API's own origin gets the token.
   if (url.origin === api.origin) headers.authorization = 'Bearer ' + token;
-  const res = await fetch(url, {headers, redirect: 'error', signal: AbortSignal.timeout(30000)});
-  if (!res.ok) throw new Error(`HTTP ${res.status} fetching context.json`);
-  const body = await res.text();
+  let body;
+  try {
+    const res = await fetch(url, {headers, redirect: 'error', signal: AbortSignal.timeout(30000)});
+    if (!res.ok) throw transient(`HTTP ${res.status} fetching context.json`);
+    body = await res.text();
+  } catch (error) {
+    throw error.transient ? error : transient('cannot fetch context.json: ' + error.message);
+  }
   if (Buffer.byteLength(body) > maxBytes) throw new Error('context.json is too large to summarize');
   try { return JSON.parse(body); } catch (_) { throw new Error('context.json is not valid JSON'); }
 }
@@ -192,6 +207,7 @@ async function refresh() {
       .filter(g => object(g) && typeof g.id === 'string' && /^[0-9a-f]+$/i.test(g.id) && object(g.files) && object(g.files['context.json']))
       .map(g => ({gist: g, file: g.files['context.json']}));
     const live = new Set();
+    const failed = new Map(); // raw URL -> {error}, retried next refresh
     await pool(found, 6, async ({file}) => {
       const url = rawURL(file.raw_url);
       if (!url) return;
@@ -199,13 +215,13 @@ async function refresh() {
       if (digests.has(url.href)) return;
       if (Number.isSafeInteger(file.size) && file.size > maxBytes) { digests.set(url.href, {error: 'context.json is too large to summarize'}); return; }
       try { digests.set(url.href, digest(await fetchRaw(url))); }
-      catch (error) { digests.set(url.href, {error: error.message}); }
+      catch (error) { (error.transient ? failed : digests).set(url.href, {error: error.message}); }
     });
     for (const key of digests.keys()) if (!live.has(key)) digests.delete(key);
     const cards = found.map(({gist, file}) => {
       const url = rawURL(file.raw_url);
       if (!url) return card(gist, null, 'context.json has an unexpected raw URL');
-      const d = digests.get(url.href);
+      const d = digests.get(url.href) || failed.get(url.href);
       return d.error ? card(gist, null, d.error) : card(gist, d, '');
     });
     cards.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -230,6 +246,21 @@ const files = {
   '/context.css': ['context.css', 'text/css; charset=utf-8'],
 };
 
+function keyed(value) {
+  const given = Buffer.from(String(value)), expected = Buffer.from(key);
+  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
+}
+
+function cookieKey(req) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const [name, ...value] = part.trim().split('=');
+    if (name === cookieName) {
+      try { return decodeURIComponent(value.join('=')); } catch (_) { return ''; }
+    }
+  }
+  return '';
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'no-referrer');
@@ -238,7 +269,19 @@ const server = http.createServer(async (req, res) => {
   if (!hosts.has(host)) { res.writeHead(421, {'content-type': 'text/plain'}); res.end('Open the dashboard at http://localhost:' + port + '/\n'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, {allow: 'GET, HEAD'}); res.end(); return; }
   const url = new URL(req.url, 'http://localhost');
+  if (url.searchParams.has('key')) {
+    if (!keyed(url.searchParams.get('key'))) { res.writeHead(403, {'content-type': 'text/plain'}); res.end('Wrong key: open the link the dashboard printed when it started.\n'); return; }
+    // Trade the key for a cookie, and take it out of the address bar.
+    res.writeHead(303, {location: '/', 'set-cookie': `${cookieName}=${encodeURIComponent(key)}; HttpOnly; SameSite=Strict; Path=/`});
+    res.end();
+    return;
+  }
   if (url.pathname === '/api/contexts') {
+    if (!keyed(cookieKey(req))) {
+      res.writeHead(401, {'content-type': 'application/json', 'cache-control': 'no-store'});
+      res.end(JSON.stringify({locked: true, error: 'Open the link the dashboard printed when it started (http://localhost:' + port + '/?key=…) to unlock it.', cards: []}));
+      return;
+    }
     await contexts(url.searchParams.has('refresh'));
     res.writeHead(state.error && !state.cards.length ? 502 : 200, {'content-type': 'application/json', 'cache-control': 'no-store'});
     res.end(JSON.stringify({login: state.login, fetchedAt: new Date(state.fetchedAt).toISOString(), error: state.error, cards: state.cards}));
@@ -251,4 +294,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (!token) console.warn('GITHUB_TOKEN is empty: GitHub will refuse to list your gists.');
-server.listen(port, '0.0.0.0', () => console.log(`Context dashboard on http://localhost:${port}/`));
+server.listen(port, '0.0.0.0', () => {
+  const shown = process.env.DASHBOARD_KEY ? '<your key>' : encodeURIComponent(key);
+  console.log(`Context dashboard: open http://localhost:${port}/?key=${shown} (with the port you forwarded)`);
+});
