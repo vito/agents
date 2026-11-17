@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Contexts</title>
+  <link rel="stylesheet" href="context.css">
+  <link rel="stylesheet" href="dashboard.css">
+  <script src="dashboard.js" defer></script>
+</head>
+<body>
+  <main>
+    <header class="dash">
+      <div>
+        <h1>Contexts</h1>
+        <p class="sub" id="status" role="status">Listing your gists…</p>
+      </div>
+      <div class="tools">
+        <input id="filter" type="search" placeholder="Filter by title, repo or text" aria-label="Filter Contexts" autocomplete="off">
+        <button id="refresh" type="button">Refresh</button>
+      </div>
+    </header>
+    <p id="error" role="alert" hidden></p>
+    <div id="cards" class="cards"></div>
+    <noscript>This dashboard requires JavaScript.</noscript>
+  </main>
+</body>
+</html>

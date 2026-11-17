@@ -151,6 +151,12 @@ type AgentsDev {
     null
   }
 
+  """Check the Context dashboard against a fake GitHub: localhost-only serving, paged listing with ETags, one fetch per context.json revision, and cards for valid, legacy and broken exports."""
+  contextDashboard: Void @check {
+    print(testContextDashboard)
+    null
+  }
+
   """Check mounts stay out of the GitHub toolbox snapshot."""
   contributorMountsOutsideToolbox: Void @check {
     print(checkContributorMountsOutsideToolbox)

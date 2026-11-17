@@ -1,0 +1,20 @@
+# The dashboard service against a fake GitHub API: two listing pages with
+# ETags, raw context.json files (valid, legacy, malformed, not a Context), a
+# raw URL off GitHub, and a gist without context.json.
+let testContextDashboard: String! {
+  let node = container.from("node:22-alpine")
+  let nonce = Random.string
+  node.withFile("/github.cjs", currentModule.source.file("context-dashboard/github.cjs"))
+    .withEnvVariable("NONCE", nonce)
+    .withExposedPort(8080)
+    .asService(args: ["node", "/github.cjs"])
+    .withHostname("mockgh")
+    .start
+  let dash = contextDashboard(token: setSecret("context-dashboard-token", "test-token"), api: "http://mockgh:8080").serve
+  node.withFile("/probe.cjs", currentModule.source.file("context-dashboard/probe.cjs"))
+    .withServiceBinding("dash", dash)
+    .withEnvVariable("NONCE", nonce)
+    .withExec(["node", "--test", "/probe.cjs"])
+    .sync
+  "Context dashboard checks passed."
+}

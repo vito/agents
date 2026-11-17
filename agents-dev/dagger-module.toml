@@ -13,6 +13,10 @@ engineVersion = "v1.0.0-0"
   source = "../context"
 
 [[dependencies]]
+  name = "context-dashboard"
+  source = "../context/dashboard"
+
+[[dependencies]]
   name = "contributor"
   source = "../contributor"
 

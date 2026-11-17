@@ -1,0 +1,60 @@
+# context-dashboard: the Contexts you published as gists, as cards on one
+# page — for a single user, on their own machine.
+#
+# The hosted viewer reads one gist whose id you already know. This lists
+# every gist of yours with a context.json — secret ones included, which only
+# your token can list — and shows each as a card: its title, the Blocks it
+# leads with, and its open questions, linking to the hosted viewer.
+#
+# The token stays in the server (server.cjs); the page only receives the
+# distilled cards. Run it with the token gh already holds:
+#
+#   dagger -m ./context/dashboard call --token=cmd://"gh auth token" \
+#     serve up --ports=8080:8080
+#
+# then open http://localhost:8080/. Listing costs one API request per 100
+# gists, and 304s on the next refresh; each context.json is fetched once per
+# revision from its raw URL.
+
+"""
+A single-user dashboard of the Contexts you published as GitHub gists.
+"""
+type ContextDashboard {
+  let token: Secret!
+  let api: String!
+
+  new(
+    """
+    A GitHub token that can list your gists, e.g. cmd://"gh auth token".
+    Only the server uses it; the page never sees it.
+    """
+    token: Secret!,
+    """
+    The GitHub API to list gists from.
+    """
+    api: String! = "https://api.github.com",
+  ) {
+    self.token = token
+    self.api = api
+    self
+  }
+
+  """
+  The dashboard on port 8080. Open it at http://localhost:8080/: other host
+  names are refused, so no other site can read it through DNS rebinding.
+  """
+  serve(
+    """
+    The Context viewer's stylesheet, shared so cards look like the viewer.
+    """
+    stylesheet: File! @defaultPath(path: "../context.css"),
+  ): Service! {
+    container.from("node:22-alpine")
+      .withDirectory("/app", currentModule.source, include: ["server.cjs", "index.html", "dashboard.js", "dashboard.css"])
+      .withFile("/app/context.css", stylesheet)
+      .withEnvVariable("GITHUB_API", api)
+      .withSecretVariable("GITHUB_TOKEN", token)
+      .withExposedPort(8080)
+      .asService(args: ["node", "/app/server.cjs"])
+  }
+}
