@@ -162,7 +162,8 @@
     } finally {
       loading = false;
       refresh.disabled = false;
-      if (locked) empty.hidden = true; else emptyNote(true);
+      // With nothing to show, the error says why; the note would guess.
+      if (locked || (!entries.size && !error.hidden)) empty.hidden = true; else emptyNote(true);
     }
   }
 

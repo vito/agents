@@ -154,4 +154,15 @@ test('Context dashboard', async t => {
     assert.deepEqual(raw, {[hex('a')]: 1, [hex('b')]: 1, [hex('c')]: 1, [hex('f')]: 1, [hex('1')]: 2}, 'each revision fetched once, the failed one twice');
     assert.deepEqual([...new Set(s.auth)], ['Bearer test-token']);
   });
+
+  await t.test('a failed listing still shows the last cards, with the error', async () => {
+    const last = (await stream('')).cards;
+    await request('mockgh', '/__down', {});
+    const failed = await stream('?refresh=1');
+    assert.equal(failed.done.error, 'GitHub /gists: HTTP 503: Service unavailable');
+    assert.deepEqual(failed.cards.slice().sort(newest), last);
+    const reloaded = await stream('');
+    assert.equal(reloaded.done.error, failed.done.error);
+    assert.deepEqual(reloaded.cards, last);
+  });
 });

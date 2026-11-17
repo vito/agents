@@ -30,7 +30,7 @@ const docs = {
     {id: 'questions/legacy', kind: 'question', text: 'A question from before viewer metadata.'},
   ]},
 };
-let flaky = 0;
+let flaky = 0, down = false;
 const gist = (id, files, extra) => ({id, html_url: 'https://gist.github.com/vito/' + id, public: false, description: '', updated_at: '2026-11-01T00:00:00Z', files, ...extra});
 const ctx = (id, rev, raw) => ({'context.json': {filename: 'context.json', size: 10, raw_url: raw || `${base}/raw/${id}/${rev}/context.json`}});
 const pages = {
@@ -50,9 +50,11 @@ http.createServer((req, res) => {
   const url = new URL(req.url, base);
   stats.requests[url.pathname + url.search] = (stats.requests[url.pathname + url.search] || 0) + 1;
   if (url.pathname === '/__stats') { res.end(JSON.stringify(stats)); return; }
+  if (url.pathname === '/__down') { down = true; res.end('{}'); return; }
   stats.auth.push(req.headers.authorization || '');
   if (url.pathname === '/user') { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({login: 'vito'})); return; }
   if (url.pathname === '/gists') {
+    if (down) { res.writeHead(503, {'content-type': 'application/json'}); res.end('{"message":"Service unavailable"}'); return; }
     const n = Number(url.searchParams.get('page') || 1);
     const etag = `"page-${n}"`;
     // The second page is slow, so the first page's cards stream ahead of it.

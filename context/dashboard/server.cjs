@@ -260,6 +260,8 @@ function refresh() {
       // why they may be out of date.
       const merged = new Map(state.cards.map(c => [c.id, c]));
       for (const c of r.cards) merged.set(c.id, c);
+      const streamed = new Set(r.cards.map(c => c.id));
+      for (const c of state.cards) if (!streamed.has(c.id)) emit({type: 'card', card: c});
       state = {login: r.login, cards: [...merged.values()].sort(newest), fetchedAt: Date.now(), error: error.message};
     }
     run = null;
