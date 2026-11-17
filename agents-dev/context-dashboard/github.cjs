@@ -25,7 +25,10 @@ const docs = {
     {id: 'decisions/two', kind: 'decision', text: '# Heading\n\n- Legacy decision with a very long text ' + 'word '.repeat(80)},
   ], viewer: {version: 1, title: 'Context', repo: 'javascript:alert(1)', lead: [], ownQuestions: []}},
   [hex('f')]: {not: 'a context'},
-  [hex('1')]: {blocks: [{id: 'facts/flaky', kind: 'fact', text: 'Served on the second try.'}]},
+  [hex('1')]: {blocks: [
+    {id: 'facts/flaky', kind: 'fact', text: 'Served on the second try.'},
+    {id: 'questions/legacy', kind: 'question', text: 'A question from before viewer metadata.'},
+  ]},
 };
 let flaky = 0;
 const gist = (id, files, extra) => ({id, html_url: 'https://gist.github.com/vito/' + id, public: false, description: '', updated_at: '2026-11-01T00:00:00Z', files, ...extra});

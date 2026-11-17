@@ -31,6 +31,16 @@ test('Context dashboard', async t => {
     assert.equal((await get('/server.cjs')).status, 404);
   });
 
+  await t.test('survives a request it cannot parse', async () => {
+    const reply = await new Promise((resolve, reject) => {
+      const socket = require('node:net').connect(8080, 'dash', () => socket.write('GET http://[ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'));
+      let data = '';
+      socket.on('data', c => data += c).on('end', () => resolve(data)).on('error', reject);
+    });
+    assert.match(reply, /^HTTP\/1\.1 400 /);
+    assert.equal((await get('/')).status, 200);
+  });
+
   await t.test('lists nothing until unlocked with the key', async () => {
     const locked = await get('/api/contexts');
     assert.equal(locked.status, 401);
@@ -65,8 +75,9 @@ test('Context dashboard', async t => {
     assert.equal(a.public, false);
     assert.deepEqual([a.active, a.total, a.counts.decision, a.counts.note], [5, 7, 1, 0], 'superseded and dropped blocks are not counted');
     assert.deepEqual(a.highlights, [{id: 'designs/server', kind: 'design', text: 'A Dagger service holds the token server-side; the page only sees cards.'}]);
-    assert.deepEqual([a.openQuestions, a.urgent], [2, 1]);
-    assert.deepEqual(a.questions.map(q => [q.number, q.priority, q.text]), [[1, 'P0', 'Ship it? <img src=x onerror=window.pwned=1>'], [2, 'P2', 'Add a check later?']]);
+    assert.equal(a.counts.question, 2);
+    assert.deepEqual([a.openQuestions, a.urgent], [1, 1], 'only the questions page\'s own questions are open');
+    assert.deepEqual(a.questions.map(q => [q.number, q.priority, q.text]), [[1, 'P0', 'Ship it? <img src=x onerror=window.pwned=1>']]);
     assert.equal(a.viewURL, 'https://vito.github.io/agents/context/v1/?gist=' + hex('a'));
     assert.equal(a.questionsURL, a.viewURL + '&view=questions');
     const b = byID[hex('b')];
@@ -90,6 +101,7 @@ test('Context dashboard', async t => {
     const flaky = forced.cards.find(c => c.id === hex('1'));
     assert.equal(flaky.error, '', 'a transient failure is retried');
     assert.deepEqual(flaky.highlights.map(h => h.text), ['Served on the second try.']);
+    assert.deepEqual(flaky.questions, [{id: 'questions/legacy', number: null, priority: null, text: 'A question from before viewer metadata.'}], 'without viewer metadata every question is open');
     assert.deepEqual(forced.cards.filter(c => c.id !== hex('1')), data.cards.filter(c => c.id !== hex('1')));
     const s = await stats();
     assert.equal(s.notModified, 2, 'both listing pages revalidated with their ETags');

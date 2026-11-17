@@ -126,7 +126,11 @@ function digest(doc) {
       if (highlights.length) break;
     }
   }
-  const questions = active.filter(b => b.kind === 'question')
+  // The questions page lists only the exporting session's own questions
+  // (every one, for exports from before viewer metadata), so the card counts
+  // what that page will show.
+  const own = Array.isArray(viewer.ownQuestions) ? new Set(viewer.ownQuestions) : null;
+  const questions = active.filter(b => b.kind === 'question' && (!own || own.has(b.id)))
     .map((b, i) => ({b, i, led: lead.includes(b) ? 0 : 1}))
     .sort((x, y) => rank(x.b) - rank(y.b) || x.led - y.led || x.i - y.i)
     .map(({b}) => b);
@@ -261,14 +265,25 @@ function cookieKey(req) {
   return '';
 }
 
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
+  handle(req, res).catch(error => {
+    // Whatever a request does, the server outlives it.
+    console.error('request failed:', error.message);
+    if (!res.headersSent) res.writeHead(500, {'content-type': 'text/plain'});
+    res.end();
+  });
+});
+
+async function handle(req, res) {
   res.setHeader('x-content-type-options', 'nosniff');
   res.setHeader('referrer-policy', 'no-referrer');
   res.setHeader('content-security-policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
   const host = (req.headers.host || '').toLowerCase().replace(/:\d+$/, '');
   if (!hosts.has(host)) { res.writeHead(421, {'content-type': 'text/plain'}); res.end('Open the dashboard at http://localhost:' + port + '/\n'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, {allow: 'GET, HEAD'}); res.end(); return; }
-  const url = new URL(req.url, 'http://localhost');
+  let url;
+  try { url = new URL(req.url, 'http://localhost'); }
+  catch (_) { res.writeHead(400, {'content-type': 'text/plain'}); res.end('bad request\n'); return; }
   if (url.searchParams.has('key')) {
     if (!keyed(url.searchParams.get('key'))) { res.writeHead(403, {'content-type': 'text/plain'}); res.end('Wrong key: open the link the dashboard printed when it started.\n'); return; }
     // Trade the key for a cookie, and take it out of the address bar.
@@ -291,7 +306,7 @@ const server = http.createServer(async (req, res) => {
   if (!file) { res.writeHead(404, {'content-type': 'text/plain'}); res.end('not found\n'); return; }
   res.writeHead(200, {'content-type': file[1], 'cache-control': 'no-cache'});
   res.end(fs.readFileSync(path.join(__dirname, file[0])));
-});
+}
 
 if (!token) console.warn('GITHUB_TOKEN is empty: GitHub will refuse to list your gists.');
 server.listen(port, '0.0.0.0', () => {

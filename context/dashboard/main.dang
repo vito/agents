@@ -54,7 +54,8 @@ type ContextDashboard {
     stylesheet: File! @defaultPath(path: "../context.css"),
     """
     A fixed key to open the dashboard with (http://localhost:8080/?key=...),
-    so a link survives restarts. Random on every start by default.
+    so a link survives restarts; percent-encode it in the link unless it is
+    URL-safe. Random on every start by default.
     """
     key: Secret = null,
   ): Service! {
