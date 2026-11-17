@@ -15,8 +15,10 @@
 # then open the http://localhost:8080/?key=... link it prints. `up` forwards
 # the port on every interface, so the cards also need that key (traded for a
 # cookie on first visit), fresh on every start unless you pass serve(key:).
-# Listing costs one API request per 100 gists, and 304s on the next refresh;
-# each context.json is fetched once per revision from its raw URL.
+# Cards stream in as each page of gists is listed and summarized, and take
+# their place newest first. Listing costs one API request per 100 gists, and
+# 304s on the next refresh; each context.json is fetched once per revision
+# from its raw URL.
 
 """
 A single-user dashboard of the Contexts you published as GitHub gists.

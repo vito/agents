@@ -15,6 +15,32 @@ let cookie = '';
 const get = (path, host = 'localhost:8080') => request('dash', path, cookie ? {host, cookie} : {host});
 const stats = async () => JSON.parse((await request('mockgh', '/__stats', {})).body);
 const hex = c => c.repeat(32);
+// /api/contexts as NDJSON messages, each stamped with when it arrived.
+const stream = query => new Promise((resolve, reject) => {
+  const start = Date.now(), messages = [];
+  http.get({host: 'dash', port: 8080, path: '/api/contexts' + query, headers: {host: 'localhost:8080', cookie}}, res => {
+    let buffer = '';
+    res.setEncoding('utf8');
+    res.on('data', chunk => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) if (line) messages.push({at: Date.now() - start, ...JSON.parse(line)});
+    });
+    res.on('end', () => {
+      try {
+        assert.equal(buffer, '');
+        assert.equal(res.headers['content-type'], 'application/x-ndjson; charset=utf-8');
+        const done = messages.filter(m => m.type === 'done');
+        assert.equal(done.length, 1);
+        assert.equal(messages.at(-1), done[0], 'done comes last');
+        resolve({status: res.statusCode, messages, done: done[0], cards: messages.filter(m => m.type === 'card').map(m => m.card)});
+      } catch (error) { reject(error); }
+    });
+  }).on('error', reject);
+});
+const newest = (a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id);
+const order = [hex('a'), hex('e'), hex('f'), hex('b'), hex('c'), hex('1')];
 
 test('Context dashboard', async t => {
   await t.test('serves only localhost, with a locked-down page', async () => {
@@ -60,14 +86,20 @@ test('Context dashboard', async t => {
   });
 
   let data;
-  await t.test('lists every page and summarizes each context.json', async () => {
-    const res = await get('/api/contexts');
-    assert.equal(res.status, 200);
-    data = JSON.parse(res.body);
-    assert.equal(data.login, 'vito');
-    assert.equal(data.error, '');
+  await t.test('streams each card as soon as it is summarized', async () => {
+    data = await stream('');
+    assert.equal(data.status, 200);
+    assert.equal(data.messages[0].type, 'login');
+    assert.equal(data.messages[0].login, 'vito');
+    assert.equal(data.done.error, '');
+    const arrival = data.messages.filter(m => m.type === 'card').map(m => [m.card.id, m.at]);
+    assert.deepEqual(arrival.slice(0, 3).map(([id]) => id).sort(), [hex('a'), hex('b'), hex('c')], 'the first page ahead of the second');
+    assert.ok(arrival[2][1] + 700 < data.done.at, `first page cards came before the slow second page: ${JSON.stringify(arrival)} done at ${data.done.at}`);
+    assert.deepEqual(data.cards.map(c => c.id).sort(), order.slice().sort(), 'gists without context.json left out');
+  });
+
+  await t.test('summarizes each context.json', async () => {
     const byID = Object.fromEntries(data.cards.map(c => [c.id, c]));
-    assert.deepEqual(data.cards.map(c => c.id), [hex('a'), hex('e'), hex('f'), hex('b'), hex('c'), hex('1')], 'newest first; gists without context.json left out');
     const a = byID[hex('a')];
     assert.equal(a.title, 'Dashboard <b>build</b>');
     assert.equal(a.description, 'Dashboard gist');
@@ -94,15 +126,25 @@ test('Context dashboard', async t => {
   });
 
   await t.test('refreshes with conditional requests, retrying only failed fetches', async () => {
-    const again = JSON.parse((await get('/api/contexts')).body);
-    assert.equal(again.fetchedAt, data.fetchedAt, 'a fresh listing is reused');
-    const forced = JSON.parse((await get('/api/contexts?refresh=1')).body);
-    assert.notEqual(forced.fetchedAt, data.fetchedAt);
+    const again = await stream('');
+    assert.equal(again.done.fetchedAt, data.done.fetchedAt, 'a fresh listing is reused');
+    assert.deepEqual(again.cards.map(c => c.id), order, 'replayed newest first');
+    assert.deepEqual(again.cards, data.cards.slice().sort(newest));
+    const forcing = stream('?refresh=1');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    // A page loading mid-refresh joins it rather than starting another.
+    const joined = await stream('');
+    const forced = await forcing;
+    assert.notEqual(forced.done.fetchedAt, data.done.fetchedAt);
+    assert.equal(joined.done.fetchedAt, forced.done.fetchedAt);
+    assert.deepEqual(joined.cards.slice().sort(newest), forced.cards.slice().sort(newest));
+    assert.equal(forced.cards.length, order.length);
     const flaky = forced.cards.find(c => c.id === hex('1'));
     assert.equal(flaky.error, '', 'a transient failure is retried');
     assert.deepEqual(flaky.highlights.map(h => h.text), ['Served on the second try.']);
     assert.deepEqual(flaky.questions, [{id: 'questions/legacy', number: null, priority: null, text: 'A question from before viewer metadata.'}], 'without viewer metadata every question is open');
-    assert.deepEqual(forced.cards.filter(c => c.id !== hex('1')), data.cards.filter(c => c.id !== hex('1')));
+    const others = cards => cards.filter(c => c.id !== hex('1')).sort(newest);
+    assert.deepEqual(others(forced.cards), others(data.cards));
     const s = await stats();
     assert.equal(s.notModified, 2, 'both listing pages revalidated with their ETags');
     assert.equal(s.requests['/user'], 1);

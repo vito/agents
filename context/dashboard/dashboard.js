@@ -7,7 +7,8 @@
   const error = document.getElementById('error');
   const filter = document.getElementById('filter');
   const refresh = document.getElementById('refresh');
-  let all = [];
+  const empty = document.getElementById('empty');
+  const entries = new Map(); // gist id -> {card, node}, as shown
 
   function el(tag, attrs, ...children) {
     const node = document.createElement(tag);
@@ -67,44 +68,101 @@
     return card;
   }
 
-  function show() {
+  const matches = c => {
     const words = filter.value.toLowerCase().split(/\s+/).filter(Boolean);
-    const shown = all.filter(c => {
-      const hay = [c.title, c.description, c.repo, ...(c.highlights || []).map(h => h.text), ...(c.questions || []).map(q => q.text)].join(' ').toLowerCase();
-      return words.every(w => hay.includes(w));
-    });
-    cards.replaceChildren(...shown.map(render));
-    if (!all.length) cards.append(el('p', {class: 'empty'}, 'No gists with a context.json yet. Export one with exportContext and publish it as a gist.'));
-    else if (!shown.length) cards.append(el('p', {class: 'empty'}, 'No Context matches the filter.'));
-    return shown.length;
+    const hay = [c.title, c.description, c.repo, ...(c.highlights || []).map(h => h.text), ...(c.questions || []).map(q => q.text)].join(' ').toLowerCase();
+    return words.every(w => hay.includes(w));
+  };
+  // Newest first, as the server sorts.
+  const before = (a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '') || a.id.localeCompare(b.id);
+
+  function emptyNote(done) {
+    const shown = [...entries.values()].filter(e => !e.node.hidden).length;
+    empty.hidden = shown > 0 || (!done && !entries.size);
+    empty.textContent = entries.size ? 'No Context matches the filter.' : 'No gists with a context.json yet. Export one with exportContext and publish it as a gist.';
   }
 
+  function show() {
+    for (const e of entries.values()) e.node.hidden = !matches(e.card);
+    emptyNote(!loading);
+  }
+
+  // Add or replace one card, in its place among those already shown.
+  function upsert(c) {
+    const node = render(c);
+    node.hidden = !matches(c);
+    const old = entries.get(c.id);
+    if (old) old.node.remove();
+    entries.set(c.id, {card: c, node});
+    const next = [...entries.values()].filter(e => e.card.id !== c.id && before(c, e.card) < 0)
+      .sort((a, b) => before(a.card, b.card))[0];
+    cards.insertBefore(node, next ? next.node : null);
+  }
+
+  async function* lines(res) {
+    const reader = res.body.getReader(), decoder = new TextDecoder();
+    let buffer = '';
+    for (;;) {
+      const {value, done} = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), {stream: !done});
+      const parts = buffer.split('\n');
+      buffer = parts.pop();
+      for (const part of parts) if (part.trim()) yield JSON.parse(part);
+      if (done) break;
+    }
+    if (buffer.trim()) yield JSON.parse(buffer);
+  }
+
+  const count = n => `${n} Context${n === 1 ? '' : 's'}`;
+  let loading = false;
+
+  // Cards stream in as the server lists and summarizes them. A refresh
+  // keeps the cards already shown until the listing says which are gone.
   async function load(force) {
+    loading = true;
     refresh.disabled = true;
+    const seen = new Set();
+    let login = '', finished = null, locked = false;
+    status.textContent = 'Listing your gists…';
     try {
       const res = await fetch('/api/contexts' + (force ? '?refresh=1' : ''), {cache: 'no-store'});
-      const data = await res.json();
-      if (data.locked) {
+      if (res.status === 401) {
+        const data = await res.json();
         error.hidden = false;
         error.textContent = data.error;
         status.textContent = 'Locked';
-        all = [];
+        entries.clear();
         cards.replaceChildren();
+        locked = true;
         return;
       }
-      all = Array.isArray(data.cards) ? data.cards : [];
-      error.hidden = !data.error;
-      error.textContent = data.error ? 'GitHub: ' + data.error + (all.length ? ' — showing the last cards listed.' : '') : '';
-      show();
-      const who = data.login ? ` of @${data.login}` : '';
-      status.textContent = `${all.length} Context${all.length === 1 ? '' : 's'} in the gists${who} · listed ${ago(data.fetchedAt)}`;
-      status.title = data.fetchedAt || '';
+      if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+      for await (const message of lines(res)) {
+        if (message.type === 'login') login = message.login || '';
+        else if (message.type === 'card' && message.card && typeof message.card.id === 'string') {
+          seen.add(message.card.id);
+          upsert(message.card);
+          status.textContent = `Listing your gists… ${count(seen.size)} so far`;
+          emptyNote(false);
+        } else if (message.type === 'done') finished = message;
+      }
+      if (!finished) throw new Error('the listing ended early');
+      // Only a complete listing says which cards are gone.
+      if (!finished.error) {
+        for (const [id, e] of entries) if (!seen.has(id)) { e.node.remove(); entries.delete(id); }
+      }
+      error.hidden = !finished.error;
+      error.textContent = finished.error ? 'GitHub: ' + finished.error + (entries.size ? ' — some cards may be out of date.' : '') : '';
+      status.textContent = `${count(entries.size)} in the gists${login ? ` of @${login}` : ''} · listed ${ago(finished.fetchedAt)}`;
+      status.title = finished.fetchedAt || '';
     } catch (e) {
       error.hidden = false;
       error.textContent = 'Cannot reach the dashboard server: ' + e.message;
-      status.textContent = '';
+      status.textContent = entries.size ? count(entries.size) + ' (incomplete)' : '';
     } finally {
+      loading = false;
       refresh.disabled = false;
+      if (locked) empty.hidden = true; else emptyNote(true);
     }
   }
 

@@ -174,24 +174,36 @@ function card(gist, summary, error) {
   };
 }
 
-const pages = new Map(); // listing page URL -> {etag, gists}
+const pages = new Map(); // listing page URL -> {etag, gists, next}
 const digests = new Map(); // raw URL -> digest or {error}
+// The last complete listing, and the refresh in flight, whose cards every
+// page loading meanwhile receives as they come.
 let state = {login: '', cards: [], fetchedAt: 0, error: ''};
-let refreshing = null;
+let run = null;
 
-async function list() {
-  const gists = [];
-  let url = new URL('gists?per_page=100', api).href;
-  while (url) {
-    const cached = pages.get(url);
-    const res = await github(url, cached && cached.etag);
-    // A 304 costs no rate limit; its page still tells where the next one is.
-    const page = res.notModified ? cached : {etag: res.etag, gists: Array.isArray(res.body) ? res.body : [], next: nextPage(res.link)};
-    pages.set(url, page);
-    gists.push(...page.gists);
-    url = page.next;
+const newest = (a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id);
+
+async function listPage(url) {
+  const cached = pages.get(url);
+  const res = await github(url, cached && cached.etag);
+  // A 304 costs no rate limit; its page still tells where the next one is.
+  const page = res.notModified ? cached : {etag: res.etag, gists: Array.isArray(res.body) ? res.body : [], next: nextPage(res.link)};
+  pages.set(url, page);
+  return page;
+}
+
+// Listing pages in order, each next one fetched while the caller summarizes
+// the one before.
+async function* listing() {
+  let next = listPage(new URL('gists?per_page=100', api).href);
+  while (next) {
+    const page = await next;
+    next = page.next ? listPage(page.next) : null;
+    // Handled when awaited; this only keeps an abandoned prefetch's failure
+    // from taking the process down.
+    if (next) next.catch(() => {});
+    yield page.gists;
   }
-  return gists;
 }
 
 async function pool(items, size, fn) {
@@ -201,46 +213,83 @@ async function pool(items, size, fn) {
   }));
 }
 
-async function refresh() {
-  try {
-    if (!state.login) {
-      const user = await github(new URL('user', api).href);
-      state.login = text(user.body && user.body.login);
-    }
-    const found = (await list())
-      .filter(g => object(g) && typeof g.id === 'string' && /^[0-9a-f]+$/i.test(g.id) && object(g.files) && object(g.files['context.json']))
-      .map(g => ({gist: g, file: g.files['context.json']}));
-    const live = new Set();
-    const failed = new Map(); // raw URL -> {error}, retried next refresh
-    await pool(found, 6, async ({file}) => {
-      const url = rawURL(file.raw_url);
-      if (!url) return;
-      live.add(url.href);
-      if (digests.has(url.href)) return;
-      if (Number.isSafeInteger(file.size) && file.size > maxBytes) { digests.set(url.href, {error: 'context.json is too large to summarize'}); return; }
+// One card, from the cache of its revision when there is one.
+async function summarize(gist, file, live, failed) {
+  const url = rawURL(file.raw_url);
+  if (!url) return card(gist, null, 'context.json has an unexpected raw URL');
+  live.add(url.href);
+  if (!digests.has(url.href)) {
+    if (Number.isSafeInteger(file.size) && file.size > maxBytes) digests.set(url.href, {error: 'context.json is too large to summarize'});
+    else {
       try { digests.set(url.href, digest(await fetchRaw(url))); }
       catch (error) { (error.transient ? failed : digests).set(url.href, {error: error.message}); }
-    });
-    for (const key of digests.keys()) if (!live.has(key)) digests.delete(key);
-    const cards = found.map(({gist, file}) => {
-      const url = rawURL(file.raw_url);
-      if (!url) return card(gist, null, 'context.json has an unexpected raw URL');
-      const d = digests.get(url.href) || failed.get(url.href);
-      return d.error ? card(gist, null, d.error) : card(gist, d, '');
-    });
-    cards.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    state = {login: state.login, cards, fetchedAt: Date.now(), error: ''};
-  } catch (error) {
-    // Keep the last good cards; say why they may be out of date.
-    state = {...state, fetchedAt: Date.now(), error: error.message};
+    }
   }
+  const d = digests.get(url.href) || failed.get(url.href);
+  return d.error ? card(gist, null, d.error) : card(gist, d, '');
 }
 
-function contexts(force) {
-  if (!refreshing && (force || Date.now() - state.fetchedAt > stale)) {
-    refreshing = refresh().finally(() => { refreshing = null; });
+function refresh() {
+  const r = {login: state.login, cards: [], listeners: new Set()};
+  const emit = message => { for (const listener of r.listeners) listener(message); };
+  run = r;
+  (async () => {
+    try {
+      if (!r.login) {
+        const user = await github(new URL('user', api).href);
+        r.login = text(user.body && user.body.login);
+        emit({type: 'login', login: r.login});
+      }
+      const live = new Set();
+      const failed = new Map(); // raw URL -> {error}, retried next refresh
+      for await (const gists of listing()) {
+        // Newest first within each page; the page sorts across pages.
+        const found = gists
+          .filter(g => object(g) && typeof g.id === 'string' && /^[0-9a-f]+$/i.test(g.id) && object(g.files) && object(g.files['context.json']))
+          .sort((a, b) => text(b.updated_at).localeCompare(text(a.updated_at)));
+        await pool(found, 6, async gist => {
+          const c = await summarize(gist, gist.files['context.json'], live, failed);
+          r.cards.push(c);
+          emit({type: 'card', card: c});
+        });
+      }
+      for (const key of digests.keys()) if (!live.has(key)) digests.delete(key);
+      state = {login: r.login, cards: r.cards.slice().sort(newest), fetchedAt: Date.now(), error: ''};
+    } catch (error) {
+      // Keep the last good cards, updated by whatever this run got to; say
+      // why they may be out of date.
+      const merged = new Map(state.cards.map(c => [c.id, c]));
+      for (const c of r.cards) merged.set(c.id, c);
+      state = {login: r.login, cards: [...merged.values()].sort(newest), fetchedAt: Date.now(), error: error.message};
+    }
+    run = null;
+    emit({type: 'done', fetchedAt: new Date(state.fetchedAt).toISOString(), error: state.error});
+  })();
+  return r;
+}
+
+// Stream the cards as NDJSON: login, then each card as soon as it is known,
+// then done. A complete listing fresh enough is replayed at once.
+async function streamContexts(res, force) {
+  res.writeHead(200, {'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store'});
+  const send = message => res.write(JSON.stringify(message) + '\n');
+  const r = run || (force || Date.now() - state.fetchedAt > stale ? refresh() : null);
+  if (!r) {
+    send({type: 'login', login: state.login});
+    for (const c of state.cards) send({type: 'card', card: c});
+    send({type: 'done', fetchedAt: new Date(state.fetchedAt).toISOString(), error: state.error});
+    res.end();
+    return;
   }
-  return refreshing || Promise.resolve();
+  // Catch up on the run so far, then follow it; nothing runs in between.
+  if (r.login) send({type: 'login', login: r.login});
+  for (const c of r.cards) send({type: 'card', card: c});
+  await new Promise(resolve => {
+    const listener = message => { send(message); if (message.type === 'done') resolve(); };
+    r.listeners.add(listener);
+    res.on('close', () => { r.listeners.delete(listener); resolve(); });
+  });
+  res.end();
 }
 
 const files = {
@@ -297,9 +346,7 @@ async function handle(req, res) {
       res.end(JSON.stringify({locked: true, error: 'Open the link the dashboard printed when it started (http://localhost:' + port + '/?key=…) to unlock it.', cards: []}));
       return;
     }
-    await contexts(url.searchParams.has('refresh'));
-    res.writeHead(state.error && !state.cards.length ? 502 : 200, {'content-type': 'application/json', 'cache-control': 'no-store'});
-    res.end(JSON.stringify({login: state.login, fetchedAt: new Date(state.fetchedAt).toISOString(), error: state.error, cards: state.cards}));
+    await streamContexts(res, url.searchParams.has('refresh'));
     return;
   }
   const file = files[url.pathname];

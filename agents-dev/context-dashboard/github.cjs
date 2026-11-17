@@ -55,11 +55,14 @@ http.createServer((req, res) => {
   if (url.pathname === '/gists') {
     const n = Number(url.searchParams.get('page') || 1);
     const etag = `"page-${n}"`;
-    if (req.headers['if-none-match'] === etag) { stats.notModified++; res.writeHead(304); res.end(); return; }
-    res.setHeader('etag', etag);
-    res.setHeader('content-type', 'application/json');
-    if (n === 1) res.setHeader('link', `<${base}/gists?per_page=100&page=2>; rel="next", <${base}/gists?per_page=100&page=2>; rel="last"`);
-    res.end(JSON.stringify(pages[n] || []));
+    // The second page is slow, so the first page's cards stream ahead of it.
+    setTimeout(() => {
+      if (req.headers['if-none-match'] === etag) { stats.notModified++; res.writeHead(304); res.end(); return; }
+      res.setHeader('etag', etag);
+      res.setHeader('content-type', 'application/json');
+      if (n === 1) res.setHeader('link', `<${base}/gists?per_page=100&page=2>; rel="next", <${base}/gists?per_page=100&page=2>; rel="last"`);
+      res.end(JSON.stringify(pages[n] || []));
+    }, n === 2 ? 1000 : 0);
     return;
   }
   const raw = /^\/raw\/([0-9a-f]+)\/r1\/context\.json$/.exec(url.pathname);
