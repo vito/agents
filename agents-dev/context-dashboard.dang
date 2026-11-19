@@ -11,7 +11,7 @@ let testContextDashboard: String! {
     .withHostname("mockgh")
     .start
   let dash = contextDashboard(token: setSecret("context-dashboard-token", "test-token"), api: "http://mockgh:8080")
-    .serve(key: setSecret("context-dashboard-key", "test-key"))
+    .serve
   node.withFile("/probe.cjs", currentModule.source.file("context-dashboard/probe.cjs"))
     .withServiceBinding("dash", dash)
     .withEnvVariable("NONCE", nonce)

@@ -1,6 +1,5 @@
 'use strict';
-// Drives the dashboard bound as "dash" (key "test-key") against the fake
-// GitHub (github.cjs).
+// Drives the dashboard bound as "dash" against the fake GitHub (github.cjs).
 const {test} = require('node:test');
 const http = require('node:http');
 const assert = require('node:assert/strict');
@@ -11,14 +10,13 @@ const request = (host, path, headers) => new Promise((resolve, reject) => {
     res.on('end', () => resolve({status: res.statusCode, headers: res.headers, body}));
   }).on('error', reject);
 });
-let cookie = '';
-const get = (path, host = 'localhost:8080') => request('dash', path, cookie ? {host, cookie} : {host});
+const get = (path, host = 'localhost:8080') => request('dash', path, {host});
 const stats = async () => JSON.parse((await request('mockgh', '/__stats', {})).body);
 const hex = c => c.repeat(32);
 // /api/contexts as NDJSON messages, each stamped with when it arrived.
 const stream = query => new Promise((resolve, reject) => {
   const start = Date.now(), messages = [];
-  http.get({host: 'dash', port: 8080, path: '/api/contexts' + query, headers: {host: 'localhost:8080', cookie}}, res => {
+  http.get({host: 'dash', port: 8080, path: '/api/contexts' + query, headers: {host: 'localhost:8080'}}, res => {
     let buffer = '';
     res.setEncoding('utf8');
     res.on('data', chunk => {
@@ -47,7 +45,6 @@ test('Context dashboard', async t => {
     for (const host of ['evil.example:8080', 'evil.example', 'dash:8080']) {
       assert.equal((await get('/', host)).status, 421, host);
       assert.equal((await get('/api/contexts', host)).status, 421, host);
-      assert.equal((await get('/?key=test-key', host)).status, 421, host);
     }
     const page = await get('/', '127.0.0.1:8080');
     assert.equal(page.status, 200);
@@ -65,24 +62,6 @@ test('Context dashboard', async t => {
     });
     assert.match(reply, /^HTTP\/1\.1 400 /);
     assert.equal((await get('/')).status, 200);
-  });
-
-  await t.test('lists nothing until unlocked with the key', async () => {
-    const locked = await get('/api/contexts');
-    assert.equal(locked.status, 401);
-    assert.deepEqual(JSON.parse(locked.body).cards, []);
-    cookie = 'context-dashboard=test-keX';
-    assert.equal((await get('/api/contexts')).status, 401);
-    cookie = '';
-    assert.equal((await get('/?key=test-keX')).status, 403);
-    assert.equal((await get('/?key=')).status, 403);
-    assert.equal((await stats()).requests['/user'], undefined, 'nothing reached GitHub');
-    const unlock = await get('/?key=test-key');
-    assert.equal(unlock.status, 303);
-    assert.equal(unlock.headers.location, '/');
-    const set = unlock.headers['set-cookie'][0];
-    assert.match(set, /^context-dashboard=test-key; HttpOnly; SameSite=Strict; Path=\/$/);
-    cookie = set.split(';')[0];
   });
 
   let data;

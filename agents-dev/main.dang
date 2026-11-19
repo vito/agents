@@ -151,7 +151,7 @@ type AgentsDev {
     null
   }
 
-  """Check the Context dashboard against a fake GitHub: localhost-only serving, the key, paged listing with ETags, one fetch per context.json revision with transient failures retried, and cards for valid, legacy and broken exports."""
+  """Check the Context dashboard against a fake GitHub: localhost-only serving, paged listing with ETags, one fetch per context.json revision with transient failures retried, and cards for valid, legacy and broken exports."""
   contextDashboard: Void @check {
     print(testContextDashboard)
     null

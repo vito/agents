@@ -6,7 +6,6 @@
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
-const crypto = require('node:crypto');
 
 const token = process.env.GITHUB_TOKEN || '';
 const api = new URL((process.env.GITHUB_API || 'https://api.github.com').replace(/\/+$/, '') + '/');
@@ -15,11 +14,6 @@ const port = Number(process.env.PORT || 8080);
 // Only these Host headers are served, so a page elsewhere cannot rebind its
 // own domain to this port and read the cards.
 const hosts = new Set(['localhost', '127.0.0.1', '[::1]']);
-// `dagger up` forwards the port on every interface, and anyone reaching it
-// picks their own Host header: the cards also need this key, exchanged once
-// (/?key=...) for an HttpOnly cookie.
-const key = process.env.DASHBOARD_KEY || crypto.randomBytes(18).toString('base64url');
-const cookieName = 'context-dashboard';
 const stale = 60 * 1000; // a page load reuses a listing this fresh
 const maxBytes = 20 * 1024 * 1024; // a context.json bigger than this is skipped
 const kinds = ['glossary', 'fact', 'decision', 'design', 'result', 'question', 'note'];
@@ -301,21 +295,6 @@ const files = {
   '/context.css': ['context.css', 'text/css; charset=utf-8'],
 };
 
-function keyed(value) {
-  const given = Buffer.from(String(value)), expected = Buffer.from(key);
-  return given.length === expected.length && crypto.timingSafeEqual(given, expected);
-}
-
-function cookieKey(req) {
-  for (const part of (req.headers.cookie || '').split(';')) {
-    const [name, ...value] = part.trim().split('=');
-    if (name === cookieName) {
-      try { return decodeURIComponent(value.join('=')); } catch (_) { return ''; }
-    }
-  }
-  return '';
-}
-
 const server = http.createServer((req, res) => {
   handle(req, res).catch(error => {
     // Whatever a request does, the server outlives it.
@@ -335,19 +314,7 @@ async function handle(req, res) {
   let url;
   try { url = new URL(req.url, 'http://localhost'); }
   catch (_) { res.writeHead(400, {'content-type': 'text/plain'}); res.end('bad request\n'); return; }
-  if (url.searchParams.has('key')) {
-    if (!keyed(url.searchParams.get('key'))) { res.writeHead(403, {'content-type': 'text/plain'}); res.end('Wrong key: open the link the dashboard printed when it started.\n'); return; }
-    // Trade the key for a cookie, and take it out of the address bar.
-    res.writeHead(303, {location: '/', 'set-cookie': `${cookieName}=${encodeURIComponent(key)}; HttpOnly; SameSite=Strict; Path=/`});
-    res.end();
-    return;
-  }
   if (url.pathname === '/api/contexts') {
-    if (!keyed(cookieKey(req))) {
-      res.writeHead(401, {'content-type': 'application/json', 'cache-control': 'no-store'});
-      res.end(JSON.stringify({locked: true, error: 'Open the link the dashboard printed when it started (http://localhost:' + port + '/?key=…) to unlock it.', cards: []}));
-      return;
-    }
     await streamContexts(res, url.searchParams.has('refresh'));
     return;
   }
@@ -359,6 +326,5 @@ async function handle(req, res) {
 
 if (!token) console.warn('GITHUB_TOKEN is empty: GitHub will refuse to list your gists.');
 server.listen(port, '0.0.0.0', () => {
-  const shown = process.env.DASHBOARD_KEY ? '<your key>' : encodeURIComponent(key);
-  console.log(`Context dashboard: open http://localhost:${port}/?key=${shown} (with the port you forwarded)`);
+  console.log(`Context dashboard: open http://localhost:${port}/ (with the port you forwarded)`);
 });

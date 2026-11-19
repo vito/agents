@@ -122,20 +122,10 @@
     loading = true;
     refresh.disabled = true;
     const seen = new Set();
-    let login = '', finished = null, locked = false;
+    let login = '', finished = null;
     status.textContent = 'Listing your gists…';
     try {
       const res = await fetch('/api/contexts' + (force ? '?refresh=1' : ''), {cache: 'no-store'});
-      if (res.status === 401) {
-        const data = await res.json();
-        error.hidden = false;
-        error.textContent = data.error;
-        status.textContent = 'Locked';
-        entries.clear();
-        cards.replaceChildren();
-        locked = true;
-        return;
-      }
       if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
       for await (const message of lines(res)) {
         if (message.type === 'login') login = message.login || '';
@@ -163,7 +153,7 @@
       loading = false;
       refresh.disabled = false;
       // With nothing to show, the error says why; the note would guess.
-      if (locked || (!entries.size && !error.hidden)) empty.hidden = true; else emptyNote(true);
+      if (!entries.size && !error.hidden) empty.hidden = true; else emptyNote(true);
     }
   }
 
